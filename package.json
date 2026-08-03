@@ -1,0 +1,18 @@
+{
+  "name": "production-tracker-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Standalone backend for the Production Tracker app — replaces Google Apps Script, talks directly to Supabase.",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}
