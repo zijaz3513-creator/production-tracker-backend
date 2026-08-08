@@ -20,10 +20,104 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
 const PORT = process.env.PORT || 3000;
+
+// One shared password per role/category, set as environment variables —
+// never hardcoded here and never sent to the browser. Master and Tailor
+// are NOT in this list — each master and tailor has their own individual
+// password instead (managed from the Admin > Staff page, stored hashed
+// in the "staff" table). If a role's env var isn't set, that role simply
+// can't log in until an admin configures it.
+const ROLE_PASSWORDS = {
+  admin: process.env.ADMIN_PASSWORD,
+  inventory: process.env.INVENTORY_PASSWORD,
+  handemb: process.env.HANDEMB_PASSWORD,
+  machemb: process.env.MACHEMB_PASSWORD,
+  designer: process.env.DESIGNER_PASSWORD,
+  patternmaster: process.env.PATTERNMASTER_PASSWORD
+};
+
+Object.keys(ROLE_PASSWORDS).forEach(role => {
+  if (!ROLE_PASSWORDS[role]) {
+    console.warn(`Warning: no password set for role "${role}" (set ${role.toUpperCase()}_PASSWORD in the environment) — that role cannot log in yet.`);
+  }
+});
+
+// Simple in-memory session store: token -> { role, name, createdAt }. Good
+// enough for a single small server instance. Sessions are lost on restart
+// (e.g. Render free tier spinning down after inactivity) — logging back in
+// takes a few seconds, it's not an error.
+const sessions = new Map();
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
+
+function getSession(token) {
+  if (!token) return null;
+  const s = sessions.get(token);
+  if (!s) return null;
+  if (Date.now() - s.createdAt > SESSION_TTL_MS) {
+    sessions.delete(token);
+    return null;
+  }
+  return s;
+}
+
+// --- Password hashing for individual master/tailor accounts (scrypt) ---
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return { hash, salt };
+}
+function verifyPassword(password, hash, salt) {
+  try {
+    const check = crypto.scryptSync(password, salt, 64);
+    const stored = Buffer.from(hash, 'hex');
+    return check.length === stored.length && crypto.timingSafeEqual(check, stored);
+  } catch (e) {
+    return false;
+  }
+}
+
+async function doLoginAction(params) {
+  const role = (params.role || '').toString();
+  const password = (params.password || '').toString();
+  const name = (params.name || '').toString();
+
+  // Masters and tailors each have their own individual password, stored
+  // (hashed) in the "staff" table and managed from the Admin > Staff page.
+  if (role === 'master' || role === 'tailor') {
+    if (!name) return { success: false, error: 'Please select your name.' };
+    const rows = await sbFetch(
+      'GET',
+      `staff?select=id,name,password_hash,password_salt&role=eq.${role}&name=eq.${encodeURIComponent(name)}&active=eq.true&limit=1`
+    );
+    const rec = rows && rows[0];
+    if (!rec || !verifyPassword(password, rec.password_hash, rec.password_salt)) {
+      return { success: false, error: 'Incorrect name or password.' };
+    }
+    const token = crypto.randomBytes(24).toString('hex');
+    sessions.set(token, { role, name, createdAt: Date.now() });
+    return { success: true, token };
+  }
+
+  if (!(role in ROLE_PASSWORDS)) {
+    return { success: false, error: 'Unknown role: ' + role };
+  }
+  const expected = ROLE_PASSWORDS[role];
+  if (!expected) {
+    return { success: false, error: 'This role has no password configured yet — ask your admin to set it up.' };
+  }
+  if (password !== expected) {
+    return { success: false, error: 'Incorrect password.' };
+  }
+
+  const token = crypto.randomBytes(24).toString('hex');
+  sessions.set(token, { role, name, createdAt: Date.now() });
+  return { success: true, token };
+}
 
 // Comma-separated list, e.g. "https://yourdomain.com,https://www.yourdomain.com"
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*')
@@ -36,18 +130,15 @@ if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
   process.exit(1);
 }
 
-const MASTERS = ['Imran', 'Rafiq', 'Sheikh', 'Baskaran', 'Usman'];
-const TAILORS = ['M1', 'M2', 'M3', 'M4', 'M5', 'M6', 'M7', 'M8', 'M9', 'M10', 'M11'];
-
 const DESIGNERS = ['Sally', 'Emman', 'Nikita'];
 const PATTERN_MASTERS = ['Nihal', 'Sohail'];
-const SAMPLE_TAILORS = TAILORS;
+const MAX_TAILOR_SLOTS = 11; // fixed by the order row layout (columns 10-20)
 const MAX_FABRIC_SLOTS = 6;
 
 // Which actions each role may call. Admin bypasses this check entirely.
 const ROLE_PERMISSIONS = {
   inventory: ['getOrders', 'updateFabric', 'updateMachEmb', 'updateHandEmb'],
-  master: ['getOrders', 'updateMaster', 'updateTailor'],
+  master: ['getOrders', 'updateTailor'],
   tailor: ['getOrders', 'markDone', 'getSamples', 'markSampleDone'],
   designer: ['getSamples', 'addSample'],
   patternmaster: ['getSamples', 'assignSampleTailor']
@@ -113,6 +204,81 @@ async function sbGetMaxId(table) {
 }
 
 // ============================================================
+// Staff (masters + tailors) — dynamic roster stored in Supabase, managed
+// from the Admin > Staff page. Deactivating someone (removeStaff) is a
+// soft-delete so past orders still show their name correctly.
+// ============================================================
+async function getActiveStaff(staffRole) {
+  return (await sbFetch(
+    'GET',
+    `staff?select=id,name&role=eq.${staffRole}&active=eq.true&order=created_at.asc`
+  )) || [];
+}
+async function getActiveStaffNames(staffRole) {
+  return (await getActiveStaff(staffRole)).map(s => s.name);
+}
+
+async function doGetRoster() {
+  const [masters, tailors] = await Promise.all([
+    getActiveStaffNames('master'),
+    getActiveStaffNames('tailor')
+  ]);
+  return { success: true, masters, tailors };
+}
+
+async function doListStaff(params) {
+  const staffRole = (params.staffRole || '').toString();
+  if (staffRole !== 'master' && staffRole !== 'tailor') {
+    return { success: false, error: 'Invalid staff role.' };
+  }
+  return { success: true, staff: await getActiveStaff(staffRole) };
+}
+
+async function doAddStaff(params) {
+  const staffRole = (params.staffRole || '').toString();
+  const name = (params.name || '').toString().trim();
+  const password = (params.password || '').toString();
+
+  if (staffRole !== 'master' && staffRole !== 'tailor') {
+    return { success: false, error: 'Invalid staff role.' };
+  }
+  if (!name) return { success: false, error: 'Name is required.' };
+  if (!password || password.length < 4) {
+    return { success: false, error: 'Password must be at least 4 characters.' };
+  }
+
+  if (staffRole === 'tailor') {
+    const current = await getActiveStaffNames('tailor');
+    if (current.length >= MAX_TAILOR_SLOTS) {
+      return { success: false, error: `Maximum of ${MAX_TAILOR_SLOTS} active tailors — remove one before adding another.` };
+    }
+  }
+
+  const existing = await sbFetch(
+    'GET',
+    `staff?select=id&role=eq.${staffRole}&name=eq.${encodeURIComponent(name)}&active=eq.true&limit=1`
+  );
+  if (existing && existing.length) {
+    return { success: false, error: 'That name is already on the list.' };
+  }
+
+  const { hash, salt } = hashPassword(password);
+  await sbInsertOne('staff', {
+    role: staffRole, name,
+    password_hash: hash, password_salt: salt,
+    active: true
+  });
+  return { success: true };
+}
+
+async function doRemoveStaff(params) {
+  const id = parseInt(params.id, 10);
+  if (!id) return { success: false, error: 'Invalid id.' };
+  await sbFetch('PATCH', `staff?id=eq.${id}`, { active: false }, { Prefer: 'return=minimal' });
+  return { success: true };
+}
+
+// ============================================================
 // Express app
 // ============================================================
 const app = express();
@@ -135,8 +301,30 @@ app.all('/api', async (req, res) => {
   const action = params.action;
 
   try {
-    const permissionError = checkPermission(action, params.role);
-    const result = permissionError || (await routeAction(action, params));
+    if (action === 'login') {
+      return res.json(await doLoginAction(params));
+    }
+    if (action === 'logout') {
+      if (params.token) sessions.delete(params.token);
+      return res.json({ success: true });
+    }
+    if (action === 'getRoster') {
+      // Just names, needed to populate the login screen before anyone is
+      // logged in — no session required, nothing sensitive returned.
+      return res.json(await doGetRoster());
+    }
+
+    // Every other action requires a valid session from a successful
+    // password login. The role used for permission checks comes from the
+    // session (set at login time), never from whatever the browser sends,
+    // so a client can't just claim to be "admin".
+    const session = getSession(params.token);
+    if (!session) {
+      return res.json({ success: false, error: 'Session expired. Please log in again.' });
+    }
+
+    const permissionError = checkPermission(action, session.role);
+    const result = permissionError || (await routeAction(action, Object.assign({}, params, { role: session.role })));
     res.json(result);
   } catch (err) {
     console.error(err);
@@ -174,6 +362,9 @@ async function routeAction(action, params) {
     case 'addSample': return doAddSample(params);
     case 'assignSampleTailor': return doAssignSampleTailor(params);
     case 'markSampleDone': return doMarkSampleDone(params);
+    case 'listStaff': return doListStaff(params);
+    case 'addStaff': return doAddStaff(params);
+    case 'removeStaff': return doRemoveStaff(params);
     default: return { success: false, error: 'Unknown action: ' + action };
   }
 }
@@ -187,7 +378,7 @@ function parseRow(params) {
 // ORDERS — reconstructs the exact same 34-column array shape the
 // frontend's parseOrders() already expects.
 // ============================================================
-function buildOrderRowArray(rec) {
+function buildOrderRowArray(rec, tailorNames) {
   const row = new Array(34).fill('');
   if (!rec) return row;
 
@@ -201,7 +392,7 @@ function buildOrderRowArray(rec) {
   row[8] = rec.hand_emb || '';
 
   if (rec.tailor) {
-    const idx = TAILORS.indexOf(rec.tailor);
+    const idx = tailorNames.indexOf(rec.tailor);
     if (idx !== -1) row[10 + idx] = rec.tailor_assigned_at || '';
   }
 
@@ -222,7 +413,10 @@ function buildOrderRowArray(rec) {
 }
 
 async function doGetOrders() {
-  const records = await sbSelectAll('orders', 'id');
+  const [records, tailorNames] = await Promise.all([
+    sbSelectAll('orders', 'id'),
+    getActiveStaffNames('tailor')
+  ]);
   const byId = {};
   let maxId = 0;
   records.forEach(rec => {
@@ -233,7 +427,7 @@ async function doGetOrders() {
   const data = [new Array(34).fill(''), new Array(34).fill('')];
   for (let id = 1; id <= maxId; id++) {
     const rec = byId[id];
-    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec));
+    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec, tailorNames));
   }
   return { success: true, data };
 }
@@ -316,7 +510,8 @@ async function doUpdateMaster(params) {
     await sbUpdate('orders', id, { master: null, master_assigned_at: null });
     return { success: true };
   }
-  if (MASTERS.indexOf(master) === -1) {
+  const masters = await getActiveStaffNames('master');
+  if (masters.indexOf(master) === -1) {
     return { success: false, error: 'Unknown master: ' + master };
   }
   await sbUpdate('orders', id, { master, master_assigned_at: new Date().toISOString() });
@@ -333,7 +528,8 @@ async function doUpdateTailor(params) {
     await sbUpdate('orders', id, { tailor: null, tailor_assigned_at: null });
     return { success: true };
   }
-  if (TAILORS.indexOf(tailor) === -1) {
+  const tailors = await getActiveStaffNames('tailor');
+  if (tailors.indexOf(tailor) === -1) {
     return { success: false, error: 'Unknown tailor: ' + tailor };
   }
   await sbUpdate('orders', id, { tailor, tailor_assigned_at: new Date().toISOString() });
@@ -492,7 +688,8 @@ async function doAssignSampleTailor(params) {
   const row = parseRow(params);
   if (!row) return { success: false, error: 'Invalid row.' };
   const tailor = (params.tailor || '').toString();
-  if (SAMPLE_TAILORS.indexOf(tailor) === -1) {
+  const sampleTailors = await getActiveStaffNames('tailor');
+  if (sampleTailors.indexOf(tailor) === -1) {
     return { success: false, error: 'Unknown tailor: ' + tailor };
   }
   await sbUpdate('design_samples', row - 1, { tailor, tailor_started_at: new Date().toISOString() });
