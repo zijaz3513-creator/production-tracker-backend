@@ -206,12 +206,14 @@ async function sbGetMaxId(table) {
 // ============================================================
 // Staff (masters + tailors) — dynamic roster stored in Supabase, managed
 // from the Admin > Staff page. Deactivating someone (removeStaff) is a
-// soft-delete so past orders still show their name correctly.
+// soft-delete so past orders still show their name correctly. Display
+// order is controlled by sort_order (lower = shown first), which the
+// Admin > Staff page lets you change with up/down buttons.
 // ============================================================
 async function getActiveStaff(staffRole) {
   return (await sbFetch(
     'GET',
-    `staff?select=id,name&role=eq.${staffRole}&active=eq.true&order=created_at.asc`
+    `staff?select=id,name,sort_order&role=eq.${staffRole}&active=eq.true&order=sort_order.asc,created_at.asc`
   )) || [];
 }
 async function getActiveStaffNames(staffRole) {
@@ -247,11 +249,9 @@ async function doAddStaff(params) {
     return { success: false, error: 'Password must be at least 4 characters.' };
   }
 
-  if (staffRole === 'tailor') {
-    const current = await getActiveStaffNames('tailor');
-    if (current.length >= MAX_TAILOR_SLOTS) {
-      return { success: false, error: `Maximum of ${MAX_TAILOR_SLOTS} active tailors — remove one before adding another.` };
-    }
+  const current = await getActiveStaff(staffRole);
+  if (staffRole === 'tailor' && current.length >= MAX_TAILOR_SLOTS) {
+    return { success: false, error: `Maximum of ${MAX_TAILOR_SLOTS} active tailors — remove one before adding another.` };
   }
 
   const existing = await sbFetch(
@@ -262,11 +262,12 @@ async function doAddStaff(params) {
     return { success: false, error: 'That name is already on the list.' };
   }
 
+  const nextOrder = current.reduce((max, s) => Math.max(max, s.sort_order || 0), 0) + 1;
   const { hash, salt } = hashPassword(password);
   await sbInsertOne('staff', {
     role: staffRole, name,
     password_hash: hash, password_salt: salt,
-    active: true
+    active: true, sort_order: nextOrder
   });
   return { success: true };
 }
@@ -275,6 +276,33 @@ async function doRemoveStaff(params) {
   const id = parseInt(params.id, 10);
   if (!id) return { success: false, error: 'Invalid id.' };
   await sbFetch('PATCH', `staff?id=eq.${id}`, { active: false }, { Prefer: 'return=minimal' });
+  return { success: true };
+}
+
+async function doReorderStaff(params) {
+  const id = parseInt(params.id, 10);
+  const direction = (params.direction || '').toString();
+  if (!id || (direction !== 'up' && direction !== 'down')) {
+    return { success: false, error: 'Invalid request.' };
+  }
+
+  const me = await sbFetch('GET', `staff?select=id,role&id=eq.${id}&limit=1`);
+  const rec = me && me[0];
+  if (!rec) return { success: false, error: 'Not found.' };
+
+  const list = await getActiveStaff(rec.role);
+  const idx = list.findIndex(s => s.id === id);
+  if (idx === -1) return { success: false, error: 'Not found.' };
+  const swapIdx = direction === 'up' ? idx - 1 : idx + 1;
+  if (swapIdx < 0 || swapIdx >= list.length) return { success: true }; // already at the edge
+
+  const a = list[idx], b = list[swapIdx];
+  const aOrder = (a.sort_order != null) ? a.sort_order : idx;
+  const bOrder = (b.sort_order != null) ? b.sort_order : swapIdx;
+  await Promise.all([
+    sbUpdate('staff', a.id, { sort_order: bOrder }),
+    sbUpdate('staff', b.id, { sort_order: aOrder })
+  ]);
   return { success: true };
 }
 
@@ -366,6 +394,7 @@ async function routeAction(action, params) {
     case 'listStaff': return doListStaff(params);
     case 'addStaff': return doAddStaff(params);
     case 'removeStaff': return doRemoveStaff(params);
+    case 'reorderStaff': return doReorderStaff(params);
     default: return { success: false, error: 'Unknown action: ' + action };
   }
 }
