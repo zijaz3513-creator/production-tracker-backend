@@ -27,19 +27,23 @@ const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
 const PORT = process.env.PORT || 3000;
 
 // One shared password per role/category, set as environment variables —
-// never hardcoded here and never sent to the browser. Master and Tailor
-// are NOT in this list — each master and tailor has their own individual
-// password instead (managed from the Admin > Staff page, stored hashed
-// in the "staff" table). If a role's env var isn't set, that role simply
-// can't log in until an admin configures it.
+// never hardcoded here and never sent to the browser. Master, Tailor,
+// Designer, and Pattern Master are NOT in this list — each person in
+// those roles has their own individual password instead (managed from
+// the Admin > Staff page, stored hashed in the "staff" table). If a
+// shared role's env var isn't set, that role simply can't log in until
+// an admin configures it.
 const ROLE_PASSWORDS = {
   admin: process.env.ADMIN_PASSWORD,
   inventory: process.env.INVENTORY_PASSWORD,
   handemb: process.env.HANDEMB_PASSWORD,
-  machemb: process.env.MACHEMB_PASSWORD,
-  designer: process.env.DESIGNER_PASSWORD,
-  patternmaster: process.env.PATTERNMASTER_PASSWORD
+  machemb: process.env.MACHEMB_PASSWORD
 };
+
+// Roles managed as individual people in the "staff" table instead of a
+// single shared password. Tailors are capped (MAX_TAILOR_SLOTS) because
+// of the order row layout; the others aren't.
+const STAFF_ROLES = ['master', 'tailor', 'designer', 'patternmaster'];
 
 Object.keys(ROLE_PASSWORDS).forEach(role => {
   if (!ROLE_PASSWORDS[role]) {
@@ -86,9 +90,10 @@ async function doLoginAction(params) {
   const password = (params.password || '').toString();
   const name = (params.name || '').toString();
 
-  // Masters and tailors each have their own individual password, stored
-  // (hashed) in the "staff" table and managed from the Admin > Staff page.
-  if (role === 'master' || role === 'tailor') {
+  // Masters, tailors, designers, and pattern masters each have their own
+  // individual password, stored (hashed) in the "staff" table and managed
+  // from the Admin > Staff page.
+  if (STAFF_ROLES.indexOf(role) !== -1) {
     if (!name) return { success: false, error: 'Please select your name.' };
     const rows = await sbFetch(
       'GET',
@@ -130,8 +135,6 @@ if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
   process.exit(1);
 }
 
-const DESIGNERS = ['Sally', 'Emman', 'Nikita'];
-const PATTERN_MASTERS = ['Nihal', 'Sohail'];
 const MAX_TAILOR_SLOTS = 11; // fixed by the order row layout (columns 10-20)
 const MAX_FABRIC_SLOTS = 6;
 
@@ -221,16 +224,18 @@ async function getActiveStaffNames(staffRole) {
 }
 
 async function doGetRoster() {
-  const [masters, tailors] = await Promise.all([
+  const [masters, tailors, designers, patternmasters] = await Promise.all([
     getActiveStaffNames('master'),
-    getActiveStaffNames('tailor')
+    getActiveStaffNames('tailor'),
+    getActiveStaffNames('designer'),
+    getActiveStaffNames('patternmaster')
   ]);
-  return { success: true, masters, tailors };
+  return { success: true, masters, tailors, designers, patternmasters };
 }
 
 async function doListStaff(params) {
   const staffRole = (params.staffRole || '').toString();
-  if (staffRole !== 'master' && staffRole !== 'tailor') {
+  if (STAFF_ROLES.indexOf(staffRole) === -1) {
     return { success: false, error: 'Invalid staff role.' };
   }
   return { success: true, staff: await getActiveStaff(staffRole) };
@@ -241,7 +246,7 @@ async function doAddStaff(params) {
   const name = (params.name || '').toString().trim();
   const password = (params.password || '').toString();
 
-  if (staffRole !== 'master' && staffRole !== 'tailor') {
+  if (STAFF_ROLES.indexOf(staffRole) === -1) {
     return { success: false, error: 'Invalid staff role.' };
   }
   if (!name) return { success: false, error: 'Name is required.' };
@@ -685,12 +690,14 @@ async function doAddSample(params) {
   const code = (params.code || '').toString().trim();
   const type = (params.type || '').toString().trim();
 
-  if (DESIGNERS.indexOf(name) === -1) return { success: false, error: 'Unknown designer: ' + name };
+  const designers = await getActiveStaffNames('designer');
+  if (designers.indexOf(name) === -1) return { success: false, error: 'Unknown designer: ' + name };
   if (!code || !type) return { success: false, error: 'Code and Type are required.' };
 
   const master = (params.master || '').toString().trim();
-  if (PATTERN_MASTERS.indexOf(master) === -1) {
-    return { success: false, error: 'Master must be Nihal or Sohail.' };
+  const patternMasters = await getActiveStaffNames('patternmaster');
+  if (patternMasters.indexOf(master) === -1) {
+    return { success: false, error: 'Unknown pattern master: ' + master };
   }
 
   const fabricColor = (params.fabricColor || '').toString();
