@@ -414,7 +414,7 @@ function parseRow(params) {
 // frontend's parseOrders() already expects.
 // ============================================================
 function buildOrderRowArray(rec, tailorNames) {
-  const row = new Array(38).fill('');
+  const row = new Array(39).fill('');
   if (!rec) return row;
 
   row[0] = rec.sr_no || '';
@@ -450,6 +450,7 @@ function buildOrderRowArray(rec, tailorNames) {
   row[35] = rec.mach_emb_fabric || '';
   row[36] = (rec.mach_emb_meters_sent != null) ? String(rec.mach_emb_meters_sent) : '';
   row[37] = (rec.mach_emb_meters_received != null) ? String(rec.mach_emb_meters_received) : '';
+  row[38] = rec.order_type || '';
   return row;
 }
 
@@ -465,7 +466,7 @@ async function doGetOrders() {
     if (rec.id > maxId) maxId = rec.id;
   });
 
-  const data = [new Array(38).fill(''), new Array(38).fill('')];
+  const data = [new Array(39).fill(''), new Array(39).fill('')];
   for (let id = 1; id <= maxId; id++) {
     const rec = byId[id];
     data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec, tailorNames));
@@ -488,6 +489,12 @@ async function doAddOrder(params) {
     return { success: false, error: 'Please select a valid garment type.' };
   }
 
+  const ORDER_TYPES = ['Simple', 'Hand Embroidery', 'Machine Embroidery'];
+  const orderType = (params.orderType || '').toString().trim();
+  if (ORDER_TYPES.indexOf(orderType) === -1) {
+    return { success: false, error: 'Please select a valid order type.' };
+  }
+
   const notes = (params.notes || '').toString();
   const chest = (params.chest || '').toString();
   const sleeve = (params.sleeve || '').toString();
@@ -505,7 +512,7 @@ async function doAddOrder(params) {
   const srNo = (await sbGetMaxId('orders')) + 1;
 
   const created = await sbInsertOne('orders', {
-    sr_no: srNo, order_no: orderNo, sku, garment_type: garmentType,
+    sr_no: srNo, order_no: orderNo, sku, garment_type: garmentType, order_type: orderType,
     notes, chest, sleeve, shoulder,
     armfit, length, size,
     urgent, urgent_due_date: urgentDate || null
@@ -657,7 +664,7 @@ async function doDeleteOrder(params) {
   if (!row) return { success: false, error: 'Invalid row.' };
   await sbUpdate('orders', row - 2, {
     sr_no: null, order_no: null, sku: null, fabric_status: null,
-    fabric_name: null, fabric_made_in: null, garment_type: null,
+    fabric_name: null, fabric_made_in: null, garment_type: null, order_type: null,
     master: null, master_assigned_at: null, machine_emb: null, hand_emb: null,
     mach_emb_fabric: null, mach_emb_meters_sent: null, mach_emb_meters_received: null,
     tailor: null, tailor_assigned_at: null, remarks: null,
