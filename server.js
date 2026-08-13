@@ -414,7 +414,7 @@ function parseRow(params) {
 // frontend's parseOrders() already expects.
 // ============================================================
 function buildOrderRowArray(rec, tailorNames) {
-  const row = new Array(34).fill('');
+  const row = new Array(38).fill('');
   if (!rec) return row;
 
   row[0] = rec.sr_no || '';
@@ -446,6 +446,10 @@ function buildOrderRowArray(rec, tailorNames) {
   row[31] = rec.urgent_due_date || '';
   row[32] = rec.created_at || '';
   row[33] = rec.done_at || '';
+  row[34] = rec.garment_type || '';
+  row[35] = rec.mach_emb_fabric || '';
+  row[36] = (rec.mach_emb_meters_sent != null) ? String(rec.mach_emb_meters_sent) : '';
+  row[37] = (rec.mach_emb_meters_received != null) ? String(rec.mach_emb_meters_received) : '';
   return row;
 }
 
@@ -461,7 +465,7 @@ async function doGetOrders() {
     if (rec.id > maxId) maxId = rec.id;
   });
 
-  const data = [new Array(34).fill(''), new Array(34).fill('')];
+  const data = [new Array(38).fill(''), new Array(38).fill('')];
   for (let id = 1; id <= maxId; id++) {
     const rec = byId[id];
     data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec, tailorNames));
@@ -477,6 +481,12 @@ async function doAddOrder(params) {
   const orderNo = (params.orderNo || '').toString().trim();
   const sku = (params.sku || '').toString().trim();
   if (!orderNo || !sku) return { success: false, error: 'Order # and SKU are required.' };
+
+  const GARMENT_TYPES = ['Abaya', 'Vest', 'Pant', 'Skirt', 'Dress', 'Bisht', 'Blouse'];
+  const garmentType = (params.garmentType || '').toString().trim();
+  if (GARMENT_TYPES.indexOf(garmentType) === -1) {
+    return { success: false, error: 'Please select a valid garment type.' };
+  }
 
   const notes = (params.notes || '').toString();
   const chest = (params.chest || '').toString();
@@ -495,7 +505,7 @@ async function doAddOrder(params) {
   const srNo = (await sbGetMaxId('orders')) + 1;
 
   const created = await sbInsertOne('orders', {
-    sr_no: srNo, order_no: orderNo, sku,
+    sr_no: srNo, order_no: orderNo, sku, garment_type: garmentType,
     notes, chest, sleeve, shoulder,
     armfit, length, size,
     urgent, urgent_due_date: urgentDate || null
@@ -531,17 +541,61 @@ async function doUpdateMachEmb(params) {
   const row = parseRow(params);
   if (!row) return { success: false, error: 'Invalid row.' };
   const value = params.value;
+
+  if (value === 'CLEAR') {
+    // Undo a "skip" — back to the same blank state a never-touched order
+    // starts in, so it can be sent for real from here.
+    await sbUpdate('orders', row - 2, {
+      machine_emb: null, mach_emb_fabric: null,
+      mach_emb_meters_sent: null, mach_emb_meters_received: null
+    });
+    return { success: true };
+  }
+
   if (!/^(RED|GREEN|SKIP)\|/.test(value || '')) {
     return { success: false, error: 'Invalid machine embroidery value format.' };
   }
-  await sbUpdate('orders', row - 2, { machine_emb: value });
-  return { success: true };
+
+  const patch = { machine_emb: value };
+  let match = null;
+
+  if (value.startsWith('RED|')) {
+    // A fresh "send" — record what's going out, and clear any previous
+    // received figure so it can't be mistaken for this trip's numbers.
+    const fabric = (params.fabric || '').toString().trim();
+    const metersSentRaw = params.metersSent;
+    const metersSent = (metersSentRaw !== undefined && metersSentRaw !== '' && !isNaN(parseFloat(metersSentRaw)))
+      ? parseFloat(metersSentRaw) : null;
+    patch.mach_emb_fabric = fabric || null;
+    patch.mach_emb_meters_sent = metersSent;
+    patch.mach_emb_meters_received = null;
+  } else if (value.startsWith('GREEN|')) {
+    const metersReceivedRaw = params.metersReceived;
+    const metersReceived = (metersReceivedRaw !== undefined && metersReceivedRaw !== '' && !isNaN(parseFloat(metersReceivedRaw)))
+      ? parseFloat(metersReceivedRaw) : null;
+    patch.mach_emb_meters_received = metersReceived;
+
+    const existing = await sbFetch('GET', `orders?id=eq.${row - 2}&select=mach_emb_meters_sent`);
+    const sentVal = (existing && existing[0]) ? existing[0].mach_emb_meters_sent : null;
+    if (sentVal != null && metersReceived != null) {
+      match = (Number(sentVal) === Number(metersReceived));
+    }
+  }
+
+  await sbUpdate('orders', row - 2, patch);
+  return { success: true, match };
 }
 
 async function doUpdateHandEmb(params) {
   const row = parseRow(params);
   if (!row) return { success: false, error: 'Invalid row.' };
   const value = params.value;
+
+  if (value === 'CLEAR') {
+    await sbUpdate('orders', row - 2, { hand_emb: null });
+    return { success: true };
+  }
+
   if (!/^(RED|GREEN|SKIP)\|/.test(value || '')) {
     return { success: false, error: 'Invalid hand embroidery value format.' };
   }
@@ -603,8 +657,9 @@ async function doDeleteOrder(params) {
   if (!row) return { success: false, error: 'Invalid row.' };
   await sbUpdate('orders', row - 2, {
     sr_no: null, order_no: null, sku: null, fabric_status: null,
-    fabric_name: null, fabric_made_in: null,
+    fabric_name: null, fabric_made_in: null, garment_type: null,
     master: null, master_assigned_at: null, machine_emb: null, hand_emb: null,
+    mach_emb_fabric: null, mach_emb_meters_sent: null, mach_emb_meters_received: null,
     tailor: null, tailor_assigned_at: null, remarks: null,
     is_done: false, done_at: null, notes: null,
     chest: null, sleeve: null, shoulder: null, armfit: null, length: null, size: null,
