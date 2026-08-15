@@ -51,6 +51,16 @@ Object.keys(ROLE_PASSWORDS).forEach(role => {
   }
 });
 
+// Static secret for external tools/integrations to call this API directly
+// (e.g. from a script, another app, or Claude) without going through the
+// browser login flow. Grants full admin-level access — keep it as secret
+// as any password. Set API_KEY in the environment to enable it; if unset,
+// this form of access is simply disabled.
+const API_KEY = process.env.API_KEY;
+if (!API_KEY) {
+  console.warn('Warning: no API_KEY set in the environment — external API-key access is disabled until one is configured.');
+}
+
 // Simple in-memory session store: token -> { role, name, createdAt }. Good
 // enough for a single small server instance. Sessions are lost on restart
 // (e.g. Render free tier spinning down after inactivity) — logging back in
@@ -347,17 +357,28 @@ app.all('/api', async (req, res) => {
       return res.json(await doGetRoster());
     }
 
-    // Every other action requires a valid session from a successful
-    // password login. The role used for permission checks comes from the
-    // session (set at login time), never from whatever the browser sends,
-    // so a client can't just claim to be "admin".
-    const session = getSession(params.token);
-    if (!session) {
-      return res.json({ success: false, error: 'Session expired. Please log in again.' });
+    // API key auth — for external tools/integrations (Claude, scripts,
+    // other apps), as an alternative to the browser's password/session
+    // login. Grants full admin-level access, so the key must be treated
+    // as a secret exactly like any of the role passwords.
+    const apiKey = (req.headers['x-api-key'] || params.apiKey || '').toString();
+    let role;
+    if (API_KEY && apiKey && apiKey === API_KEY) {
+      role = 'admin';
+    } else {
+      // Every other action requires a valid session from a successful
+      // password login. The role used for permission checks comes from the
+      // session (set at login time), never from whatever the browser sends,
+      // so a client can't just claim to be "admin".
+      const session = getSession(params.token);
+      if (!session) {
+        return res.json({ success: false, error: 'Session expired. Please log in again.' });
+      }
+      role = session.role;
     }
 
-    const permissionError = checkPermission(action, session.role);
-    const result = permissionError || (await routeAction(action, Object.assign({}, params, { role: session.role })));
+    const permissionError = checkPermission(action, role);
+    const result = permissionError || (await routeAction(action, Object.assign({}, params, { role })));
     res.json(result);
   } catch (err) {
     console.error(err);
