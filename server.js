@@ -390,6 +390,7 @@ async function routeAction(action, params) {
     case 'updateMaster': return doUpdateMaster(params);
     case 'updateTailor': return doUpdateTailor(params);
     case 'markDone': return doMarkDone(params);
+    case 'undoMarkDone': return doUndoMarkDone(params);
     case 'deleteOrder': return doDeleteOrder(params);
     case 'updateUrgent': return doUpdateUrgent(params);
     case 'getSamples': return doGetSamples();
@@ -656,6 +657,16 @@ async function doMarkDone(params) {
     return { success: false, error: 'Cannot mark Done — no tailor has been assigned yet.' };
   }
   await sbUpdate('orders', id, { is_done: true, done_at: new Date().toISOString() });
+  return { success: true };
+}
+
+async function doUndoMarkDone(params) {
+  // Admin-only escape hatch for orders accidentally marked Done (e.g. a
+  // tailor scanned the wrong QR code) — puts it back to "not done" so it
+  // can be scanned and completed for real. Not exposed to any other role.
+  const row = parseRow(params);
+  if (!row) return { success: false, error: 'Invalid row.' };
+  await sbUpdate('orders', row - 2, { is_done: false, done_at: null });
   return { success: true };
 }
 
