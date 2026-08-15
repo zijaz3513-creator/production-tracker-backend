@@ -21,6 +21,9 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
+const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
+const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
+const { z } = require('zod');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
@@ -854,6 +857,250 @@ async function doMarkSampleDone(params) {
   await sbUpdate('design_samples', id, { tailor_ended_at: new Date().toISOString(), is_done: true });
   return { success: true };
 }
+
+// ============================================================
+// MCP SERVER — lets Claude (or any other MCP-compatible tool) work with
+// this system directly in a conversation. Separate from the /api used by
+// the browser app: these tools speak in plain order numbers and readable
+// fields rather than row numbers and raw positional arrays.
+// ============================================================
+
+function embLabel(raw) {
+  const m = (raw || '').match(/^(RED|GREEN|SKIP)\|(.*)$/);
+  if (!m) return 'not started';
+  if (m[1] === 'SKIP') return 'not needed';
+  if (m[1] === 'RED') return 'out — sent ' + m[2];
+  return 'received ' + m[2];
+}
+
+function orderStatusLabel(rec) {
+  if (rec.is_done) return 'Done';
+  if (rec.tailor) return 'With tailor';
+  if (rec.master) return 'In cutting';
+  if (rec.fabric_status === 'Not Available') return 'No fabric';
+  if (!rec.fabric_status) return 'Awaiting fabric check';
+  return 'Fabric ready — not yet assigned';
+}
+
+function formatOrderForMcp(rec) {
+  return {
+    orderNo: rec.order_no,
+    sku: rec.sku,
+    garmentType: rec.garment_type,
+    orderType: rec.order_type,
+    status: orderStatusLabel(rec),
+    fabricStatus: rec.fabric_status || 'not checked yet',
+    fabricName: rec.fabric_name || null,
+    fabricMadeIn: rec.fabric_made_in || null,
+    machineEmbroidery: embLabel(rec.machine_emb),
+    machEmbFabric: rec.mach_emb_fabric || null,
+    machEmbMetersSent: rec.mach_emb_meters_sent,
+    machEmbMetersReceived: rec.mach_emb_meters_received,
+    handEmbroidery: embLabel(rec.hand_emb),
+    master: rec.master || null,
+    tailor: rec.tailor || null,
+    urgent: !!rec.urgent,
+    urgentDueDate: rec.urgent_due_date || null,
+    createdAt: rec.created_at || null,
+    doneAt: rec.done_at || null,
+    notes: rec.notes || null
+  };
+}
+
+async function findRowByOrderNo(orderNo) {
+  const rows = await sbFetch('GET', `orders?order_no=eq.${encodeURIComponent(orderNo)}&select=id&limit=1`);
+  return (rows && rows[0]) ? rows[0].id + 2 : null;
+}
+
+function mcpJson(obj, isError) {
+  return { content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }], structuredContent: obj, isError: !!isError };
+}
+
+function buildMcpServer() {
+  const server = new McpServer({ name: 'production-tracker', version: '1.0.0' });
+
+  server.registerTool('search_orders', {
+    title: 'Search Orders',
+    description: 'Search production orders by order number/SKU text, and optionally filter by status, master, or tailor. Returns the most recent matches (default 20, max 50) with readable fields. Use this when you don\'t know the exact order number.',
+    inputSchema: {
+      query: z.string().optional().describe('Text to match against order number or SKU'),
+      status: z.enum(['done', 'cutting', 'with_tailor', 'awaiting_fabric', 'no_fabric', 'fabric_ready']).optional(),
+      master: z.string().optional().describe('Filter to orders currently assigned to this cutting master'),
+      tailor: z.string().optional().describe('Filter to orders currently assigned to this tailor'),
+      limit: z.number().min(1).max(50).optional()
+    }
+  }, async ({ query, status, master, tailor, limit }) => {
+    const max = Math.min(limit || 20, 50);
+    let qs = 'select=*&order=id.desc&limit=800';
+    if (master) qs += `&master=eq.${encodeURIComponent(master)}`;
+    if (tailor) qs += `&tailor=eq.${encodeURIComponent(tailor)}`;
+    if (status === 'done') qs += '&is_done=eq.true';
+
+    const rows = (await sbFetch('GET', `orders?${qs}`)) || [];
+    const statusMap = {
+      cutting: 'In cutting', with_tailor: 'With tailor',
+      awaiting_fabric: 'Awaiting fabric check', no_fabric: 'No fabric',
+      fabric_ready: 'Fabric ready — not yet assigned'
+    };
+
+    const results = rows.filter(rec => {
+      if (query) {
+        const hay = (String(rec.order_no || '') + ' ' + String(rec.sku || '')).toLowerCase();
+        if (!hay.includes(query.toLowerCase())) return false;
+      }
+      if (status && status !== 'done') {
+        if (orderStatusLabel(rec) !== statusMap[status]) return false;
+      }
+      return true;
+    }).slice(0, max).map(formatOrderForMcp);
+
+    return mcpJson({ count: results.length, note: 'Searched the 800 most recent orders — narrow with query/master/tailor for older ones.', orders: results });
+  });
+
+  server.registerTool('get_order', {
+    title: 'Get Order',
+    description: 'Get full details for one order by its exact order number.',
+    inputSchema: { orderNo: z.string() }
+  }, async ({ orderNo }) => {
+    const rows = await sbFetch('GET', `orders?order_no=eq.${encodeURIComponent(orderNo)}&limit=1`);
+    const rec = rows && rows[0];
+    if (!rec) return mcpJson({ error: 'No order found with order number "' + orderNo + '".' }, true);
+    return mcpJson(formatOrderForMcp(rec));
+  });
+
+  server.registerTool('add_order', {
+    title: 'Add Order',
+    description: 'Create a new production order. Automatically routes it to machine/hand embroidery (or skips both, for Simple) based on orderType, same as adding one from the app.',
+    inputSchema: {
+      orderNo: z.string(), sku: z.string(),
+      garmentType: z.enum(['Abaya', 'Vest', 'Pant', 'Skirt', 'Dress', 'Bisht', 'Blouse']),
+      orderType: z.enum(['Simple', 'Hand Embroidery', 'Machine Embroidery']),
+      notes: z.string().optional(),
+      chest: z.string().optional(), sleeve: z.string().optional(), shoulder: z.string().optional(),
+      armfit: z.string().optional(), length: z.string().optional(), size: z.string().optional(),
+      urgent: z.boolean().optional(), urgentDate: z.string().optional().describe('Required if urgent is true, format DD/MM/YYYY or similar')
+    }
+  }, async (p) => {
+    const result = await doAddOrder({
+      orderNo: p.orderNo, sku: p.sku, garmentType: p.garmentType, orderType: p.orderType,
+      notes: p.notes || '', chest: p.chest || '', sleeve: p.sleeve || '', shoulder: p.shoulder || '',
+      armfit: p.armfit || '', length: p.length || '', size: p.size || '',
+      urgent: p.urgent ? 'Yes' : '', urgentDate: p.urgentDate || ''
+    });
+    if (!result.success) return mcpJson(result, true);
+
+    const ts = new Date().toLocaleString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+    if (p.orderType === 'Hand Embroidery') {
+      await doUpdateHandEmb({ row: result.row, value: 'RED|' + ts });
+      await doUpdateMachEmb({ row: result.row, value: 'SKIP|' + ts });
+    } else if (p.orderType === 'Machine Embroidery') {
+      await doUpdateMachEmb({ row: result.row, value: 'RED|' + ts });
+      await doUpdateHandEmb({ row: result.row, value: 'SKIP|' + ts });
+    } else {
+      await doUpdateMachEmb({ row: result.row, value: 'SKIP|' + ts });
+      await doUpdateHandEmb({ row: result.row, value: 'SKIP|' + ts });
+    }
+    return mcpJson({ success: true, orderNo: p.orderNo });
+  });
+
+  server.registerTool('update_fabric', {
+    title: 'Update Fabric Status',
+    description: 'Mark an order\'s fabric as Available or Not Available.',
+    inputSchema: { orderNo: z.string(), value: z.enum(['Available', 'Not Available']) }
+  }, async ({ orderNo, value }) => {
+    const row = await findRowByOrderNo(orderNo);
+    if (!row) return mcpJson({ error: 'No order found with order number "' + orderNo + '".' }, true);
+    return mcpJson(await doUpdateFabric({ row, value }));
+  });
+
+  server.registerTool('assign_master', {
+    title: 'Assign Cutting Master',
+    description: 'Assign (or reassign) which master is cutting an order. Pass an empty master to unassign.',
+    inputSchema: { orderNo: z.string(), master: z.string() }
+  }, async ({ orderNo, master }) => {
+    const row = await findRowByOrderNo(orderNo);
+    if (!row) return mcpJson({ error: 'No order found with order number "' + orderNo + '".' }, true);
+    return mcpJson(await doUpdateMaster({ row, master }));
+  });
+
+  server.registerTool('assign_tailor', {
+    title: 'Assign Tailor',
+    description: 'Assign (or reassign) which tailor is sewing an order. Pass an empty tailor to unassign.',
+    inputSchema: { orderNo: z.string(), tailor: z.string() }
+  }, async ({ orderNo, tailor }) => {
+    const row = await findRowByOrderNo(orderNo);
+    if (!row) return mcpJson({ error: 'No order found with order number "' + orderNo + '".' }, true);
+    return mcpJson(await doUpdateTailor({ row, tailor }));
+  });
+
+  server.registerTool('mark_order_done', {
+    title: 'Mark Order Done',
+    description: 'Mark an order as completed. Fails if no tailor has been assigned yet.',
+    inputSchema: { orderNo: z.string() }
+  }, async ({ orderNo }) => {
+    const row = await findRowByOrderNo(orderNo);
+    if (!row) return mcpJson({ error: 'No order found with order number "' + orderNo + '".' }, true);
+    return mcpJson(await doMarkDone({ row }));
+  });
+
+  server.registerTool('undo_order_done', {
+    title: 'Undo Order Done',
+    description: 'Reopen an order that was accidentally marked Done, putting it back to in-progress.',
+    inputSchema: { orderNo: z.string() }
+  }, async ({ orderNo }) => {
+    const row = await findRowByOrderNo(orderNo);
+    if (!row) return mcpJson({ error: 'No order found with order number "' + orderNo + '".' }, true);
+    return mcpJson(await doUndoMarkDone({ row }));
+  });
+
+  server.registerTool('get_production_summary', {
+    title: 'Get Production Summary',
+    description: 'Aggregate production stats: totals, how many are done/in-cutting/with-tailor/awaiting-fabric, and a per-master and per-tailor breakdown. Much cheaper than listing every order when you just need the numbers.',
+    inputSchema: {}
+  }, async () => {
+    const rows = (await sbFetch('GET', 'orders?select=order_no,master,tailor,fabric_status,is_done&order=id.desc&limit=2000')) || [];
+    const summary = { totalConsidered: rows.length, done: 0, withTailor: 0, inCutting: 0, awaitingFabric: 0, noFabric: 0, byMaster: {}, byTailor: {} };
+    rows.forEach(rec => {
+      if (rec.is_done) summary.done++;
+      else if (rec.tailor) summary.withTailor++;
+      else if (rec.master) summary.inCutting++;
+      else if (rec.fabric_status === 'Not Available') summary.noFabric++;
+      else if (!rec.fabric_status) summary.awaitingFabric++;
+
+      if (rec.master && !rec.is_done) summary.byMaster[rec.master] = (summary.byMaster[rec.master] || 0) + 1;
+      if (rec.tailor && !rec.is_done) summary.byTailor[rec.tailor] = (summary.byTailor[rec.tailor] || 0) + 1;
+    });
+    return mcpJson(summary);
+  });
+
+  server.registerTool('list_staff', {
+    title: 'List Staff',
+    description: 'List active masters, tailors, designers, or pattern masters.',
+    inputSchema: { staffRole: z.enum(['master', 'tailor', 'designer', 'patternmaster']) }
+  }, async ({ staffRole }) => {
+    return mcpJson({ staffRole, names: await getActiveStaffNames(staffRole) });
+  });
+
+  return server;
+}
+
+app.post('/mcp/:apiKey', async (req, res) => {
+  if (!API_KEY || req.params.apiKey !== API_KEY) {
+    return res.status(401).json({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' }, id: null });
+  }
+  try {
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+    res.on('close', () => transport.close());
+    const mcpServer = buildMcpServer();
+    await mcpServer.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error('MCP error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' }, id: null });
+    }
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`Production Tracker backend listening on port ${PORT}`);
