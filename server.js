@@ -40,7 +40,8 @@ const ROLE_PASSWORDS = {
   admin: process.env.ADMIN_PASSWORD,
   inventory: process.env.INVENTORY_PASSWORD,
   handemb: process.env.HANDEMB_PASSWORD,
-  machemb: process.env.MACHEMB_PASSWORD
+  machemb: process.env.MACHEMB_PASSWORD,
+  fulfillment: process.env.FULFILLMENT_PASSWORD
 };
 
 // Roles managed as individual people in the "staff" table instead of a
@@ -157,7 +158,17 @@ const ROLE_PERMISSIONS = {
   master: ['getOrders', 'updateTailor'],
   tailor: ['getOrders', 'markDone', 'getSamples', 'markSampleDone'],
   designer: ['getSamples', 'addSample'],
-  patternmaster: ['getSamples', 'assignSampleTailor']
+  patternmaster: ['getSamples', 'assignSampleTailor'],
+  // Same access as Admin, except it cannot delete orders/samples or remove
+  // staff — those three stay Admin-only.
+  fulfillment: [
+    'getOrders', 'addOrder', 'updateFabric', 'updateFabricDetails',
+    'updateMachEmb', 'updateHandEmb', 'updateMaster', 'updateTailor',
+    'markDone', 'undoMarkDone', 'updateUrgent',
+    'getSamples', 'addSample', 'assignSampleTailor', 'assignSampleMaster',
+    'markSampleDone', 'undoSampleDone',
+    'listStaff', 'addStaff', 'reorderStaff'
+  ]
 };
 
 // ============================================================
