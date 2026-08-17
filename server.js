@@ -423,6 +423,7 @@ async function routeAction(action, params) {
     case 'assignSampleMaster': return doAssignSampleMaster(params);
     case 'markSampleDone': return doMarkSampleDone(params);
     case 'undoSampleDone': return doUndoSampleDone(params);
+    case 'deleteSample': return doDeleteSample(params);
     case 'listStaff': return doListStaff(params);
     case 'addStaff': return doAddStaff(params);
     case 'removeStaff': return doRemoveStaff(params);
@@ -877,6 +878,15 @@ async function doUndoSampleDone(params) {
   const row = parseRow(params);
   if (!row) return { success: false, error: 'Invalid row.' };
   await sbUpdate('design_samples', row - 1, { is_done: false, tailor_ended_at: null });
+  return { success: true };
+}
+
+async function doDeleteSample(params) {
+  const row = parseRow(params);
+  if (!row) return { success: false, error: 'Invalid row.' };
+  const id = row - 1;
+  await sbFetch('DELETE', `sample_fabrics?sample_id=eq.${id}`, undefined, { Prefer: 'return=minimal' });
+  await sbFetch('DELETE', `design_samples?id=eq.${id}`, undefined, { Prefer: 'return=minimal' });
   return { success: true };
 }
 
