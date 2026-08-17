@@ -420,7 +420,9 @@ async function routeAction(action, params) {
     case 'getSamples': return doGetSamples();
     case 'addSample': return doAddSample(params);
     case 'assignSampleTailor': return doAssignSampleTailor(params);
+    case 'assignSampleMaster': return doAssignSampleMaster(params);
     case 'markSampleDone': return doMarkSampleDone(params);
+    case 'undoSampleDone': return doUndoSampleDone(params);
     case 'listStaff': return doListStaff(params);
     case 'addStaff': return doAddStaff(params);
     case 'removeStaff': return doRemoveStaff(params);
@@ -833,6 +835,18 @@ async function doAddSample(params) {
   return { success: true, row: created.id + 1, srNo };
 }
 
+async function doAssignSampleMaster(params) {
+  const row = parseRow(params);
+  if (!row) return { success: false, error: 'Invalid row.' };
+  const master = (params.master || '').toString();
+  const patternMasters = await getActiveStaffNames('patternmaster');
+  if (patternMasters.indexOf(master) === -1) {
+    return { success: false, error: 'Unknown pattern master: ' + master };
+  }
+  await sbUpdate('design_samples', row - 1, { master });
+  return { success: true };
+}
+
 async function doAssignSampleTailor(params) {
   const row = parseRow(params);
   if (!row) return { success: false, error: 'Invalid row.' };
@@ -855,6 +869,14 @@ async function doMarkSampleDone(params) {
     return { success: false, error: 'Cannot mark Done — no tailor has been assigned yet.' };
   }
   await sbUpdate('design_samples', id, { tailor_ended_at: new Date().toISOString(), is_done: true });
+  return { success: true };
+}
+
+async function doUndoSampleDone(params) {
+  // Admin-only escape hatch, same idea as undoMarkDone for orders.
+  const row = parseRow(params);
+  if (!row) return { success: false, error: 'Invalid row.' };
+  await sbUpdate('design_samples', row - 1, { is_done: false, tailor_ended_at: null });
   return { success: true };
 }
 
