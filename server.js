@@ -47,7 +47,7 @@ const ROLE_PASSWORDS = {
 // Roles managed as individual people in the "staff" table instead of a
 // single shared password. Tailors are capped (MAX_TAILOR_SLOTS) because
 // of the order row layout; the others aren't.
-const STAFF_ROLES = ['master', 'tailor', 'designer', 'patternmaster'];
+const STAFF_ROLES = ['master', 'tailor', 'designer', 'patternmaster', 'samplemachemb', 'samplehandemb'];
 
 Object.keys(ROLE_PASSWORDS).forEach(role => {
   if (!ROLE_PASSWORDS[role]) {
@@ -156,9 +156,11 @@ const MAX_FABRIC_SLOTS = 6;
 const ROLE_PERMISSIONS = {
   inventory: ['getOrders', 'updateFabric', 'updateFabricDetails', 'updateMachEmb', 'updateHandEmb'],
   master: ['getOrders', 'updateTailor'],
-  tailor: ['getOrders', 'markDone', 'getSamples', 'markSampleDone'],
+  tailor: ['getOrders', 'markDone', 'getSamples', 'markSampleDone', 'sendSampleEmb'],
   designer: ['getSamples', 'addSample'],
   patternmaster: ['getSamples', 'assignSampleTailor'],
+  samplemachemb: ['getSamples', 'receiveSampleEmb'],
+  samplehandemb: ['getSamples', 'receiveSampleEmb'],
   // Same access as Admin, except it cannot delete orders/samples or remove
   // staff — those three stay Admin-only.
   fulfillment: [
@@ -166,7 +168,7 @@ const ROLE_PERMISSIONS = {
     'updateMachEmb', 'updateHandEmb', 'updateMaster', 'updateTailor',
     'markDone', 'undoMarkDone', 'updateUrgent',
     'getSamples', 'addSample', 'assignSampleTailor', 'assignSampleMaster',
-    'markSampleDone', 'undoSampleDone',
+    'markSampleDone', 'undoSampleDone', 'sendSampleEmb', 'receiveSampleEmb',
     'listStaff', 'addStaff', 'reorderStaff'
   ]
 };
@@ -248,13 +250,15 @@ async function getActiveStaffNames(staffRole) {
 }
 
 async function doGetRoster() {
-  const [masters, tailors, designers, patternmasters] = await Promise.all([
+  const [masters, tailors, designers, patternmasters, sampleMachEmb, sampleHandEmb] = await Promise.all([
     getActiveStaffNames('master'),
     getActiveStaffNames('tailor'),
     getActiveStaffNames('designer'),
-    getActiveStaffNames('patternmaster')
+    getActiveStaffNames('patternmaster'),
+    getActiveStaffNames('samplemachemb'),
+    getActiveStaffNames('samplehandemb')
   ]);
-  return { success: true, masters, tailors, designers, patternmasters };
+  return { success: true, masters, tailors, designers, patternmasters, sampleMachEmb, sampleHandEmb };
 }
 
 async function doListStaff(params) {
@@ -377,22 +381,25 @@ app.all('/api', async (req, res) => {
     // as a secret exactly like any of the role passwords.
     const apiKey = (req.headers['x-api-key'] || params.apiKey || '').toString();
     let role;
+    let authenticatedName = '';
     if (API_KEY && apiKey && apiKey === API_KEY) {
       role = 'admin';
     } else {
       // Every other action requires a valid session from a successful
-      // password login. The role used for permission checks comes from the
-      // session (set at login time), never from whatever the browser sends,
-      // so a client can't just claim to be "admin".
+      // password login. The role (and, for individually-logged-in staff,
+      // their real name) used for permission/ownership checks comes from
+      // the session set at login time, never from whatever the browser
+      // sends, so a client can't just claim to be someone else.
       const session = getSession(params.token);
       if (!session) {
         return res.json({ success: false, error: 'Session expired. Please log in again.' });
       }
       role = session.role;
+      authenticatedName = session.name || '';
     }
 
     const permissionError = checkPermission(action, role);
-    const result = permissionError || (await routeAction(action, Object.assign({}, params, { role })));
+    const result = permissionError || (await routeAction(action, Object.assign({}, params, { role, authenticatedName })));
     res.json(result);
   } catch (err) {
     console.error(err);
@@ -432,6 +439,8 @@ async function routeAction(action, params) {
     case 'addSample': return doAddSample(params);
     case 'assignSampleTailor': return doAssignSampleTailor(params);
     case 'assignSampleMaster': return doAssignSampleMaster(params);
+    case 'sendSampleEmb': return doSendSampleEmb(params);
+    case 'receiveSampleEmb': return doReceiveSampleEmb(params);
     case 'markSampleDone': return doMarkSampleDone(params);
     case 'undoSampleDone': return doUndoSampleDone(params);
     case 'deleteSample': return doDeleteSample(params);
@@ -741,7 +750,7 @@ async function doUpdateUrgent(params) {
 // DESIGN SAMPLES
 // ============================================================
 function buildSampleRowArray(rec, fabricsBySampleId) {
-  const row = new Array(33).fill('');
+  const row = new Array(37).fill('');
   if (!rec) return row;
 
   row[0] = rec.sr_no || '';
@@ -769,6 +778,10 @@ function buildSampleRowArray(rec, fabricsBySampleId) {
   row[30] = rec.tailor_started_at || '';
   row[31] = rec.tailor_ended_at || '';
   row[32] = rec.is_done ? 'Done' : '';
+  row[33] = rec.mach_emb_person || '';
+  row[34] = rec.mach_emb_status || '';
+  row[35] = rec.hand_emb_person || '';
+  row[36] = rec.hand_emb_status || '';
   return row;
 }
 
@@ -789,7 +802,7 @@ async function doGetSamples() {
     if (rec.id > maxId) maxId = rec.id;
   });
 
-  const data = [new Array(33).fill('')];
+  const data = [new Array(37).fill('')];
   for (let id = 1; id <= maxId; id++) {
     data.push(buildSampleRowArray(byId[id], fabricsBySampleId));
   }
@@ -817,6 +830,23 @@ async function doAddSample(params) {
   const liningColor = (params.liningColor || '').toString();
   const pipingColor = (params.pipingColor || '').toString();
 
+  let machEmbPerson = null;
+  if (machEmb) {
+    machEmbPerson = (params.machEmbPerson || '').toString().trim();
+    const machStaff = await getActiveStaffNames('samplemachemb');
+    if (machStaff.indexOf(machEmbPerson) === -1) {
+      return { success: false, error: 'Please pick who should do the machine embroidery.' };
+    }
+  }
+  let handEmbPerson = null;
+  if (handEmb) {
+    handEmbPerson = (params.handEmbPerson || '').toString().trim();
+    const handStaff = await getActiveStaffNames('samplehandemb');
+    if (handStaff.indexOf(handEmbPerson) === -1) {
+      return { success: false, error: 'Please pick who should do the hand embroidery.' };
+    }
+  }
+
   const fabricSlots = [];
   let hasAnyFabric = false;
   for (let i = 1; i <= MAX_FABRIC_SLOTS; i++) {
@@ -836,6 +866,7 @@ async function doAddSample(params) {
   const created = await sbInsertOne('design_samples', {
     sr_no: srNo, name, code, type, fabric_color: fabricColor,
     master, machine_emb: machEmb, hand_emb: handEmb,
+    mach_emb_person: machEmbPerson, hand_emb_person: handEmbPerson,
     lining_color: liningColor, piping_color: pipingColor
   });
 
@@ -871,14 +902,70 @@ async function doAssignSampleTailor(params) {
   return { success: true };
 }
 
+async function doSendSampleEmb(params) {
+  // Tailor sends a cut piece out for machine/hand embroidery. Only makes
+  // sense for a sample that actually needs it and has someone assigned.
+  const row = parseRow(params);
+  if (!row) return { success: false, error: 'Invalid row.' };
+  const kind = (params.kind || '').toString();
+  if (kind !== 'mach' && kind !== 'hand') return { success: false, error: 'Invalid embroidery kind.' };
+  const id = row - 1;
+
+  const personCol = kind === 'mach' ? 'mach_emb_person' : 'hand_emb_person';
+  const rec = await sbFetch('GET', `design_samples?id=eq.${id}&select=${personCol}`);
+  const person = rec && rec[0] ? rec[0][personCol] : null;
+  if (!person) {
+    return { success: false, error: 'This sample has no ' + (kind === 'mach' ? 'machine' : 'hand') + ' embroidery person assigned.' };
+  }
+
+  const statusCol = kind === 'mach' ? 'mach_emb_status' : 'hand_emb_status';
+  await sbUpdate('design_samples', id, { [statusCol]: 'RED|' + new Date().toLocaleString('en-GB', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' }) });
+  return { success: true };
+}
+
+async function doReceiveSampleEmb(params) {
+  // The assigned machine/hand embroidery person marks their part finished
+  // and hands it back to the tailor. Checked against the person actually
+  // assigned so one embroidery worker can't clear someone else's queue.
+  const row = parseRow(params);
+  if (!row) return { success: false, error: 'Invalid row.' };
+  const kind = (params.kind || '').toString();
+  if (kind !== 'mach' && kind !== 'hand') return { success: false, error: 'Invalid embroidery kind.' };
+  const id = row - 1;
+  const name = (params.authenticatedName || '').toString();
+
+  const personCol = kind === 'mach' ? 'mach_emb_person' : 'hand_emb_person';
+  const rec = await sbFetch('GET', `design_samples?id=eq.${id}&select=${personCol}`);
+  const person = rec && rec[0] ? rec[0][personCol] : null;
+  if (!person) {
+    return { success: false, error: 'This sample has no ' + (kind === 'mach' ? 'machine' : 'hand') + ' embroidery person assigned.' };
+  }
+  const role = (params.role || '').toString();
+  const isOverride = (role === 'admin' || role === 'fulfillment');
+  if (!isOverride && name && person !== name) {
+    return { success: false, error: 'This sample is assigned to ' + person + ', not you.' };
+  }
+
+  const statusCol = kind === 'mach' ? 'mach_emb_status' : 'hand_emb_status';
+  await sbUpdate('design_samples', id, { [statusCol]: 'GREEN|' + new Date().toLocaleString('en-GB', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' }) });
+  return { success: true };
+}
+
 async function doMarkSampleDone(params) {
   const row = parseRow(params);
   if (!row) return { success: false, error: 'Invalid row.' };
   const id = row - 1;
 
-  const rec = await sbFetch('GET', 'design_samples?id=eq.' + id + '&select=tailor');
-  if (!rec || !rec.length || !rec[0].tailor) {
+  const rec = await sbFetch('GET', 'design_samples?id=eq.' + id + '&select=tailor,mach_emb_person,mach_emb_status,hand_emb_person,hand_emb_status');
+  const s = rec && rec[0];
+  if (!s || !s.tailor) {
     return { success: false, error: 'Cannot mark Done — no tailor has been assigned yet.' };
+  }
+  if (s.mach_emb_person && !(s.mach_emb_status || '').startsWith('GREEN')) {
+    return { success: false, error: 'Cannot mark Done — still waiting on machine embroidery (' + s.mach_emb_person + ').' };
+  }
+  if (s.hand_emb_person && !(s.hand_emb_status || '').startsWith('GREEN')) {
+    return { success: false, error: 'Cannot mark Done — still waiting on hand embroidery (' + s.hand_emb_person + ').' };
   }
   await sbUpdate('design_samples', id, { tailor_ended_at: new Date().toISOString(), is_done: true });
   return { success: true };
