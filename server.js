@@ -45,8 +45,7 @@ const ROLE_PASSWORDS = {
 };
 
 // Roles managed as individual people in the "staff" table instead of a
-// single shared password. Tailors are capped (MAX_TAILOR_SLOTS) because
-// of the order row layout; the others aren't.
+// single shared password.
 const STAFF_ROLES = ['master', 'tailor', 'designer', 'patternmaster', 'samplemachemb', 'samplehandemb'];
 
 Object.keys(ROLE_PASSWORDS).forEach(role => {
@@ -149,7 +148,6 @@ if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
   process.exit(1);
 }
 
-const MAX_TAILOR_SLOTS = 11; // fixed by the order row layout (columns 10-20)
 const MAX_FABRIC_SLOTS = 6;
 
 // Which actions each role may call. Admin bypasses this check entirely.
@@ -283,9 +281,6 @@ async function doAddStaff(params) {
   }
 
   const current = await getActiveStaff(staffRole);
-  if (staffRole === 'tailor' && current.length >= MAX_TAILOR_SLOTS) {
-    return { success: false, error: `Maximum of ${MAX_TAILOR_SLOTS} active tailors — remove one before adding another.` };
-  }
 
   const existing = await sbFetch(
     'GET',
@@ -461,7 +456,7 @@ function parseRow(params) {
 // ORDERS — reconstructs the exact same 34-column array shape the
 // frontend's parseOrders() already expects.
 // ============================================================
-function buildOrderRowArray(rec, tailorNames) {
+function buildOrderRowArray(rec) {
   const row = new Array(41).fill('');
   if (!rec) return row;
 
@@ -476,10 +471,8 @@ function buildOrderRowArray(rec, tailorNames) {
   row[8] = rec.hand_emb || '';
   row[9] = rec.fabric_made_in || '';
 
-  if (rec.tailor) {
-    const idx = tailorNames.indexOf(rec.tailor);
-    if (idx !== -1) row[10 + idx] = rec.tailor_assigned_at || '';
-  }
+  row[10] = rec.tailor || '';
+  row[11] = rec.tailor_assigned_at || '';
 
   row[21] = rec.remarks || '';
   row[22] = rec.is_done ? 'Done' : '';
@@ -505,10 +498,7 @@ function buildOrderRowArray(rec, tailorNames) {
 }
 
 async function doGetOrders() {
-  const [records, tailorNames] = await Promise.all([
-    sbSelectAll('orders', 'id'),
-    getActiveStaffNames('tailor')
-  ]);
+  const records = await sbSelectAll('orders', 'id');
   const byId = {};
   let maxId = 0;
   records.forEach(rec => {
@@ -519,7 +509,7 @@ async function doGetOrders() {
   const data = [new Array(41).fill(''), new Array(41).fill('')];
   for (let id = 1; id <= maxId; id++) {
     const rec = byId[id];
-    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec, tailorNames));
+    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec));
   }
   return { success: true, data };
 }
