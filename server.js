@@ -45,8 +45,8 @@ const ROLE_PASSWORDS = {
 };
 
 // Roles managed as individual people in the "staff" table instead of a
-// single shared password. No cap on how many people can be added to any
-// of these roles, including tailors.
+// single shared password. Tailors are capped (MAX_TAILOR_SLOTS) because
+// of the order row layout; the others aren't.
 const STAFF_ROLES = ['master', 'tailor', 'designer', 'patternmaster', 'samplemachemb', 'samplehandemb'];
 
 Object.keys(ROLE_PASSWORDS).forEach(role => {
@@ -149,11 +149,12 @@ if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
   process.exit(1);
 }
 
+const MAX_TAILOR_SLOTS = 11; // fixed by the order row layout (columns 10-20)
 const MAX_FABRIC_SLOTS = 6;
 
 // Which actions each role may call. Admin bypasses this check entirely.
 const ROLE_PERMISSIONS = {
-  inventory: ['getOrders', 'updateFabric', 'updateFabricDetails', 'updateMachEmb', 'updateHandEmb'],
+  inventory: ['getOrders', 'updateFabric', 'updateFabricDetails', 'updateMachEmb', 'updateHandEmb', 'markDone'],
   master: ['getOrders', 'updateTailor'],
   tailor: ['getOrders', 'markDone', 'getSamples', 'markSampleDone', 'sendSampleEmb'],
   designer: ['getSamples', 'addSample'],
@@ -282,6 +283,9 @@ async function doAddStaff(params) {
   }
 
   const current = await getActiveStaff(staffRole);
+  if (staffRole === 'tailor' && current.length >= MAX_TAILOR_SLOTS) {
+    return { success: false, error: `Maximum of ${MAX_TAILOR_SLOTS} active tailors — remove one before adding another.` };
+  }
 
   const existing = await sbFetch(
     'GET',
@@ -457,8 +461,8 @@ function parseRow(params) {
 // ORDERS — reconstructs the exact same 34-column array shape the
 // frontend's parseOrders() already expects.
 // ============================================================
-function buildOrderRowArray(rec) {
-  const row = new Array(39).fill('');
+function buildOrderRowArray(rec, tailorNames) {
+  const row = new Array(41).fill('');
   if (!rec) return row;
 
   row[0] = rec.sr_no || '';
@@ -472,8 +476,10 @@ function buildOrderRowArray(rec) {
   row[8] = rec.hand_emb || '';
   row[9] = rec.fabric_made_in || '';
 
-  row[10] = rec.tailor || '';
-  row[11] = rec.tailor_assigned_at || '';
+  if (rec.tailor) {
+    const idx = tailorNames.indexOf(rec.tailor);
+    if (idx !== -1) row[10 + idx] = rec.tailor_assigned_at || '';
+  }
 
   row[21] = rec.remarks || '';
   row[22] = rec.is_done ? 'Done' : '';
@@ -493,11 +499,16 @@ function buildOrderRowArray(rec) {
   row[36] = (rec.mach_emb_meters_sent != null) ? String(rec.mach_emb_meters_sent) : '';
   row[37] = (rec.mach_emb_meters_received != null) ? String(rec.mach_emb_meters_received) : '';
   row[38] = rec.order_type || '';
+  row[39] = rec.fabric_source || '';
+  row[40] = rec.fabric_purchase_status || '';
   return row;
 }
 
 async function doGetOrders() {
-  const records = await sbSelectAll('orders', 'id');
+  const [records, tailorNames] = await Promise.all([
+    sbSelectAll('orders', 'id'),
+    getActiveStaffNames('tailor')
+  ]);
   const byId = {};
   let maxId = 0;
   records.forEach(rec => {
@@ -505,10 +516,10 @@ async function doGetOrders() {
     if (rec.id > maxId) maxId = rec.id;
   });
 
-  const data = [new Array(39).fill(''), new Array(39).fill('')];
+  const data = [new Array(41).fill(''), new Array(41).fill('')];
   for (let id = 1; id <= maxId; id++) {
     const rec = byId[id];
-    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec));
+    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec, tailorNames));
   }
   return { success: true, data };
 }
@@ -560,14 +571,57 @@ async function doAddOrder(params) {
   return { success: true, row: created.id + 2, srNo };
 }
 
+const FABRIC_STATUSES = [
+  'Available', 'Not Available',
+  'Ready Made - Found in Factory', 'Ready Made - Stock'
+];
+const FABRIC_SOURCES = ['Kuwait', 'China'];
+const FABRIC_PURCHASE_STATUSES = ['In Purchase', 'Not In Purchase'];
+
+// A ready-made piece needs no cutting or sewing at all — it skips the
+// master/tailor stage entirely and goes straight to "ready to mark Done."
+function isReadyMadeStatus(value) {
+  return value === 'Ready Made - Found in Factory' || value === 'Ready Made - Stock';
+}
+
 async function doUpdateFabric(params) {
   const row = parseRow(params);
   if (!row) return { success: false, error: 'Invalid row.' };
   const value = params.value;
-  if (value !== 'Available' && value !== 'Not Available') {
-    return { success: false, error: 'Fabric value must be "Available" or "Not Available".' };
+  if (FABRIC_STATUSES.indexOf(value) === -1) {
+    return { success: false, error: 'Invalid fabric status.' };
   }
-  await sbUpdate('orders', row - 2, { fabric_status: value });
+
+  const patch = { fabric_status: value };
+
+  if (value === 'Not Available') {
+    const source = (params.source || '').toString();
+    const purchaseStatus = (params.purchaseStatus || '').toString();
+    if (FABRIC_SOURCES.indexOf(source) === -1) {
+      return { success: false, error: 'Please pick where the fabric is being sourced from (Kuwait or China).' };
+    }
+    if (FABRIC_PURCHASE_STATUSES.indexOf(purchaseStatus) === -1) {
+      return { success: false, error: 'Please pick the purchase status.' };
+    }
+    patch.fabric_source = source;
+    patch.fabric_purchase_status = purchaseStatus;
+  } else {
+    // Switching away from Not Available clears those two fields — they're
+    // meaningless for Available or either Ready Made status.
+    patch.fabric_source = null;
+    patch.fabric_purchase_status = null;
+  }
+
+  if (isReadyMadeStatus(value)) {
+    // No cutting/sewing needed — clear any master/tailor assignment so the
+    // order doesn't get stuck waiting on a step that will never happen.
+    patch.master = null;
+    patch.master_assigned_at = null;
+    patch.tailor = null;
+    patch.tailor_assigned_at = null;
+  }
+
+  await sbUpdate('orders', row - 2, patch);
   return { success: true };
 }
 
@@ -690,8 +744,10 @@ async function doMarkDone(params) {
   if (!row) return { success: false, error: 'Invalid row.' };
   const id = row - 2;
 
-  const rec = await sbFetch('GET', 'orders?id=eq.' + id + '&select=tailor');
-  if (!rec || !rec.length || !rec[0].tailor) {
+  const rec = await sbFetch('GET', 'orders?id=eq.' + id + '&select=tailor,fabric_status');
+  const s = rec && rec[0];
+  if (!s) return { success: false, error: 'Order not found.' };
+  if (!s.tailor && !isReadyMadeStatus(s.fabric_status)) {
     return { success: false, error: 'Cannot mark Done — no tailor has been assigned yet.' };
   }
   await sbUpdate('orders', id, { is_done: true, done_at: new Date().toISOString() });
@@ -714,6 +770,7 @@ async function doDeleteOrder(params) {
   await sbUpdate('orders', row - 2, {
     sr_no: null, order_no: null, sku: null, fabric_status: null,
     fabric_name: null, fabric_made_in: null, garment_type: null, order_type: null,
+    fabric_source: null, fabric_purchase_status: null,
     master: null, master_assigned_at: null, machine_emb: null, hand_emb: null,
     mach_emb_fabric: null, mach_emb_meters_sent: null, mach_emb_meters_received: null,
     tailor: null, tailor_assigned_at: null, remarks: null,
