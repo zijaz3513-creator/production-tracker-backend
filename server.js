@@ -551,7 +551,7 @@ function parseRow(params) {
 // ORDERS — reconstructs the exact same 34-column array shape the
 // frontend's parseOrders() already expects.
 // ============================================================
-function buildOrderRowArray(rec, tailorNames) {
+function buildOrderRowArray(rec) {
   const row = new Array(41).fill('');
   if (!rec) return row;
 
@@ -566,10 +566,18 @@ function buildOrderRowArray(rec, tailorNames) {
   row[8] = rec.hand_emb || '';
   row[9] = rec.fabric_made_in || '';
 
-  if (rec.tailor) {
-    const idx = tailorNames.indexOf(rec.tailor);
-    if (idx !== -1) row[10 + idx] = rec.tailor_assigned_at || '';
-  }
+  // Tailor is written directly by name (columns 10/11), the same way
+  // `master` is above — NOT by position in the active-tailor roster.
+  // The old scheme placed rec.tailor_assigned_at into row[10 + idx],
+  // where idx was the tailor's index in the currently-active tailor
+  // list. That's unsafe: the frontend decoded it back using its own
+  // separately-cached TAILORS array, and the two orderings only stay
+  // in sync until someone adds/removes/reorders a tailor in Admin >
+  // Staff. The instant they diverge, every order's tailor decodes to
+  // whichever name happens to now sit at that same slot — which is
+  // exactly the "everything shows the same tailor" bug this replaces.
+  row[10] = rec.tailor || '';
+  row[11] = rec.tailor_assigned_at || '';
 
   row[21] = rec.remarks || '';
   row[22] = rec.is_done ? 'Done' : '';
@@ -595,10 +603,7 @@ function buildOrderRowArray(rec, tailorNames) {
 }
 
 async function doGetOrders() {
-  const [records, tailorNames] = await Promise.all([
-    sbSelectAll('orders', 'id'),
-    getActiveStaffNames('tailor')
-  ]);
+  const records = await sbSelectAll('orders', 'id');
   const byId = {};
   let maxId = 0;
   records.forEach(rec => {
@@ -609,7 +614,7 @@ async function doGetOrders() {
   const data = [new Array(41).fill(''), new Array(41).fill('')];
   for (let id = 1; id <= maxId; id++) {
     const rec = byId[id];
-    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec, tailorNames));
+    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec));
   }
   return { success: true, data };
 }
@@ -622,13 +627,10 @@ async function doGetOrders() {
 async function doGetOrder(params) {
   const row = parseRow(params);
   if (!row) return { success: false, error: 'Invalid row.' };
-  const [recs, tailorNames] = await Promise.all([
-    sbFetch('GET', `orders?id=eq.${row - 2}&select=*&limit=1`),
-    getActiveStaffNames('tailor')
-  ]);
+  const recs = await sbFetch('GET', `orders?id=eq.${row - 2}&select=*&limit=1`);
   const rec = recs && recs[0];
   if (!rec || isBlankOrder_(rec)) return { success: false, error: 'Order not found.' };
-  return { success: true, row, data: buildOrderRowArray(rec, tailorNames) };
+  return { success: true, row, data: buildOrderRowArray(rec) };
 }
 
 // Same idea as doGetOrder, but for when the caller only has the order
@@ -642,13 +644,10 @@ async function doGetOrderByOrderNo(params) {
   let query = `orders?order_no=eq.${encodeURIComponent(orderNo)}&select=*&limit=1`;
   if (sku) query = `orders?order_no=eq.${encodeURIComponent(orderNo)}&sku=eq.${encodeURIComponent(sku)}&select=*&limit=1`;
 
-  const [recs, tailorNames] = await Promise.all([
-    sbFetch('GET', query),
-    getActiveStaffNames('tailor')
-  ]);
+  const recs = await sbFetch('GET', query);
   const rec = recs && recs[0];
   if (!rec) return { success: false, error: 'Order "' + orderNo + '" not found.' };
-  return { success: true, row: rec.id + 2, data: buildOrderRowArray(rec, tailorNames) };
+  return { success: true, row: rec.id + 2, data: buildOrderRowArray(rec) };
 }
 
 function isBlankOrder_(rec) {
