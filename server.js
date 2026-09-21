@@ -45,7 +45,8 @@ const ROLE_PASSWORDS = {
 };
 
 // Roles managed as individual people in the "staff" table instead of a
-// single shared password.
+// single shared password. Tailors are capped (MAX_TAILOR_SLOTS) because
+// of the order row layout; the others aren't.
 const STAFF_ROLES = ['master', 'tailor', 'designer', 'patternmaster', 'samplemachemb', 'samplehandemb'];
 
 Object.keys(ROLE_PASSWORDS).forEach(role => {
@@ -62,6 +63,94 @@ Object.keys(ROLE_PASSWORDS).forEach(role => {
 const API_KEY = process.env.API_KEY;
 if (!API_KEY) {
   console.warn('Warning: no API_KEY set in the environment — external API-key access is disabled until one is configured.');
+}
+
+// ============================================================
+// Shopify sync — best-effort, fire-and-forget. Never blocks or breaks the
+// tracker's own actions if Shopify is slow, misconfigured, or an order
+// simply doesn't exist there.
+//
+// IMPORTANT PLATFORM LIMITATION: Shopify does not let any app — including
+// custom/private ones — write into the native order Timeline shown in the
+// admin. That's a hard restriction on Shopify's side, not something this
+// code can work around. This instead keeps a running, timestamped log in
+// an order metafield (production_tracker.timeline), and mirrors the
+// latest status into the order's Note field for an at-a-glance view.
+// Both show directly on the Shopify order page.
+// ============================================================
+const SHOPIFY_STORE = process.env.SHOPIFY_STORE_DOMAIN; // e.g. your-store.myshopify.com
+const SHOPIFY_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
+const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-01';
+const SHOPIFY_ENABLED = !!(SHOPIFY_STORE && SHOPIFY_TOKEN);
+if (!SHOPIFY_ENABLED) {
+  console.warn('Shopify sync disabled — set SHOPIFY_STORE_DOMAIN and SHOPIFY_ADMIN_TOKEN to enable it.');
+}
+
+async function shopifyGraphQL(query, variables) {
+  const res = await fetch(`https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': SHOPIFY_TOKEN },
+    body: JSON.stringify({ query, variables })
+  });
+  const json = await res.json();
+  if (json.errors) throw new Error(JSON.stringify(json.errors));
+  return json.data;
+}
+
+async function findShopifyOrder(orderNo) {
+  const clean = String(orderNo || '').trim().replace(/^#/, '');
+  if (!clean) return null;
+  const data = await shopifyGraphQL(
+    `query($q: String!) {
+      orders(first: 1, query: $q) {
+        edges { node { id name
+          metafield(namespace: "production_tracker", key: "timeline") { value }
+        } }
+      }
+    }`,
+    { q: `name:${clean} OR name:#${clean}` }
+  );
+  const edge = data && data.orders && data.orders.edges[0];
+  return edge ? edge.node : null;
+}
+
+// Appends one timestamped line to the order's running log metafield, and
+// mirrors the same line as the order's current Note. Swallows all errors —
+// callers fire this without awaiting it, so a Shopify hiccup never slows
+// down or breaks the tracker itself.
+async function pushShopifyUpdate(orderNo, statusLine) {
+  if (!SHOPIFY_ENABLED || !orderNo) return;
+  try {
+    const order = await findShopifyOrder(orderNo);
+    if (!order) return; // no matching Shopify order — nothing to sync, not an error
+
+    const ts = new Date().toLocaleString('en-GB', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' });
+    const prevLog = (order.metafield && order.metafield.value) || '';
+    const newLog = (prevLog ? prevLog + '\n' : '') + `[${ts}] ${statusLine}`;
+
+    await shopifyGraphQL(
+      `mutation($input: OrderInput!) {
+        orderUpdate(input: $input) { userErrors { field message } }
+      }`,
+      { input: {
+        id: order.id,
+        note: statusLine,
+        metafields: [{ namespace: 'production_tracker', key: 'timeline', type: 'multi_line_text_field', value: newLog }]
+      } }
+    );
+  } catch (e) {
+    console.error('Shopify sync failed for order ' + orderNo + ':', e.message);
+  }
+}
+
+// Looks up an order's order_no from its internal row/id — used by the
+// update handlers below to know what to sync to Shopify. Short-circuits
+// instantly (no DB call) when Shopify sync isn't configured, so this adds
+// zero latency for anyone who hasn't set it up.
+async function getOrderNo(row) {
+  if (!SHOPIFY_ENABLED) return null;
+  const rows = await sbFetch('GET', `orders?id=eq.${row - 2}&select=order_no`);
+  return (rows && rows[0]) ? rows[0].order_no : null;
 }
 
 // Simple in-memory session store: token -> { role, name, createdAt }. Good
@@ -148,13 +237,14 @@ if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
   process.exit(1);
 }
 
+const MAX_TAILOR_SLOTS = 11; // fixed by the order row layout (columns 10-20)
 const MAX_FABRIC_SLOTS = 6;
 
 // Which actions each role may call. Admin bypasses this check entirely.
 const ROLE_PERMISSIONS = {
-  inventory: ['getOrders', 'updateFabric', 'updateFabricDetails', 'updateMachEmb', 'updateHandEmb', 'markDone'],
-  master: ['getOrders', 'updateTailor'],
-  tailor: ['getOrders', 'markDone', 'getSamples', 'markSampleDone', 'sendSampleEmb'],
+  inventory: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'updateFabric', 'updateFabricDetails', 'updateMachEmb', 'updateHandEmb', 'markDone'],
+  master: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'updateTailor'],
+  tailor: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'markDone', 'getSamples', 'markSampleDone', 'sendSampleEmb'],
   designer: ['getSamples', 'addSample'],
   patternmaster: ['getSamples', 'assignSampleTailor'],
   samplemachemb: ['getSamples', 'receiveSampleEmb'],
@@ -162,7 +252,7 @@ const ROLE_PERMISSIONS = {
   // Same access as Admin, except it cannot delete orders/samples or remove
   // staff — those three stay Admin-only.
   fulfillment: [
-    'getOrders', 'addOrder', 'updateFabric', 'updateFabricDetails',
+    'getOrders', 'getOrder', 'getOrderByOrderNo', 'addOrder', 'updateFabric', 'updateFabricDetails',
     'updateMachEmb', 'updateHandEmb', 'updateMaster', 'updateTailor',
     'markDone', 'undoMarkDone', 'updateUrgent',
     'getSamples', 'addSample', 'assignSampleTailor', 'assignSampleMaster',
@@ -281,6 +371,9 @@ async function doAddStaff(params) {
   }
 
   const current = await getActiveStaff(staffRole);
+  if (staffRole === 'tailor' && current.length >= MAX_TAILOR_SLOTS) {
+    return { success: false, error: `Maximum of ${MAX_TAILOR_SLOTS} active tailors — remove one before adding another.` };
+  }
 
   const existing = await sbFetch(
     'GET',
@@ -419,6 +512,8 @@ function checkPermission(action, role) {
 async function routeAction(action, params) {
   switch (action) {
     case 'getOrders': return doGetOrders();
+    case 'getOrder': return doGetOrder(params);
+    case 'getOrderByOrderNo': return doGetOrderByOrderNo(params);
     case 'addOrder': return doAddOrder(params);
     case 'updateFabric': return doUpdateFabric(params);
     case 'updateFabricDetails': return doUpdateFabricDetails(params);
@@ -456,7 +551,7 @@ function parseRow(params) {
 // ORDERS — reconstructs the exact same 34-column array shape the
 // frontend's parseOrders() already expects.
 // ============================================================
-function buildOrderRowArray(rec) {
+function buildOrderRowArray(rec, tailorNames) {
   const row = new Array(41).fill('');
   if (!rec) return row;
 
@@ -471,8 +566,10 @@ function buildOrderRowArray(rec) {
   row[8] = rec.hand_emb || '';
   row[9] = rec.fabric_made_in || '';
 
-  row[10] = rec.tailor || '';
-  row[11] = rec.tailor_assigned_at || '';
+  if (rec.tailor) {
+    const idx = tailorNames.indexOf(rec.tailor);
+    if (idx !== -1) row[10 + idx] = rec.tailor_assigned_at || '';
+  }
 
   row[21] = rec.remarks || '';
   row[22] = rec.is_done ? 'Done' : '';
@@ -498,7 +595,10 @@ function buildOrderRowArray(rec) {
 }
 
 async function doGetOrders() {
-  const records = await sbSelectAll('orders', 'id');
+  const [records, tailorNames] = await Promise.all([
+    sbSelectAll('orders', 'id'),
+    getActiveStaffNames('tailor')
+  ]);
   const byId = {};
   let maxId = 0;
   records.forEach(rec => {
@@ -509,9 +609,46 @@ async function doGetOrders() {
   const data = [new Array(41).fill(''), new Array(41).fill('')];
   for (let id = 1; id <= maxId; id++) {
     const rec = byId[id];
-    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec));
+    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec, tailorNames));
   }
   return { success: true, data };
+}
+
+// Fetches just ONE order (instead of the whole table) — used to refresh a
+// single scanned/looked-up order without re-pulling every order in the
+// system. This is the main thing that keeps Supabase egress low: scanning
+// is by far the most frequent action in the app, and it used to trigger a
+// full-table reload every single time.
+async function doGetOrder(params) {
+  const row = parseRow(params);
+  if (!row) return { success: false, error: 'Invalid row.' };
+  const [recs, tailorNames] = await Promise.all([
+    sbFetch('GET', `orders?id=eq.${row - 2}&select=*&limit=1`),
+    getActiveStaffNames('tailor')
+  ]);
+  const rec = recs && recs[0];
+  if (!rec || isBlankOrder_(rec)) return { success: false, error: 'Order not found.' };
+  return { success: true, row, data: buildOrderRowArray(rec, tailorNames) };
+}
+
+// Same idea as doGetOrder, but for when the caller only has the order
+// number/SKU (e.g. a fresh QR scan or manual lookup not yet in the local
+// cache) and doesn't know the internal row id yet.
+async function doGetOrderByOrderNo(params) {
+  const orderNo = (params.orderNo || '').toString().trim();
+  const sku = (params.sku || '').toString().trim();
+  if (!orderNo) return { success: false, error: 'Order number is required.' };
+
+  let query = `orders?order_no=eq.${encodeURIComponent(orderNo)}&select=*&limit=1`;
+  if (sku) query = `orders?order_no=eq.${encodeURIComponent(orderNo)}&sku=eq.${encodeURIComponent(sku)}&select=*&limit=1`;
+
+  const [recs, tailorNames] = await Promise.all([
+    sbFetch('GET', query),
+    getActiveStaffNames('tailor')
+  ]);
+  const rec = recs && recs[0];
+  if (!rec) return { success: false, error: 'Order "' + orderNo + '" not found.' };
+  return { success: true, row: rec.id + 2, data: buildOrderRowArray(rec, tailorNames) };
 }
 
 function isBlankOrder_(rec) {
@@ -557,6 +694,8 @@ async function doAddOrder(params) {
     armfit, length, size,
     urgent, urgent_due_date: urgentDate || null
   });
+
+  pushShopifyUpdate(orderNo, `Order added to production — awaiting fabric check (SKU ${sku})`);
 
   return { success: true, row: created.id + 2, srNo };
 }
@@ -612,6 +751,16 @@ async function doUpdateFabric(params) {
   }
 
   await sbUpdate('orders', row - 2, patch);
+
+  const orderNo = await getOrderNo(row);
+  let statusLine;
+  if (value === 'Not Available') {
+    statusLine = `Fabric: Not Available (${patch.fabric_source}, ${patch.fabric_purchase_status})`;
+  } else {
+    statusLine = `Fabric: ${value}`;
+  }
+  pushShopifyUpdate(orderNo, statusLine);
+
   return { success: true };
 }
 
@@ -701,6 +850,7 @@ async function doUpdateMaster(params) {
 
   if (master === '') {
     await sbUpdate('orders', id, { master: null, master_assigned_at: null });
+    pushShopifyUpdate(await getOrderNo(row), 'Master unassigned');
     return { success: true };
   }
   const masters = await getActiveStaffNames('master');
@@ -708,6 +858,7 @@ async function doUpdateMaster(params) {
     return { success: false, error: 'Unknown master: ' + master };
   }
   await sbUpdate('orders', id, { master, master_assigned_at: new Date().toISOString() });
+  pushShopifyUpdate(await getOrderNo(row), `In cutting — assigned to Master: ${master}`);
   return { success: true };
 }
 
@@ -719,6 +870,7 @@ async function doUpdateTailor(params) {
 
   if (tailor === '') {
     await sbUpdate('orders', id, { tailor: null, tailor_assigned_at: null });
+    pushShopifyUpdate(await getOrderNo(row), 'Tailor unassigned');
     return { success: true };
   }
   const tailors = await getActiveStaffNames('tailor');
@@ -726,6 +878,7 @@ async function doUpdateTailor(params) {
     return { success: false, error: 'Unknown tailor: ' + tailor };
   }
   await sbUpdate('orders', id, { tailor, tailor_assigned_at: new Date().toISOString() });
+  pushShopifyUpdate(await getOrderNo(row), `With Tailor: ${tailor}`);
   return { success: true };
 }
 
@@ -734,13 +887,14 @@ async function doMarkDone(params) {
   if (!row) return { success: false, error: 'Invalid row.' };
   const id = row - 2;
 
-  const rec = await sbFetch('GET', 'orders?id=eq.' + id + '&select=tailor,fabric_status');
+  const rec = await sbFetch('GET', 'orders?id=eq.' + id + '&select=tailor,fabric_status,order_no');
   const s = rec && rec[0];
   if (!s) return { success: false, error: 'Order not found.' };
   if (!s.tailor && !isReadyMadeStatus(s.fabric_status)) {
     return { success: false, error: 'Cannot mark Done — no tailor has been assigned yet.' };
   }
   await sbUpdate('orders', id, { is_done: true, done_at: new Date().toISOString() });
+  pushShopifyUpdate(s.order_no, 'Production complete — Done ✅');
   return { success: true };
 }
 
