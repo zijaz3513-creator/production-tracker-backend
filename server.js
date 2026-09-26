@@ -260,7 +260,7 @@ const ROLE_PERMISSIONS = {
   atelier_supervisor: [
     'atelierApprovalsList', 'atelierApproveJob', 'atelierRejectJob', 'atelierTeamToday',
     'atelierStandardsList', 'atelierPayrollReport', 'atelierMechanicCallsList', 'atelierMechanicResolve',
-    'atelierGetWorkingTimeConfig'
+    'atelierGetWorkingTimeConfig', 'atelierFindPendingByCode'
   ],
   designer: ['getSamples', 'addSample'],
   patternmaster: ['getSamples', 'assignSampleTailor'],
@@ -584,6 +584,7 @@ async function routeAction(action, params) {
     case 'atelierMechanicCallsList': return doAtelierMechanicCallsList();
     case 'atelierMechanicResolve': return doAtelierMechanicResolve(params);
     case 'atelierPayrollReport': return doAtelierPayrollReport();
+    case 'atelierFindPendingByCode': return doAtelierFindPendingByCode(params);
     // Aeon Workstation — admin only (not in any role's permission list above,
     // so only the admin bypass in checkPermission() can reach these)
     case 'atelierSetStandard': return doAtelierSetStandard(params);
@@ -1522,7 +1523,7 @@ function atelierTodayStartIso() {
 
 function formatAtelierJob(j) {
   return {
-    id: j.id, orderNo: j.order_no, sku: j.sku, model: j.model, garmentType: j.garment_type,
+    id: j.id, tailor: j.tailor, orderNo: j.order_no, sku: j.sku, model: j.model, garmentType: j.garment_type,
     qty: j.qty, status: j.status, manual: j.manual, urgent: j.urgent,
     startAt: j.start_at, endAt: j.end_at,
     durationMinutes: j.duration_ms != null ? Math.round(j.duration_ms / 60000) : null,
@@ -1572,6 +1573,32 @@ async function doAtelierMyEarnings(params) {
 async function doAtelierApprovalsList() {
   const rows = (await sbFetch('GET', 'atelier_jobs?status=eq.pending&select=*&order=end_at.asc')) || [];
   return { success: true, jobs: rows.map(formatAtelierJob) };
+}
+
+// ---- Supervisor scan-to-approve: look up the Atelier job for a scanned
+// order/SKU label (the same labels already used by inventory/master/tailor
+// scanning elsewhere in the app). Prefers a job awaiting approval; if none
+// is pending, returns the most recent job for that line anyway so the
+// supervisor sees *why* nothing is waiting (still in progress, already
+// approved, not started yet) instead of a bare "not found". ----
+async function doAtelierFindPendingByCode(params) {
+  const orderNo = (params.orderNo || '').toString().trim();
+  const sku = (params.sku || '').toString().trim();
+  if (!orderNo && !sku) return { success: false, error: "Scanned code didn't contain an order number or SKU." };
+
+  const base = orderNo && sku
+    ? `order_no=eq.${encodeURIComponent(orderNo)}&sku=eq.${encodeURIComponent(sku)}`
+    : orderNo
+      ? `order_no=eq.${encodeURIComponent(orderNo)}`
+      : `sku=eq.${encodeURIComponent(sku)}`;
+
+  const pending = await sbFetch('GET', `atelier_jobs?${base}&status=eq.pending&select=*&order=created_at.desc&limit=1`);
+  if (pending && pending[0]) return { success: true, job: formatAtelierJob(pending[0]), matchStatus: 'pending' };
+
+  const any = await sbFetch('GET', `atelier_jobs?${base}&select=*&order=created_at.desc&limit=1`);
+  if (any && any[0]) return { success: true, job: formatAtelierJob(any[0]), matchStatus: any[0].status };
+
+  return { success: false, error: 'No Atelier job found yet for this order/SKU.' };
 }
 
 async function doAtelierApproveJob(params) {
