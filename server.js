@@ -1389,16 +1389,42 @@ async function doAtelierMyOrders(params) {
   return { success: true, lines };
 }
 
-// ---- Job lifecycle (one active job per tailor) ----
+// ---- Job lifecycle ----
+// A tailor can have several jobs "in progress" (status 'active') at once —
+// e.g. one paused for a mechanic call while another is picked up in the
+// meantime — but only one of them ever has its timer ticking (run_since
+// set) at a time, since a person can only physically work on one piece at
+// once. getAtelierActiveJob returns that one *running* job (kept under its
+// original name so callers that only care about "the current job" — the
+// mechanic-call flow below — don't need to change); getAtelierActiveJobs
+// returns the full in-progress list; getAtelierJobForTailor fetches one
+// specific in-progress job by id, scoped to its tailor.
 async function getAtelierActiveJob(tailor) {
-  const rows = await sbFetch('GET', `atelier_jobs?tailor=eq.${encodeURIComponent(tailor)}&status=eq.active&select=*&limit=1`);
+  const rows = await sbFetch('GET', `atelier_jobs?tailor=eq.${encodeURIComponent(tailor)}&status=eq.active&run_since=not.is.null&select=*&limit=1`);
   return rows && rows[0];
+}
+async function getAtelierActiveJobs(tailor) {
+  return (await sbFetch('GET', `atelier_jobs?tailor=eq.${encodeURIComponent(tailor)}&status=eq.active&select=*&order=start_at.asc`)) || [];
+}
+async function getAtelierJobForTailor(tailor, jobId) {
+  if (!jobId) return null;
+  const rows = await sbFetch('GET', `atelier_jobs?id=eq.${jobId}&tailor=eq.${encodeURIComponent(tailor)}&status=eq.active&select=*&limit=1`);
+  return rows && rows[0];
+}
+// Pauses whichever job is currently running for this tailor (if any) and
+// returns it, so callers can decide whether to touch it further.
+async function atelierPauseRunning(tailor, exceptJobId) {
+  const running = await getAtelierActiveJob(tailor);
+  if (running && running.id !== exceptJobId) {
+    const accum = Number(running.accum_ms || 0) + (Date.now() - new Date(running.run_since).getTime());
+    await sbUpdate('atelier_jobs', running.id, { accum_ms: accum, run_since: null });
+  }
+  return running;
 }
 
 async function doAtelierStartJob(params) {
   const tailor = (params.authenticatedName || '').toString();
   if (!tailor) return { success: false, error: 'Not signed in.' };
-  if (await getAtelierActiveJob(tailor)) return { success: false, error: 'You already have a job running — finish, pause, or return it first.' };
 
   const manual = !!(params.manual === true || params.manual === 'true');
   const orderNo = (params.orderNo || '').toString().trim();
@@ -1425,6 +1451,11 @@ async function doAtelierStartJob(params) {
     return { success: false, error: 'Garment type is required for a manual entry.' };
   }
 
+  // Starting a new job automatically pauses whatever the tailor was
+  // running — they can have several jobs in progress, just not several
+  // timers ticking at once.
+  await atelierPauseRunning(tailor);
+
   const model = atelierModelFromSku(sku);
   const standardMin = (await getStandardMinutes(model, garmentType)) * qty;
   const now = new Date().toISOString();
@@ -1438,7 +1469,9 @@ async function doAtelierStartJob(params) {
 }
 
 async function doAtelierPauseJob(params) {
-  const job = await getAtelierActiveJob((params.authenticatedName || '').toString());
+  const tailor = (params.authenticatedName || '').toString();
+  const jobId = parseInt(params.jobId, 10) || null;
+  const job = jobId ? await getAtelierJobForTailor(tailor, jobId) : await getAtelierActiveJob(tailor);
   if (!job) return { success: false, error: 'No running job to pause.' };
   if (!job.run_since) return { success: true };
   const accum = Number(job.accum_ms || 0) + (Date.now() - new Date(job.run_since).getTime());
@@ -1447,16 +1480,23 @@ async function doAtelierPauseJob(params) {
 }
 
 async function doAtelierResumeJob(params) {
-  const job = await getAtelierActiveJob((params.authenticatedName || '').toString());
+  const tailor = (params.authenticatedName || '').toString();
+  const jobId = parseInt(params.jobId, 10) || null;
+  const job = jobId ? await getAtelierJobForTailor(tailor, jobId) : await getAtelierActiveJob(tailor);
   if (!job) return { success: false, error: 'No job to resume.' };
   if (job.run_since) return { success: true };
+  // Only one timer runs at a time — pause whatever else is currently
+  // running before resuming this one.
+  await atelierPauseRunning(tailor, job.id);
   await sbUpdate('atelier_jobs', job.id, { run_since: new Date().toISOString() });
   return { success: true };
 }
 
 async function doAtelierFinishJob(params) {
-  const job = await getAtelierActiveJob((params.authenticatedName || '').toString());
-  if (!job) return { success: false, error: 'No running job to finish.' };
+  const tailor = (params.authenticatedName || '').toString();
+  const jobId = parseInt(params.jobId, 10) || null;
+  const job = jobId ? await getAtelierJobForTailor(tailor, jobId) : await getAtelierActiveJob(tailor);
+  if (!job) return { success: false, error: 'No job to finish.' };
   const accum = Number(job.accum_ms || 0) + (job.run_since ? (Date.now() - new Date(job.run_since).getTime()) : 0);
   const now = new Date().toISOString();
   await sbUpdate('atelier_jobs', job.id, { accum_ms: accum, run_since: null, status: 'pending', end_at: now, duration_ms: accum });
@@ -1465,8 +1505,10 @@ async function doAtelierFinishJob(params) {
 
 async function doAtelierReturnJob(params) {
   // Gives back an unfinished job — the order line reappears in the list.
-  const job = await getAtelierActiveJob((params.authenticatedName || '').toString());
-  if (!job) return { success: false, error: 'No running job to return.' };
+  const tailor = (params.authenticatedName || '').toString();
+  const jobId = parseInt(params.jobId, 10) || null;
+  const job = jobId ? await getAtelierJobForTailor(tailor, jobId) : await getAtelierActiveJob(tailor);
+  if (!job) return { success: false, error: 'No job to return.' };
   await sbFetch('DELETE', `atelier_jobs?id=eq.${job.id}`, undefined, { Prefer: 'return=minimal' });
   return { success: true };
 }
@@ -1496,9 +1538,14 @@ async function doAtelierMechanicResolve(params) {
   await sbUpdate('atelier_calls', id, { open: false, fixed_at: now });
 
   if (call.job_id) {
-    const jobRows = await sbFetch('GET', `atelier_jobs?id=eq.${call.job_id}&select=status,run_since&limit=1`);
+    const jobRows = await sbFetch('GET', `atelier_jobs?id=eq.${call.job_id}&select=*&limit=1`);
     const job = jobRows && jobRows[0];
-    if (job && job.status === 'active' && !job.run_since) await sbUpdate('atelier_jobs', call.job_id, { run_since: now });
+    if (job && job.status === 'active' && !job.run_since) {
+      // The tailor may have picked up a different job while waiting on the
+      // mechanic — pause that one before resuming the fixed job's timer.
+      await atelierPauseRunning(job.tailor, job.id);
+      await sbUpdate('atelier_jobs', call.job_id, { run_since: now });
+    }
   }
   return { success: true };
 }
@@ -1536,7 +1583,7 @@ function formatAtelierJob(j) {
 async function doAtelierMyToday(params) {
   const tailor = (params.authenticatedName || '').toString();
   const jobs = (await sbFetch('GET', `atelier_jobs?tailor=eq.${encodeURIComponent(tailor)}&created_at=gte.${atelierTodayStartIso()}&select=*`)) || [];
-  const active = jobs.find(j => j.status === 'active');
+  const activeJobs = jobs.filter(j => j.status === 'active').sort((a, b) => new Date(a.start_at) - new Date(b.start_at));
   let pieces = 0, minutesWorked = 0, earnedApproved = 0, earnedPending = 0;
   jobs.forEach(j => {
     if (j.status === 'approved' || j.status === 'pending') pieces += (j.qty || 0);
@@ -1547,7 +1594,7 @@ async function doAtelierMyToday(params) {
   return {
     success: true, pieces, minutesWorked: Math.round(minutesWorked),
     earnedApproved: +earnedApproved.toFixed(3), earnedPending: +earnedPending.toFixed(3),
-    activeJob: active ? formatAtelierJob(active) : null
+    activeJobs: activeJobs.map(formatAtelierJob)
   };
 }
 
@@ -1654,14 +1701,20 @@ async function doAtelierTeamToday() {
   const stopped = new Set(openCalls.map(c => c.tailor));
 
   const byTailor = {};
-  tailors.forEach(t => { byTailor[t] = { tailor: t, status: 'waiting', currentOrder: null, pieces: 0, minutes: 0 }; });
+  tailors.forEach(t => { byTailor[t] = { tailor: t, status: 'waiting', currentOrder: null, activeCount: 0, pieces: 0, minutes: 0 }; });
   jobs.forEach(j => {
-    const b = byTailor[j.tailor] || (byTailor[j.tailor] = { tailor: j.tailor, status: 'waiting', currentOrder: null, pieces: 0, minutes: 0 });
+    const b = byTailor[j.tailor] || (byTailor[j.tailor] = { tailor: j.tailor, status: 'waiting', currentOrder: null, activeCount: 0, pieces: 0, minutes: 0 });
     if (j.status === 'approved' || j.status === 'pending') b.pieces += (j.qty || 0);
     b.minutes += (j.duration_ms || j.accum_ms || 0) / 60000;
     if (j.status === 'active') {
-      b.currentOrder = { orderNo: j.order_no, sku: j.sku, garmentType: j.garment_type };
-      b.status = stopped.has(j.tailor) ? 'machine_stopped' : (j.run_since ? 'working' : 'paused');
+      b.activeCount++;
+      // A tailor can have several jobs in progress at once now — prefer
+      // showing whichever one is actually running; fall back to the first
+      // paused one seen if nothing is running (yet).
+      if (j.run_since || !b.currentOrder) {
+        b.currentOrder = { orderNo: j.order_no, sku: j.sku, garmentType: j.garment_type };
+        b.status = stopped.has(j.tailor) ? 'machine_stopped' : (j.run_since ? 'working' : 'paused');
+      }
     }
   });
   return { success: true, team: Object.values(byTailor).map(b => Object.assign({}, b, { minutes: Math.round(b.minutes) })) };
