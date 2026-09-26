@@ -41,7 +41,11 @@ const ROLE_PASSWORDS = {
   inventory: process.env.INVENTORY_PASSWORD,
   handemb: process.env.HANDEMB_PASSWORD,
   machemb: process.env.MACHEMB_PASSWORD,
-  fulfillment: process.env.FULFILLMENT_PASSWORD
+  fulfillment: process.env.FULFILLMENT_PASSWORD,
+  // Aeon Workstation supervisor — approves tailoring jobs, sees team status and
+  // payroll, but (like everyone except admin) cannot see or edit pay rates
+  // or standard times.
+  atelier_supervisor: process.env.ATELIER_SUPERVISOR_PASSWORD
 };
 
 // Roles managed as individual people in the "staff" table instead of a
@@ -244,7 +248,20 @@ const MAX_FABRIC_SLOTS = 6;
 const ROLE_PERMISSIONS = {
   inventory: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'updateFabric', 'updateFabricDetails', 'updateMachEmb', 'updateHandEmb', 'markDone'],
   master: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'updateTailor'],
-  tailor: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'markDone', 'getSamples', 'markSampleDone', 'sendSampleEmb'],
+  tailor: [
+    'getOrders', 'getOrder', 'getOrderByOrderNo', 'markDone', 'getSamples', 'markSampleDone', 'sendSampleEmb',
+    // Aeon Workstation — tailor floor
+    'atelierMyOrders', 'atelierStartJob', 'atelierPauseJob', 'atelierResumeJob', 'atelierFinishJob', 'atelierReturnJob',
+    'atelierMechanicCall', 'atelierMyToday', 'atelierMyHistory', 'atelierMyEarnings', 'atelierGetWorkingTimeConfig'
+  ],
+  // Aeon Workstation supervisor: approvals, team status, standard-time
+  // *viewing*, payroll and mechanic calls. Cannot see/edit pay rates or
+  // write standard times — those stay admin-only per spec.
+  atelier_supervisor: [
+    'atelierApprovalsList', 'atelierApproveJob', 'atelierRejectJob', 'atelierTeamToday',
+    'atelierStandardsList', 'atelierPayrollReport', 'atelierMechanicCallsList', 'atelierMechanicResolve',
+    'atelierGetWorkingTimeConfig'
+  ],
   designer: ['getSamples', 'addSample'],
   patternmaster: ['getSamples', 'assignSampleTailor'],
   samplemachemb: ['getSamples', 'receiveSampleEmb'],
@@ -462,6 +479,13 @@ app.all('/api', async (req, res) => {
       // logged in — no session required, nothing sensitive returned.
       return res.json(await doGetRoster());
     }
+    if (action === 'atelierListTailors') {
+      // Names for the tailor sign-in grid — no session yet, nothing sensitive.
+      return res.json(await doAtelierListTailors());
+    }
+    if (action === 'atelierTailorLogin') {
+      return res.json(await doAtelierTailorLogin(params));
+    }
 
     // API key auth — for external tools/integrations (Claude, scripts,
     // other apps), as an alternative to the browser's password/session
@@ -538,6 +562,36 @@ async function routeAction(action, params) {
     case 'addStaff': return doAddStaff(params);
     case 'removeStaff': return doRemoveStaff(params);
     case 'reorderStaff': return doReorderStaff(params);
+
+    // Aeon Workstation — tailor floor
+    case 'atelierMyOrders': return doAtelierMyOrders(params);
+    case 'atelierStartJob': return doAtelierStartJob(params);
+    case 'atelierPauseJob': return doAtelierPauseJob(params);
+    case 'atelierResumeJob': return doAtelierResumeJob(params);
+    case 'atelierFinishJob': return doAtelierFinishJob(params);
+    case 'atelierReturnJob': return doAtelierReturnJob(params);
+    case 'atelierMechanicCall': return doAtelierMechanicCall(params);
+    case 'atelierMyToday': return doAtelierMyToday(params);
+    case 'atelierMyHistory': return doAtelierMyHistory(params);
+    case 'atelierMyEarnings': return doAtelierMyEarnings(params);
+    case 'atelierGetWorkingTimeConfig': return doAtelierGetWorkingTimeConfig();
+    // Aeon Workstation — supervisor / admin
+    case 'atelierApprovalsList': return doAtelierApprovalsList();
+    case 'atelierApproveJob': return doAtelierApproveJob(params);
+    case 'atelierRejectJob': return doAtelierRejectJob(params);
+    case 'atelierTeamToday': return doAtelierTeamToday();
+    case 'atelierStandardsList': return doAtelierStandardsList();
+    case 'atelierMechanicCallsList': return doAtelierMechanicCallsList();
+    case 'atelierMechanicResolve': return doAtelierMechanicResolve(params);
+    case 'atelierPayrollReport': return doAtelierPayrollReport();
+    // Aeon Workstation — admin only (not in any role's permission list above,
+    // so only the admin bypass in checkPermission() can reach these)
+    case 'atelierSetStandard': return doAtelierSetStandard(params);
+    case 'atelierUseFastStandard': return doAtelierUseFastStandard(params);
+    case 'atelierSetTypeDefault': return doAtelierSetTypeDefault(params);
+    case 'atelierGetSettings': return doAtelierGetSettings();
+    case 'atelierSetSettings': return doAtelierSetSettings(params);
+    case 'atelierSetPin': return doAtelierSetPin(params);
     default: return { success: false, error: 'Unknown action: ' + action };
   }
 }
@@ -1177,6 +1231,559 @@ async function doDeleteSample(params) {
   await sbFetch('DELETE', `sample_fabrics?sample_id=eq.${id}`, undefined, { Prefer: 'return=minimal' });
   await sbFetch('DELETE', `design_samples?id=eq.${id}`, undefined, { Prefer: 'return=minimal' });
   return { success: true };
+}
+
+// ============================================================
+// AEON ATELIER — tailor floor module (tablet timers, mechanic calls,
+// approvals, standard times, payroll). Sits on top of the same "orders"
+// and "staff" tables above; its own tables are atelier_jobs, atelier_calls,
+// atelier_standards and atelier_settings (single row, id=1). See the
+// migration SQL supplied alongside this file.
+//
+// Roles: "tailor" (existing role, now also signs in here with a 4-digit
+// PIN instead of the shared/individual password used elsewhere in the
+// app) · "atelier_supervisor" (new shared-password role, view + approve
+// only) · "admin" (full access, including pay settings and standard
+// times, which must stay admin-only per spec).
+// ============================================================
+
+const ATELIER_GARMENT_TYPES = ['Abaya','Pant','Blouse','Skirt','Vest','Dress','Jumpsuit','Bisht','Trenchcoat','Blazer','Inner','Shayla','Set','Other'];
+
+function atelierModelFromSku(sku) {
+  const s = (sku || '').toString().trim();
+  if (!s) return '';
+  const i = s.indexOf('-');
+  return i === -1 ? s : s.slice(0, i);
+}
+
+function atelierQtyFromNotes(notes) {
+  const m = (notes || '').toString().match(/(\d+)\s*(pcs|pc|pieces)/i);
+  return m ? (parseInt(m[1], 10) || 1) : 1;
+}
+
+// ---- Settings (single row, id=1) — cached in memory, invalidated on write ----
+let atelierSettingsCache = null;
+async function getAtelierSettings() {
+  if (atelierSettingsCache) return atelierSettingsCache;
+  const rows = await sbFetch('GET', 'atelier_settings?id=eq.1&select=*&limit=1');
+  atelierSettingsCache = (rows && rows[0]) || {
+    mode: 'trial', type_rates: {}, type_std: {}, hours_per_day: 10, days_per_month: 26, pay_rules: {}
+  };
+  return atelierSettingsCache;
+}
+function invalidateAtelierSettingsCache() { atelierSettingsCache = null; }
+
+async function getStandardMinutes(model, garmentType) {
+  if (model) {
+    const rows = await sbFetch('GET', `atelier_standards?model=eq.${encodeURIComponent(model)}&select=min_per_piece&limit=1`);
+    if (rows && rows[0] && rows[0].min_per_piece != null) return Number(rows[0].min_per_piece);
+  }
+  const settings = await getAtelierSettings();
+  const typeStd = settings.type_std || {};
+  return Number(typeStd[garmentType] || 30); // generic fallback until admin sets real defaults
+}
+
+// ---- Shopify product catalog cache: model -> {title, productType, tags} ----
+// Refreshed periodically in the background; a stale/empty cache never blocks
+// the app — lines just show the raw SKU + backend garment type instead.
+let shopifyCatalogByModel = {};
+async function refreshShopifyCatalog() {
+  if (!SHOPIFY_ENABLED) return;
+  try {
+    const byModel = {};
+    let cursor = null, pages = 0;
+    do {
+      const data = await shopifyGraphQL(
+        `query($cursor: String) {
+          products(first: 100, after: $cursor) {
+            pageInfo { hasNextPage endCursor }
+            edges { node { title productType tags variants(first: 5) { edges { node { sku } } } } }
+          }
+        }`,
+        { cursor }
+      );
+      const conn = data.products;
+      conn.edges.forEach(({ node }) => {
+        node.variants.edges.forEach(({ node: v }) => {
+          const model = atelierModelFromSku(v.sku);
+          if (model && !byModel[model]) byModel[model] = { title: node.title, productType: node.productType, tags: node.tags };
+        });
+      });
+      cursor = conn.pageInfo.hasNextPage ? conn.pageInfo.endCursor : null;
+      pages++;
+    } while (cursor && pages < 20);
+    shopifyCatalogByModel = byModel;
+    console.log(`Aeon Workstation: Shopify catalog cached (${Object.keys(byModel).length} models).`);
+  } catch (e) {
+    console.error('Aeon Workstation: Shopify catalog refresh failed:', e.message);
+  }
+}
+if (SHOPIFY_ENABLED) {
+  refreshShopifyCatalog();
+  setInterval(refreshShopifyCatalog, 15 * 60 * 1000);
+}
+
+// ---- Tailor sign-in: name + 4-digit PIN (separate from the password login
+// above). PINs live on the same "staff" row as the tailor's regular
+// password, in atelier_pin_hash/atelier_pin_salt. ----
+async function doAtelierListTailors() {
+  return { success: true, names: await getActiveStaffNames('tailor') };
+}
+
+async function doAtelierTailorLogin(params) {
+  const name = (params.name || '').toString();
+  const pin = (params.pin || '').toString();
+  if (!name || !/^\d{4}$/.test(pin)) return { success: false, error: 'Select your name and enter your 4-digit PIN.' };
+
+  const rows = await sbFetch('GET', `staff?select=id,name,atelier_pin_hash,atelier_pin_salt&role=eq.tailor&name=eq.${encodeURIComponent(name)}&active=eq.true&limit=1`);
+  const rec = rows && rows[0];
+  if (!rec || !rec.atelier_pin_hash || !verifyPassword(pin, rec.atelier_pin_hash, rec.atelier_pin_salt)) {
+    return { success: false, error: 'Incorrect name or PIN.' };
+  }
+  const token = crypto.randomBytes(24).toString('hex');
+  sessions.set(token, { role: 'tailor', name, createdAt: Date.now() });
+  return { success: true, token, name };
+}
+
+// Admin-only: set/change a tailor's PIN (Admin > Staff, or Atelier > Settings)
+async function doAtelierSetPin(params) {
+  const id = parseInt(params.staffId, 10);
+  const pin = (params.pin || '').toString();
+  if (!id) return { success: false, error: 'Invalid staff id.' };
+  if (!/^\d{4}$/.test(pin)) return { success: false, error: 'PIN must be exactly 4 digits.' };
+  const { hash, salt } = hashPassword(pin);
+  await sbFetch('PATCH', `staff?id=eq.${id}`, { atelier_pin_hash: hash, atelier_pin_salt: salt }, { Prefer: 'return=minimal' });
+  return { success: true };
+}
+
+// ---- Assigned order lines for the signed-in tailor ----
+async function doAtelierMyOrders(params) {
+  const tailor = (params.authenticatedName || '').toString();
+  if (!tailor) return { success: false, error: 'Not signed in.' };
+
+  const orders = (await sbFetch('GET', `orders?tailor=eq.${encodeURIComponent(tailor)}&is_done=eq.false&select=order_no,sku,garment_type,order_type,master,urgent,urgent_due_date,notes,created_at`)) || [];
+  if (!orders.length) return { success: true, lines: [] };
+
+  // Rule: a line is hidden once a non-rework job exists for (orderNo, sku).
+  const blockKey = new Set();
+  const jobs = (await sbFetch('GET', `atelier_jobs?tailor=eq.${encodeURIComponent(tailor)}&status=in.(active,pending,approved)&select=order_no,sku`)) || [];
+  jobs.forEach(j => blockKey.add(j.order_no + '|' + j.sku));
+
+  const lines = [];
+  for (const o of orders) {
+    if (blockKey.has(o.order_no + '|' + o.sku)) continue;
+    const model = atelierModelFromSku(o.sku);
+    const cat = shopifyCatalogByModel[model] || null;
+    const qty = atelierQtyFromNotes(o.notes);
+    const standardMin = (await getStandardMinutes(model, o.garment_type)) * qty;
+    lines.push({
+      orderNo: o.order_no, sku: o.sku, model,
+      productTitle: cat ? cat.title : null, productType: cat ? cat.productType : null, tags: cat ? cat.tags : [],
+      garmentType: o.garment_type, qty, master: o.master || null,
+      urgent: !!o.urgent, urgentDueDate: o.urgent_due_date || null,
+      notes: o.notes || '', createdAt: o.created_at, standardMinutes: standardMin
+    });
+  }
+  lines.sort((a, b) => (b.urgent - a.urgent) || (new Date(a.createdAt) - new Date(b.createdAt)));
+  return { success: true, lines };
+}
+
+// ---- Job lifecycle (one active job per tailor) ----
+async function getAtelierActiveJob(tailor) {
+  const rows = await sbFetch('GET', `atelier_jobs?tailor=eq.${encodeURIComponent(tailor)}&status=eq.active&select=*&limit=1`);
+  return rows && rows[0];
+}
+
+async function doAtelierStartJob(params) {
+  const tailor = (params.authenticatedName || '').toString();
+  if (!tailor) return { success: false, error: 'Not signed in.' };
+  if (await getAtelierActiveJob(tailor)) return { success: false, error: 'You already have a job running — finish, pause, or return it first.' };
+
+  const manual = !!(params.manual === true || params.manual === 'true');
+  const orderNo = (params.orderNo || '').toString().trim();
+  const sku = (params.sku || '').toString().trim();
+  if (!orderNo || !sku) return { success: false, error: 'Order number and SKU are required.' };
+
+  let garmentType = (params.garmentType || '').toString().trim();
+  let qty = parseInt(params.qty, 10) || 1;
+  let master = (params.master || '').toString().trim() || null;
+  let notes = (params.notes || '').toString();
+  let urgent = false;
+
+  if (!manual) {
+    // Re-verify against the assignment itself — never trust the client here.
+    const rows = await sbFetch('GET', `orders?order_no=eq.${encodeURIComponent(orderNo)}&sku=eq.${encodeURIComponent(sku)}&tailor=eq.${encodeURIComponent(tailor)}&limit=1&select=*`);
+    const rec = rows && rows[0];
+    if (!rec) return { success: false, error: 'This order line is not assigned to you.' };
+    garmentType = rec.garment_type; master = rec.master || null; notes = rec.notes || ''; urgent = !!rec.urgent;
+    qty = atelierQtyFromNotes(notes);
+
+    const blocked = await sbFetch('GET', `atelier_jobs?order_no=eq.${encodeURIComponent(orderNo)}&sku=eq.${encodeURIComponent(sku)}&status=in.(active,pending,approved)&select=id&limit=1`);
+    if (blocked && blocked.length) return { success: false, error: 'This order line already has a job in progress.' };
+  } else if (!garmentType) {
+    return { success: false, error: 'Garment type is required for a manual entry.' };
+  }
+
+  const model = atelierModelFromSku(sku);
+  const standardMin = (await getStandardMinutes(model, garmentType)) * qty;
+  const now = new Date().toISOString();
+
+  const job = await sbInsertOne('atelier_jobs', {
+    tailor, order_no: orderNo, sku, model, garment_type: garmentType, qty,
+    master, urgent, notes, manual, status: 'active', standard_min: standardMin,
+    start_at: now, run_since: now, accum_ms: 0
+  });
+  return { success: true, job: formatAtelierJob(job) };
+}
+
+async function doAtelierPauseJob(params) {
+  const job = await getAtelierActiveJob((params.authenticatedName || '').toString());
+  if (!job) return { success: false, error: 'No running job to pause.' };
+  if (!job.run_since) return { success: true };
+  const accum = Number(job.accum_ms || 0) + (Date.now() - new Date(job.run_since).getTime());
+  await sbUpdate('atelier_jobs', job.id, { accum_ms: accum, run_since: null });
+  return { success: true };
+}
+
+async function doAtelierResumeJob(params) {
+  const job = await getAtelierActiveJob((params.authenticatedName || '').toString());
+  if (!job) return { success: false, error: 'No job to resume.' };
+  if (job.run_since) return { success: true };
+  await sbUpdate('atelier_jobs', job.id, { run_since: new Date().toISOString() });
+  return { success: true };
+}
+
+async function doAtelierFinishJob(params) {
+  const job = await getAtelierActiveJob((params.authenticatedName || '').toString());
+  if (!job) return { success: false, error: 'No running job to finish.' };
+  const accum = Number(job.accum_ms || 0) + (job.run_since ? (Date.now() - new Date(job.run_since).getTime()) : 0);
+  const now = new Date().toISOString();
+  await sbUpdate('atelier_jobs', job.id, { accum_ms: accum, run_since: null, status: 'pending', end_at: now, duration_ms: accum });
+  return { success: true };
+}
+
+async function doAtelierReturnJob(params) {
+  // Gives back an unfinished job — the order line reappears in the list.
+  const job = await getAtelierActiveJob((params.authenticatedName || '').toString());
+  if (!job) return { success: false, error: 'No running job to return.' };
+  await sbFetch('DELETE', `atelier_jobs?id=eq.${job.id}`, undefined, { Prefer: 'return=minimal' });
+  return { success: true };
+}
+
+// ---- Mechanic calls (pause the active job; resolving resumes it) ----
+async function doAtelierMechanicCall(params) {
+  const tailor = (params.authenticatedName || '').toString();
+  const reason = (params.reason || '').toString().trim();
+  if (!reason) return { success: false, error: 'Please select a reason.' };
+
+  const job = await getAtelierActiveJob(tailor);
+  if (job && job.run_since) {
+    const accum = Number(job.accum_ms || 0) + (Date.now() - new Date(job.run_since).getTime());
+    await sbUpdate('atelier_jobs', job.id, { accum_ms: accum, run_since: null });
+  }
+  await sbInsertOne('atelier_calls', { tailor, reason, job_id: job ? job.id : null, at: new Date().toISOString(), open: true });
+  return { success: true };
+}
+
+async function doAtelierMechanicResolve(params) {
+  const id = parseInt(params.callId, 10);
+  if (!id) return { success: false, error: 'Invalid call id.' };
+  const rows = await sbFetch('GET', `atelier_calls?id=eq.${id}&select=*&limit=1`);
+  const call = rows && rows[0];
+  if (!call) return { success: false, error: 'Call not found.' };
+  const now = new Date().toISOString();
+  await sbUpdate('atelier_calls', id, { open: false, fixed_at: now });
+
+  if (call.job_id) {
+    const jobRows = await sbFetch('GET', `atelier_jobs?id=eq.${call.job_id}&select=status,run_since&limit=1`);
+    const job = jobRows && jobRows[0];
+    if (job && job.status === 'active' && !job.run_since) await sbUpdate('atelier_jobs', call.job_id, { run_since: now });
+  }
+  return { success: true };
+}
+
+async function doAtelierMechanicCallsList() {
+  const rows = (await sbFetch('GET', 'atelier_calls?select=*&order=at.desc&limit=200')) || [];
+  return { success: true, calls: rows.map(c => ({
+    id: c.id, tailor: c.tailor, reason: c.reason, at: c.at, open: c.open, fixedAt: c.fixed_at,
+    downtimeMinutes: c.fixed_at ? Math.round((new Date(c.fixed_at) - new Date(c.at)) / 60000) : null
+  })) };
+}
+
+// ---- Tailor-facing today / history / earnings ----
+function atelierMonthStartIso() {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+}
+function atelierTodayStartIso() {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+}
+
+function formatAtelierJob(j) {
+  return {
+    id: j.id, orderNo: j.order_no, sku: j.sku, model: j.model, garmentType: j.garment_type,
+    qty: j.qty, status: j.status, manual: j.manual, urgent: j.urgent,
+    startAt: j.start_at, endAt: j.end_at,
+    durationMinutes: j.duration_ms != null ? Math.round(j.duration_ms / 60000) : null,
+    accumMs: j.accum_ms, runSince: j.run_since,
+    standardMinutes: j.standard_min, payAmount: j.pay_amount,
+    approvedAt: j.approved_at, reworkAt: j.rework_at
+  };
+}
+
+async function doAtelierMyToday(params) {
+  const tailor = (params.authenticatedName || '').toString();
+  const jobs = (await sbFetch('GET', `atelier_jobs?tailor=eq.${encodeURIComponent(tailor)}&created_at=gte.${atelierTodayStartIso()}&select=*`)) || [];
+  const active = jobs.find(j => j.status === 'active');
+  let pieces = 0, minutesWorked = 0, earnedApproved = 0, earnedPending = 0;
+  jobs.forEach(j => {
+    if (j.status === 'approved' || j.status === 'pending') pieces += (j.qty || 0);
+    if (j.duration_ms) minutesWorked += j.duration_ms / 60000;
+    if (j.status === 'approved') earnedApproved += Number(j.pay_amount || 0);
+    if (j.status === 'pending') earnedPending += Number(j.pay_amount || 0);
+  });
+  return {
+    success: true, pieces, minutesWorked: Math.round(minutesWorked),
+    earnedApproved: +earnedApproved.toFixed(3), earnedPending: +earnedPending.toFixed(3),
+    activeJob: active ? formatAtelierJob(active) : null
+  };
+}
+
+async function doAtelierMyHistory(params) {
+  const tailor = (params.authenticatedName || '').toString();
+  const jobs = (await sbFetch('GET', `atelier_jobs?tailor=eq.${encodeURIComponent(tailor)}&created_at=gte.${atelierMonthStartIso()}&select=*&order=created_at.desc`)) || [];
+  return { success: true, jobs: jobs.map(formatAtelierJob) };
+}
+
+async function doAtelierMyEarnings(params) {
+  const tailor = (params.authenticatedName || '').toString();
+  const jobs = (await sbFetch('GET', `atelier_jobs?tailor=eq.${encodeURIComponent(tailor)}&created_at=gte.${atelierMonthStartIso()}&select=status,pay_amount`)) || [];
+  let approved = 0, pending = 0, rework = 0;
+  jobs.forEach(j => {
+    if (j.status === 'approved') approved += Number(j.pay_amount || 0);
+    else if (j.status === 'pending') pending += Number(j.pay_amount || 0);
+    else if (j.status === 'rework') rework++;
+  });
+  return { success: true, approved: +approved.toFixed(3), pending: +pending.toFixed(3), reworkCount: rework };
+}
+
+// ---- Supervisor/admin: approvals ----
+async function doAtelierApprovalsList() {
+  const rows = (await sbFetch('GET', 'atelier_jobs?status=eq.pending&select=*&order=end_at.asc')) || [];
+  return { success: true, jobs: rows.map(formatAtelierJob) };
+}
+
+async function doAtelierApproveJob(params) {
+  const id = parseInt(params.jobId, 10);
+  if (!id) return { success: false, error: 'Invalid job id.' };
+  const approver = (params.authenticatedName || params.role || '').toString();
+
+  const rows = await sbFetch('GET', `atelier_jobs?id=eq.${id}&select=*&limit=1`);
+  const job = rows && rows[0];
+  if (!job) return { success: false, error: 'Job not found.' };
+  if (job.status !== 'pending') return { success: false, error: 'This job is not pending approval.' };
+  if (job.tailor === approver) return { success: false, error: 'You cannot approve your own work.' }; // enforced server-side, not just in the UI
+
+  const qtyRaw = params.correctedQty;
+  const qty = (qtyRaw !== undefined && qtyRaw !== '' && !isNaN(parseInt(qtyRaw, 10))) ? parseInt(qtyRaw, 10) : job.qty;
+
+  const settings = await getAtelierSettings();
+  const standardMin = (await getStandardMinutes(job.model, job.garment_type)) * qty;
+  const rate = (settings.type_rates || {})[job.garment_type];
+  const patch = {
+    qty, standard_min: standardMin, status: 'approved',
+    approved_at: new Date().toISOString(), approved_by: approver,
+    // Trial mode pays per job immediately. Live mode pay is a monthly
+    // function of standard hours/efficiency/rework (see the payroll
+    // report below), so no per-job amount is stored for it.
+    pay_amount: settings.mode === 'trial' ? +(Number(rate || 0) * qty).toFixed(3) : null
+  };
+  await sbUpdate('atelier_jobs', id, patch);
+  if (SHOPIFY_ENABLED) pushShopifyUpdate(job.order_no, `Tailoring approved — ${job.tailor}, ${qty} pc(s)`);
+  return { success: true };
+}
+
+async function doAtelierRejectJob(params) {
+  const id = parseInt(params.jobId, 10);
+  if (!id) return { success: false, error: 'Invalid job id.' };
+  const approver = (params.authenticatedName || params.role || '').toString();
+
+  const rows = await sbFetch('GET', `atelier_jobs?id=eq.${id}&select=tailor,status&limit=1`);
+  const job = rows && rows[0];
+  if (!job) return { success: false, error: 'Job not found.' };
+  if (job.status !== 'pending') return { success: false, error: 'This job is not pending approval.' };
+  if (job.tailor === approver) return { success: false, error: 'You cannot review your own work.' };
+
+  await sbUpdate('atelier_jobs', id, { status: 'rework', rework_at: new Date().toISOString(), pay_amount: 0 });
+  return { success: true };
+}
+
+// ---- Supervisor/admin: team status ----
+async function doAtelierTeamToday() {
+  const tailors = await getActiveStaffNames('tailor');
+  const jobs = (await sbFetch('GET', `atelier_jobs?created_at=gte.${atelierTodayStartIso()}&select=*`)) || [];
+  const openCalls = (await sbFetch('GET', 'atelier_calls?open=eq.true&select=tailor')) || [];
+  const stopped = new Set(openCalls.map(c => c.tailor));
+
+  const byTailor = {};
+  tailors.forEach(t => { byTailor[t] = { tailor: t, status: 'waiting', currentOrder: null, pieces: 0, minutes: 0 }; });
+  jobs.forEach(j => {
+    const b = byTailor[j.tailor] || (byTailor[j.tailor] = { tailor: j.tailor, status: 'waiting', currentOrder: null, pieces: 0, minutes: 0 });
+    if (j.status === 'approved' || j.status === 'pending') b.pieces += (j.qty || 0);
+    b.minutes += (j.duration_ms || j.accum_ms || 0) / 60000;
+    if (j.status === 'active') {
+      b.currentOrder = { orderNo: j.order_no, sku: j.sku, garmentType: j.garment_type };
+      b.status = stopped.has(j.tailor) ? 'machine_stopped' : (j.run_since ? 'working' : 'paused');
+    }
+  });
+  return { success: true, team: Object.values(byTailor).map(b => Object.assign({}, b, { minutes: Math.round(b.minutes) })) };
+}
+
+// ---- Standard times (median/P25 from finished jobs) — admin-only to edit ----
+function median(nums) {
+  if (!nums.length) return null;
+  const s = nums.slice().sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+function percentile(nums, p) {
+  if (!nums.length) return null;
+  const s = nums.slice().sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.floor((p / 100) * s.length))];
+}
+
+async function doAtelierStandardsList() {
+  const jobs = (await sbFetch('GET', 'atelier_jobs?status=eq.approved&duration_ms=not.is.null&select=model,qty,duration_ms')) || [];
+  const byModel = {};
+  jobs.forEach(j => {
+    if (!j.model || !j.qty) return;
+    (byModel[j.model] = byModel[j.model] || []).push((j.duration_ms / 60000) / j.qty);
+  });
+  const currentRows = (await sbFetch('GET', 'atelier_standards?select=*')) || [];
+  const currentByModel = {};
+  currentRows.forEach(r => { currentByModel[r.model] = r; });
+
+  const settings = await getAtelierSettings();
+  const standards = Object.keys(byModel).map(model => {
+    const vals = byModel[model];
+    return {
+      model, jobCount: vals.length,
+      medianMinPerPiece: +median(vals).toFixed(1),
+      p25MinPerPiece: +percentile(vals, 25).toFixed(1),
+      currentStandard: currentByModel[model] ? Number(currentByModel[model].min_per_piece) : null
+    };
+  });
+  return { success: true, standards, typeDefaults: settings.type_std || {} };
+}
+
+async function doAtelierSetStandard(params) {
+  const model = (params.model || '').toString().trim();
+  const min = parseFloat(params.min);
+  if (!model || isNaN(min) || min <= 0) return { success: false, error: 'Provide a model and a positive number of minutes.' };
+  await sbFetch('POST', 'atelier_standards',
+    { model, min_per_piece: min, updated_at: new Date().toISOString(), updated_by: (params.authenticatedName || 'admin').toString() },
+    { Prefer: 'resolution=merge-duplicates,return=minimal' });
+  return { success: true };
+}
+
+async function doAtelierUseFastStandard(params) {
+  const model = (params.model || '').toString().trim();
+  if (!model) return { success: false, error: 'Model is required.' };
+  const jobs = (await sbFetch('GET', `atelier_jobs?status=eq.approved&model=eq.${encodeURIComponent(model)}&duration_ms=not.is.null&select=qty,duration_ms`)) || [];
+  const vals = jobs.filter(j => j.qty).map(j => (j.duration_ms / 60000) / j.qty);
+  const p25 = percentile(vals, 25);
+  if (p25 == null) return { success: false, error: 'Not enough finished jobs for this model yet.' };
+  return doAtelierSetStandard({ model, min: p25, authenticatedName: params.authenticatedName });
+}
+
+async function doAtelierSetTypeDefault(params) {
+  const type = (params.garmentType || '').toString();
+  const min = parseFloat(params.min);
+  if (ATELIER_GARMENT_TYPES.indexOf(type) === -1 || isNaN(min) || min <= 0) {
+    return { success: false, error: 'Invalid garment type or minutes.' };
+  }
+  const settings = await getAtelierSettings();
+  const typeStd = Object.assign({}, settings.type_std, { [type]: min });
+  await sbFetch('PATCH', 'atelier_settings?id=eq.1', { type_std: typeStd, updated_at: new Date().toISOString() }, { Prefer: 'return=minimal' });
+  invalidateAtelierSettingsCache();
+  return { success: true };
+}
+
+// ---- Payroll (monthly) ----
+async function doAtelierPayrollReport() {
+  const jobs = (await sbFetch('GET', `atelier_jobs?created_at=gte.${atelierMonthStartIso()}&select=*`)) || [];
+  const settings = await getAtelierSettings();
+  const hoursPerDay = Number(settings.hours_per_day || 10);
+  const daysPerMonth = Number(settings.days_per_month || 26);
+
+  const byTailor = {};
+  jobs.forEach(j => {
+    const b = byTailor[j.tailor] || (byTailor[j.tailor] = {
+      tailor: j.tailor, pieces: 0, standardHours: 0, hoursWorked: 0, reworkCount: 0, approvedPay: 0, pendingPay: 0
+    });
+    if (j.status === 'rework') { b.reworkCount++; }
+    if (j.status === 'approved' || j.status === 'pending') {
+      b.pieces += (j.qty || 0);
+      b.standardHours += Number(j.standard_min || 0) / 60;
+    }
+    if (j.duration_ms) b.hoursWorked += j.duration_ms / 3600000;
+    if (j.status === 'approved') b.approvedPay += Number(j.pay_amount || 0);
+    if (j.status === 'pending') b.pendingPay += Number(j.pay_amount || 0);
+  });
+
+  const rows = Object.values(byTailor).map(b => {
+    const efficiency = b.hoursWorked > 0 ? +(b.standardHours / b.hoursWorked * 100).toFixed(1) : 0;
+    let livePay = null;
+    if (settings.mode !== 'trial') {
+      const rules = settings.pay_rules || {};
+      let base = b.standardHours * Number(rules.ratePerStdHour || 0);
+      const tier = (Array.isArray(rules.efficiencyTiers) ? rules.efficiencyTiers : [])
+        .find(t => efficiency >= (t.min || 0) && efficiency <= (t.max != null ? t.max : Infinity));
+      if (tier && tier.multiplier != null) base *= tier.multiplier;
+      livePay = +Math.max(0, base - Number(rules.reworkPenalty || 0) * b.reworkCount).toFixed(3);
+    }
+    return {
+      tailor: b.tailor, pieces: b.pieces, standardHours: +b.standardHours.toFixed(2), hoursWorked: +b.hoursWorked.toFixed(2),
+      efficiency, reworkCount: b.reworkCount, approvedPay: +b.approvedPay.toFixed(3), pendingPay: +b.pendingPay.toFixed(3), livePay
+    };
+  });
+  return { success: true, mode: settings.mode, monthlyCapacityHours: hoursPerDay * daysPerMonth, rows };
+}
+
+// ---- Settings (admin-only: rates and standard times are never sent to a
+// tailor session) ----
+function safeJsonObj(v) {
+  if (v && typeof v === 'object') return v;
+  try { return JSON.parse(v); } catch (e) { return {}; }
+}
+
+async function doAtelierGetSettings() {
+  const s = await getAtelierSettings();
+  return { success: true, settings: {
+    mode: s.mode, typeRates: s.type_rates, typeStd: s.type_std,
+    hoursPerDay: s.hours_per_day, daysPerMonth: s.days_per_month, payRules: s.pay_rules
+  } };
+}
+
+async function doAtelierSetSettings(params) {
+  const patch = { updated_at: new Date().toISOString() };
+  if (params.mode === 'trial' || params.mode === 'live') patch.mode = params.mode;
+  if (params.typeRates !== undefined) patch.type_rates = safeJsonObj(params.typeRates);
+  if (params.typeStd !== undefined) patch.type_std = safeJsonObj(params.typeStd);
+  if (params.hoursPerDay) patch.hours_per_day = parseFloat(params.hoursPerDay) || 10;
+  if (params.daysPerMonth) patch.days_per_month = parseFloat(params.daysPerMonth) || 26;
+  if (params.payRules !== undefined) patch.pay_rules = safeJsonObj(params.payRules);
+  await sbFetch('PATCH', 'atelier_settings?id=eq.1', patch, { Prefer: 'return=minimal' });
+  invalidateAtelierSettingsCache();
+  return { success: true };
+}
+
+// Non-sensitive slice of settings any signed-in role may read (working
+// hours/day for capacity display) — never includes rates or pay rules.
+async function doAtelierGetWorkingTimeConfig() {
+  const s = await getAtelierSettings();
+  return { success: true, hoursPerDay: s.hours_per_day, daysPerMonth: s.days_per_month, mode: s.mode };
 }
 
 // ============================================================
