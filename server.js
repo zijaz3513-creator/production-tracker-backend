@@ -1576,7 +1576,8 @@ function formatAtelierJob(j) {
     durationMinutes: j.duration_ms != null ? Math.round(j.duration_ms / 60000) : null,
     accumMs: j.accum_ms, runSince: j.run_since,
     standardMinutes: j.standard_min, payAmount: j.pay_amount,
-    approvedAt: j.approved_at, reworkAt: j.rework_at
+    approvedAt: j.approved_at, reworkAt: j.rework_at,
+    rejectReason: j.reject_reason || null, rejectedBy: j.rejected_by || null
   };
 }
 
@@ -1678,9 +1679,17 @@ async function doAtelierApproveJob(params) {
   return { success: true };
 }
 
+// Rejection must always be attributed to one of three causes, so payroll
+// and standard-time analysis (and the tailor themselves) can see *why* a
+// job was sent back rather than just that it was.
+const ATELIER_REJECT_REASONS = ["Master's issue", "Tailor's issue", "Fabric issue"];
 async function doAtelierRejectJob(params) {
   const id = parseInt(params.jobId, 10);
   if (!id) return { success: false, error: 'Invalid job id.' };
+  const reason = (params.reason || '').toString().trim();
+  if (ATELIER_REJECT_REASONS.indexOf(reason) === -1) {
+    return { success: false, error: "Please select a reason: Master's issue, Tailor's issue, or Fabric issue." };
+  }
   const approver = (params.authenticatedName || params.role || '').toString();
 
   const rows = await sbFetch('GET', `atelier_jobs?id=eq.${id}&select=tailor,status&limit=1`);
@@ -1689,7 +1698,10 @@ async function doAtelierRejectJob(params) {
   if (job.status !== 'pending') return { success: false, error: 'This job is not pending approval.' };
   if (job.tailor === approver) return { success: false, error: 'You cannot review your own work.' };
 
-  await sbUpdate('atelier_jobs', id, { status: 'rework', rework_at: new Date().toISOString(), pay_amount: 0 });
+  await sbUpdate('atelier_jobs', id, {
+    status: 'rework', rework_at: new Date().toISOString(), pay_amount: 0,
+    reject_reason: reason, rejected_by: approver
+  });
   return { success: true };
 }
 
