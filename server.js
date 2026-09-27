@@ -1832,11 +1832,19 @@ function percentile(nums, p) {
 }
 
 async function doAtelierStandardsList() {
-  const jobs = (await sbFetch('GET', 'atelier_jobs?status=eq.approved&duration_ms=not.is.null&select=model,qty,duration_ms')) || [];
+  const jobs = (await sbFetch('GET', 'atelier_jobs?status=eq.approved&duration_ms=not.is.null&select=model,qty,duration_ms,tailor')) || [];
   const byModel = {};
+  // Per model, per tailor: every approved job's minutes/piece, so we can
+  // tell who is fastest/slowest at sewing that particular model.
+  const byModelTailor = {};
   jobs.forEach(j => {
     if (!j.model || !j.qty) return;
-    (byModel[j.model] = byModel[j.model] || []).push((j.duration_ms / 60000) / j.qty);
+    const minPerPiece = (j.duration_ms / 60000) / j.qty;
+    (byModel[j.model] = byModel[j.model] || []).push(minPerPiece);
+    if (j.tailor) {
+      const tByTailor = (byModelTailor[j.model] = byModelTailor[j.model] || {});
+      (tByTailor[j.tailor] = tByTailor[j.tailor] || []).push(minPerPiece);
+    }
   });
   const currentRows = (await sbFetch('GET', 'atelier_standards?select=*')) || [];
   const currentByModel = {};
@@ -1845,11 +1853,27 @@ async function doAtelierStandardsList() {
   const settings = await getAtelierSettings();
   const standards = Object.keys(byModel).map(model => {
     const vals = byModel[model];
+
+    // Rank tailors on this model by their own average minutes/piece —
+    // lower average = faster. Ties (or a single tailor) just report the
+    // same name for both.
+    const tailorStats = Object.keys(byModelTailor[model] || {}).map(tailor => {
+      const arr = byModelTailor[model][tailor];
+      const avg = arr.reduce((a, b) => a + b, 0) / arr.length;
+      return { tailor, avgMinPerPiece: +avg.toFixed(1), jobCount: arr.length };
+    });
+    let fastestTailor = null, slowestTailor = null;
+    if (tailorStats.length) {
+      fastestTailor = tailorStats.reduce((a, b) => (b.avgMinPerPiece < a.avgMinPerPiece ? b : a));
+      slowestTailor = tailorStats.reduce((a, b) => (b.avgMinPerPiece > a.avgMinPerPiece ? b : a));
+    }
+
     return {
       model, jobCount: vals.length,
       medianMinPerPiece: +median(vals).toFixed(1),
       p25MinPerPiece: +percentile(vals, 25).toFixed(1),
-      currentStandard: currentByModel[model] ? Number(currentByModel[model].min_per_piece) : null
+      currentStandard: currentByModel[model] ? Number(currentByModel[model].min_per_piece) : null,
+      fastestTailor, slowestTailor
     };
   });
   return { success: true, standards, typeDefaults: settings.type_std || {} };
