@@ -260,7 +260,7 @@ const ROLE_PERMISSIONS = {
   atelier_supervisor: [
     'atelierApprovalsList', 'atelierApproveJob', 'atelierRejectJob', 'atelierTeamToday',
     'atelierStandardsList', 'atelierPayrollReport', 'atelierMechanicCallsList', 'atelierMechanicResolve',
-    'atelierGetWorkingTimeConfig', 'atelierFindPendingByCode'
+    'atelierGetWorkingTimeConfig', 'atelierFindPendingByCode', 'atelierJobsForLine', 'atelierCancelJob'
   ],
   designer: ['getSamples', 'addSample'],
   patternmaster: ['getSamples', 'assignSampleTailor'],
@@ -585,6 +585,8 @@ async function routeAction(action, params) {
     case 'atelierMechanicResolve': return doAtelierMechanicResolve(params);
     case 'atelierPayrollReport': return doAtelierPayrollReport();
     case 'atelierFindPendingByCode': return doAtelierFindPendingByCode(params);
+    case 'atelierJobsForLine': return doAtelierJobsForLine(params);
+    case 'atelierCancelJob': return doAtelierCancelJob(params);
     // Aeon Workstation — admin only (not in any role's permission list above,
     // so only the admin bypass in checkPermission() can reach these)
     case 'atelierSetStandard': return doAtelierSetStandard(params);
@@ -1445,7 +1447,7 @@ async function doAtelierStartJob(params) {
     garmentType = rec.garment_type; master = rec.master || null; notes = rec.notes || ''; urgent = !!rec.urgent;
     qty = atelierQtyFromNotes(notes);
 
-    const blocked = await sbFetch('GET', `atelier_jobs?order_no=eq.${encodeURIComponent(orderNo)}&sku=eq.${encodeURIComponent(sku)}&status=in.(active,pending,approved)&select=id&limit=1`);
+    const blocked = await sbFetch('GET', `atelier_jobs?order_no=eq.${encodeURIComponent(orderNo)}&sku=eq.${encodeURIComponent(sku)}&status=in.(active,pending)&select=id&limit=1`);
     if (blocked && blocked.length) return { success: false, error: 'This order line already has a job in progress.' };
   } else if (!garmentType) {
     return { success: false, error: 'Garment type is required for a manual entry.' };
@@ -1702,6 +1704,32 @@ async function doAtelierRejectJob(params) {
     status: 'rework', rework_at: new Date().toISOString(), pay_amount: 0,
     reject_reason: reason, rejected_by: approver
   });
+  return { success: true };
+}
+
+// Troubleshooting tool: show every atelier job ever logged against a given
+// order line (any status), so a supervisor can see what's actually blocking
+// a tailor from starting it again — and clear it if it's a stray one.
+async function doAtelierJobsForLine(params) {
+  const orderNo = (params.orderNo || '').toString().trim();
+  if (!orderNo) return { success: false, error: 'Order number is required.' };
+  const rows = await sbFetch('GET', `atelier_jobs?order_no=eq.${encodeURIComponent(orderNo)}&select=*&order=start_at.desc`);
+  return { success: true, jobs: (rows || []).map(formatAtelierJob) };
+}
+
+// Cancels a stray job (active or pending) that's blocking a line, without
+// touching payroll — only jobs that were never approved can be cancelled,
+// so a completed/paid job can't accidentally be erased this way.
+async function doAtelierCancelJob(params) {
+  const id = parseInt(params.jobId, 10);
+  if (!id) return { success: false, error: 'Invalid job id.' };
+  const rows = await sbFetch('GET', `atelier_jobs?id=eq.${id}&select=status&limit=1`);
+  const job = rows && rows[0];
+  if (!job) return { success: false, error: 'Job not found.' };
+  if (job.status !== 'active' && job.status !== 'pending') {
+    return { success: false, error: 'Only an active or pending job can be cancelled.' };
+  }
+  await sbUpdate('atelier_jobs', id, { status: 'cancelled', run_since: null, pay_amount: 0 });
   return { success: true };
 }
 
