@@ -274,7 +274,7 @@ const ROLE_PERMISSIONS = {
     'markDone', 'undoMarkDone', 'updateUrgent',
     'getSamples', 'addSample', 'assignSampleTailor', 'assignSampleMaster',
     'markSampleDone', 'undoSampleDone', 'sendSampleEmb', 'receiveSampleEmb',
-    'listStaff', 'addStaff', 'reorderStaff'
+    'listStaff', 'addStaff', 'reorderStaff', 'atelierRevertJob'
   ]
 };
 
@@ -609,7 +609,7 @@ function parseRow(params) {
 // ORDERS — reconstructs the exact same 34-column array shape the
 // frontend's parseOrders() already expects.
 // ============================================================
-function buildOrderRowArray(rec, inQC) {
+function buildOrderRowArray(rec, qcJobId) {
   const row = new Array(41).fill('');
   if (!rec) return row;
 
@@ -637,11 +637,12 @@ function buildOrderRowArray(rec, inQC) {
   row[10] = rec.tailor || '';
   row[11] = rec.tailor_assigned_at || '';
   row[12] = rec.rework_note || '';
-  // Whether the tailor has already finished this line and it's sitting
-  // in QC awaiting supervisor approval (an atelier_jobs row with status
-  // 'pending' for this order_no+sku). Lets the main order dashboard show
-  // "QC" as its own stage instead of still lumping it in with "With tailor".
-  row[13] = inQC ? 'QC' : '';
+  // The id of the atelier_jobs row sitting in QC (status 'pending') for
+  // this order line, if any — blank when it isn't in QC. Carrying the
+  // actual id (not just a yes/no flag) lets the admin dashboard call
+  // atelierRevertJob directly, the same "undo finish & reassign" action
+  // available on the Atelier Supervisor's Approvals screen.
+  row[13] = qcJobId || '';
 
   row[21] = rec.remarks || '';
   row[22] = rec.is_done ? 'Done' : '';
@@ -677,27 +678,29 @@ async function doGetOrders() {
 
   // Which (order_no, sku) lines are currently sitting in QC — an
   // atelier_jobs row with status 'pending' — so the dashboard can show
-  // "QC" as its own stage instead of lumping it in with "With tailor".
-  const qcJobs = (await sbFetch('GET', 'atelier_jobs?status=eq.pending&select=order_no,sku')) || [];
-  const qcSet = new Set(qcJobs.map(j => (j.order_no || '') + '|' + (j.sku || '')));
+  // "QC" as its own stage instead of lumping it in with "With tailor",
+  // and so admin/fulfillment can revert it straight from this screen.
+  const qcJobs = (await sbFetch('GET', 'atelier_jobs?status=eq.pending&select=id,order_no,sku')) || [];
+  const qcMap = new Map(qcJobs.map(j => [(j.order_no || '') + '|' + (j.sku || ''), j.id]));
 
   const data = [new Array(41).fill(''), new Array(41).fill('')];
   for (let id = 1; id <= maxId; id++) {
     const rec = byId[id];
-    const inQC = rec ? qcSet.has((rec.order_no || '') + '|' + (rec.sku || '')) : false;
-    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec, inQC));
+    const qcJobId = rec ? qcMap.get((rec.order_no || '') + '|' + (rec.sku || '')) : null;
+    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec, qcJobId));
   }
   return { success: true, data };
 }
 
-// Single-order version of the QC check used in doGetOrders — is there a
-// pending (QC) atelier job for this exact order line right now?
-async function isOrderInQC(orderNo, sku) {
-  if (!orderNo) return false;
+// Single-order version of the QC lookup used in doGetOrders — is there a
+// pending (QC) atelier job for this exact order line right now, and if so
+// what's its id (so the caller can revert it)?
+async function getQcJobId(orderNo, sku) {
+  if (!orderNo) return null;
   let q = `atelier_jobs?order_no=eq.${encodeURIComponent(orderNo)}&status=eq.pending&select=id&limit=1`;
   if (sku) q = `atelier_jobs?order_no=eq.${encodeURIComponent(orderNo)}&sku=eq.${encodeURIComponent(sku)}&status=eq.pending&select=id&limit=1`;
   const rows = await sbFetch('GET', q);
-  return !!(rows && rows[0]);
+  return (rows && rows[0]) ? rows[0].id : null;
 }
 
 // Fetches just ONE order (instead of the whole table) — used to refresh a
@@ -711,8 +714,8 @@ async function doGetOrder(params) {
   const recs = await sbFetch('GET', `orders?id=eq.${row - 2}&select=*&limit=1`);
   const rec = recs && recs[0];
   if (!rec || isBlankOrder_(rec)) return { success: false, error: 'Order not found.' };
-  const inQC = await isOrderInQC(rec.order_no, rec.sku);
-  return { success: true, row, data: buildOrderRowArray(rec, inQC) };
+  const qcJobId = await getQcJobId(rec.order_no, rec.sku);
+  return { success: true, row, data: buildOrderRowArray(rec, qcJobId) };
 }
 
 // Same idea as doGetOrder, but for when the caller only has the order
@@ -729,8 +732,8 @@ async function doGetOrderByOrderNo(params) {
   const recs = await sbFetch('GET', query);
   const rec = recs && recs[0];
   if (!rec) return { success: false, error: 'Order "' + orderNo + '" not found.' };
-  const inQC = await isOrderInQC(rec.order_no, rec.sku);
-  return { success: true, row: rec.id + 2, data: buildOrderRowArray(rec, inQC) };
+  const qcJobId = await getQcJobId(rec.order_no, rec.sku);
+  return { success: true, row: rec.id + 2, data: buildOrderRowArray(rec, qcJobId) };
 }
 
 function isBlankOrder_(rec) {
