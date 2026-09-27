@@ -635,6 +635,7 @@ function buildOrderRowArray(rec) {
   // exactly the "everything shows the same tailor" bug this replaces.
   row[10] = rec.tailor || '';
   row[11] = rec.tailor_assigned_at || '';
+  row[12] = rec.rework_note || '';
 
   row[21] = rec.remarks || '';
   row[22] = rec.is_done ? 'Done' : '';
@@ -777,7 +778,7 @@ async function doUpdateFabric(params) {
     return { success: false, error: 'Invalid fabric status.' };
   }
 
-  const patch = { fabric_status: value };
+  const patch = { fabric_status: value, rework_note: null };
 
   if (value === 'Not Available') {
     const source = (params.source || '').toString();
@@ -933,7 +934,7 @@ async function doUpdateTailor(params) {
   if (tailors.indexOf(tailor) === -1) {
     return { success: false, error: 'Unknown tailor: ' + tailor };
   }
-  await sbUpdate('orders', id, { tailor, tailor_assigned_at: new Date().toISOString() });
+  await sbUpdate('orders', id, { tailor, tailor_assigned_at: new Date().toISOString(), rework_note: null });
   pushShopifyUpdate(await getOrderNo(row), `With Tailor: ${tailor}`);
   return { success: true };
 }
@@ -1579,7 +1580,8 @@ function formatAtelierJob(j) {
     accumMs: j.accum_ms, runSince: j.run_since,
     standardMinutes: j.standard_min, payAmount: j.pay_amount,
     approvedAt: j.approved_at, reworkAt: j.rework_at,
-    rejectReason: j.reject_reason || null, rejectedBy: j.rejected_by || null
+    rejectReason: j.reject_reason || null, rejectedBy: j.rejected_by || null,
+    fabricIssueType: j.fabric_issue_type || null
   };
 }
 
@@ -1677,6 +1679,11 @@ async function doAtelierApproveJob(params) {
     pay_amount: settings.mode === 'trial' ? +(Number(rate || 0) * qty).toFixed(3) : null
   };
   await sbUpdate('atelier_jobs', id, patch);
+  if (job.order_no && job.sku) {
+    const orderRows = await sbFetch('GET', `orders?order_no=eq.${encodeURIComponent(job.order_no)}&sku=eq.${encodeURIComponent(job.sku)}&select=id&limit=1`);
+    const orderRec = orderRows && orderRows[0];
+    if (orderRec) await sbUpdate('orders', orderRec.id, { rework_note: null });
+  }
   if (SHOPIFY_ENABLED) pushShopifyUpdate(job.order_no, `Tailoring approved — ${job.tailor}, ${qty} pc(s)`);
   return { success: true };
 }
@@ -1685,6 +1692,13 @@ async function doAtelierApproveJob(params) {
 // and standard-time analysis (and the tailor themselves) can see *why* a
 // job was sent back rather than just that it was.
 const ATELIER_REJECT_REASONS = ["Master's issue", "Tailor's issue", "Fabric issue"];
+// When the cause is the fabric itself, we also need to know *what* about
+// it was wrong, so whoever re-checks it (Inventory/Admin) knows what to
+// fix rather than just "something's wrong".
+const ATELIER_FABRIC_ISSUE_TYPES = [
+  'Wrong fabric used', 'Fabric damaged / torn', 'Not enough fabric',
+  'Wrong color / shade', 'Fabric quality issue', 'Other'
+];
 async function doAtelierRejectJob(params) {
   const id = parseInt(params.jobId, 10);
   if (!id) return { success: false, error: 'Invalid job id.' };
@@ -1692,9 +1706,16 @@ async function doAtelierRejectJob(params) {
   if (ATELIER_REJECT_REASONS.indexOf(reason) === -1) {
     return { success: false, error: "Please select a reason: Master's issue, Tailor's issue, or Fabric issue." };
   }
+  let fabricIssueType = null;
+  if (reason === 'Fabric issue') {
+    fabricIssueType = (params.fabricIssueType || '').toString().trim();
+    if (ATELIER_FABRIC_ISSUE_TYPES.indexOf(fabricIssueType) === -1) {
+      return { success: false, error: 'Please select what kind of fabric issue this is.' };
+    }
+  }
   const approver = (params.authenticatedName || params.role || '').toString();
 
-  const rows = await sbFetch('GET', `atelier_jobs?id=eq.${id}&select=tailor,status&limit=1`);
+  const rows = await sbFetch('GET', `atelier_jobs?id=eq.${id}&select=tailor,status,order_no,sku,master&limit=1`);
   const job = rows && rows[0];
   if (!job) return { success: false, error: 'Job not found.' };
   if (job.status !== 'pending') return { success: false, error: 'This job is not pending approval.' };
@@ -1702,8 +1723,45 @@ async function doAtelierRejectJob(params) {
 
   await sbUpdate('atelier_jobs', id, {
     status: 'rework', rework_at: new Date().toISOString(), pay_amount: 0,
-    reject_reason: reason, rejected_by: approver
+    reject_reason: reason, rejected_by: approver, fabric_issue_type: fabricIssueType
   });
+
+  // Route it back to whoever's responsible. Tailor's issue needs nothing
+  // extra — the order line is still assigned to that tailor, so it's
+  // already sitting back in their queue to redo. Master's issue and
+  // Fabric issue both need the main order record nudged so the right
+  // person sees it next time they touch that order.
+  if (job.order_no && job.sku) {
+    const orderRows = await sbFetch('GET', `orders?order_no=eq.${encodeURIComponent(job.order_no)}&sku=eq.${encodeURIComponent(job.sku)}&select=id&limit=1`);
+    const orderRec = orderRows && orderRows[0];
+    if (orderRec) {
+      const stamp = new Date().toLocaleString();
+      if (reason === "Master's issue") {
+        // Send it back to the same cutting master: clear the tailor so it
+        // drops out of the tailor's queue until the master re-cuts and
+        // reassigns, but leave `master` untouched so it's obvious whose
+        // re-cut this is.
+        await sbUpdate('orders', orderRec.id, {
+          tailor: null, tailor_assigned_at: null,
+          rework_note: `⚠️ Rejected — Master's issue (${job.master || 'cutting master'}) — needs re-cut. By ${approver}, ${stamp}.`
+        });
+      } else if (reason === 'Fabric issue') {
+        // Send it back to Inventory/Admin: reopen the fabric-check step so
+        // it shows up wherever "awaiting fabric" is tracked, tagged with
+        // exactly what's wrong with the fabric.
+        await sbUpdate('orders', orderRec.id, {
+          fabric_status: null, fabric_source: null, fabric_purchase_status: null,
+          rework_note: `⚠️ Rejected — Fabric issue: ${fabricIssueType}. By ${approver}, ${stamp}.`
+        });
+      } else {
+        // Tailor's issue — just leave a visible note; no reassignment needed.
+        await sbUpdate('orders', orderRec.id, {
+          rework_note: `⚠️ Rejected — Tailor's issue (${job.tailor}) — please redo. By ${approver}, ${stamp}.`
+        });
+      }
+    }
+  }
+
   return { success: true };
 }
 
