@@ -608,7 +608,7 @@ function parseRow(params) {
 // ORDERS — reconstructs the exact same 34-column array shape the
 // frontend's parseOrders() already expects.
 // ============================================================
-function buildOrderRowArray(rec) {
+function buildOrderRowArray(rec, inQC) {
   const row = new Array(41).fill('');
   if (!rec) return row;
 
@@ -636,6 +636,11 @@ function buildOrderRowArray(rec) {
   row[10] = rec.tailor || '';
   row[11] = rec.tailor_assigned_at || '';
   row[12] = rec.rework_note || '';
+  // Whether the tailor has already finished this line and it's sitting
+  // in QC awaiting supervisor approval (an atelier_jobs row with status
+  // 'pending' for this order_no+sku). Lets the main order dashboard show
+  // "QC" as its own stage instead of still lumping it in with "With tailor".
+  row[13] = inQC ? 'QC' : '';
 
   row[21] = rec.remarks || '';
   row[22] = rec.is_done ? 'Done' : '';
@@ -669,12 +674,29 @@ async function doGetOrders() {
     if (rec.id > maxId) maxId = rec.id;
   });
 
+  // Which (order_no, sku) lines are currently sitting in QC — an
+  // atelier_jobs row with status 'pending' — so the dashboard can show
+  // "QC" as its own stage instead of lumping it in with "With tailor".
+  const qcJobs = (await sbFetch('GET', 'atelier_jobs?status=eq.pending&select=order_no,sku')) || [];
+  const qcSet = new Set(qcJobs.map(j => (j.order_no || '') + '|' + (j.sku || '')));
+
   const data = [new Array(41).fill(''), new Array(41).fill('')];
   for (let id = 1; id <= maxId; id++) {
     const rec = byId[id];
-    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec));
+    const inQC = rec ? qcSet.has((rec.order_no || '') + '|' + (rec.sku || '')) : false;
+    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec, inQC));
   }
   return { success: true, data };
+}
+
+// Single-order version of the QC check used in doGetOrders — is there a
+// pending (QC) atelier job for this exact order line right now?
+async function isOrderInQC(orderNo, sku) {
+  if (!orderNo) return false;
+  let q = `atelier_jobs?order_no=eq.${encodeURIComponent(orderNo)}&status=eq.pending&select=id&limit=1`;
+  if (sku) q = `atelier_jobs?order_no=eq.${encodeURIComponent(orderNo)}&sku=eq.${encodeURIComponent(sku)}&status=eq.pending&select=id&limit=1`;
+  const rows = await sbFetch('GET', q);
+  return !!(rows && rows[0]);
 }
 
 // Fetches just ONE order (instead of the whole table) — used to refresh a
@@ -688,7 +710,8 @@ async function doGetOrder(params) {
   const recs = await sbFetch('GET', `orders?id=eq.${row - 2}&select=*&limit=1`);
   const rec = recs && recs[0];
   if (!rec || isBlankOrder_(rec)) return { success: false, error: 'Order not found.' };
-  return { success: true, row, data: buildOrderRowArray(rec) };
+  const inQC = await isOrderInQC(rec.order_no, rec.sku);
+  return { success: true, row, data: buildOrderRowArray(rec, inQC) };
 }
 
 // Same idea as doGetOrder, but for when the caller only has the order
@@ -705,7 +728,8 @@ async function doGetOrderByOrderNo(params) {
   const recs = await sbFetch('GET', query);
   const rec = recs && recs[0];
   if (!rec) return { success: false, error: 'Order "' + orderNo + '" not found.' };
-  return { success: true, row: rec.id + 2, data: buildOrderRowArray(rec) };
+  const inQC = await isOrderInQC(rec.order_no, rec.sku);
+  return { success: true, row: rec.id + 2, data: buildOrderRowArray(rec, inQC) };
 }
 
 function isBlankOrder_(rec) {
