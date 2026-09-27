@@ -258,7 +258,7 @@ const ROLE_PERMISSIONS = {
   // *viewing*, payroll and mechanic calls. Cannot see/edit pay rates or
   // write standard times — those stay admin-only per spec.
   atelier_supervisor: [
-    'atelierApprovalsList', 'atelierApproveJob', 'atelierRejectJob', 'atelierTeamToday',
+    'atelierApprovalsList', 'atelierApproveJob', 'atelierRejectJob', 'atelierRevertJob', 'atelierTeamToday',
     'atelierStandardsList', 'atelierPayrollReport', 'atelierMechanicCallsList', 'atelierMechanicResolve',
     'atelierGetWorkingTimeConfig', 'atelierFindPendingByCode', 'atelierJobsForLine', 'atelierCancelJob'
   ],
@@ -579,6 +579,7 @@ async function routeAction(action, params) {
     case 'atelierApprovalsList': return doAtelierApprovalsList();
     case 'atelierApproveJob': return doAtelierApproveJob(params);
     case 'atelierRejectJob': return doAtelierRejectJob(params);
+    case 'atelierRevertJob': return doAtelierRevertJob(params);
     case 'atelierTeamToday': return doAtelierTeamToday();
     case 'atelierStandardsList': return doAtelierStandardsList();
     case 'atelierMechanicCallsList': return doAtelierMechanicCallsList();
@@ -1789,7 +1790,46 @@ async function doAtelierRejectJob(params) {
   return { success: true };
 }
 
-// Troubleshooting tool: show every atelier job ever logged against a given
+// Undoes a finish that was pressed by mistake — the job never gets reviewed
+// at all; it's deleted outright (no time or pay recorded, unlike a reject)
+// and the order line is handed to whichever tailor the supervisor picks,
+// which may or may not be the same tailor who scanned it in the first place.
+async function doAtelierRevertJob(params) {
+  const id = parseInt(params.jobId, 10);
+  if (!id) return { success: false, error: 'Invalid job id.' };
+  const newTailor = (params.newTailor || '').toString().trim();
+  if (!newTailor) return { success: false, error: 'Please choose which tailor to give this to.' };
+
+  const tailors = await getActiveStaffNames('tailor');
+  if (tailors.indexOf(newTailor) === -1) {
+    return { success: false, error: 'Unknown tailor: ' + newTailor };
+  }
+
+  const approver = (params.authenticatedName || params.role || '').toString();
+  const rows = await sbFetch('GET', `atelier_jobs?id=eq.${id}&select=tailor,status,order_no,sku&limit=1`);
+  const job = rows && rows[0];
+  if (!job) return { success: false, error: 'Job not found.' };
+  if (job.status !== 'pending') return { success: false, error: 'This job is not in QC — it may have already been approved, rejected, or reverted.' };
+
+  await sbFetch('DELETE', `atelier_jobs?id=eq.${id}`, undefined, { Prefer: 'return=minimal' });
+
+  if (job.order_no && job.sku) {
+    const orderRows = await sbFetch('GET', `orders?order_no=eq.${encodeURIComponent(job.order_no)}&sku=eq.${encodeURIComponent(job.sku)}&select=id&limit=1`);
+    const orderRec = orderRows && orderRows[0];
+    if (orderRec) {
+      const stamp = new Date().toLocaleString();
+      await sbUpdate('orders', orderRec.id, {
+        tailor: newTailor, tailor_assigned_at: new Date().toISOString(),
+        rework_note: `↩️ Reverted from QC (was finished by ${job.tailor}) — reassigned to ${newTailor} by ${approver}, ${stamp}.`
+      });
+    }
+    if (SHOPIFY_ENABLED) pushShopifyUpdate(job.order_no, `Reverted from QC — reassigned to Tailor: ${newTailor}`);
+  }
+
+  return { success: true };
+}
+
+
 // order line (any status), so a supervisor can see what's actually blocking
 // a tailor from starting it again — and clear it if it's a stray one.
 async function doAtelierJobsForLine(params) {
