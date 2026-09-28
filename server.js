@@ -1690,8 +1690,8 @@ async function doAtelierApproveJob(params) {
   if (job.status !== 'pending') return { success: false, error: 'This job is not pending approval.' };
   if (job.tailor === approver) return { success: false, error: 'You cannot approve your own work.' }; // enforced server-side, not just in the UI
 
-  const qtyRaw = params.correctedQty;
-  const qty = (qtyRaw !== undefined && qtyRaw !== '' && !isNaN(parseInt(qtyRaw, 10))) ? parseInt(qtyRaw, 10) : job.qty;
+  // Piece count is fixed — approvers can't change it (any correctedQty sent is ignored).
+  const qty = job.qty;
 
   const settings = await getAtelierSettings();
   const standardMin = (await getStandardMinutes(job.model, job.garment_type)) * qty;
