@@ -271,7 +271,7 @@ const ROLE_PERMISSIONS = {
   fulfillment: [
     'getOrders', 'getOrder', 'getOrderByOrderNo', 'addOrder', 'updateFabric', 'updateFabricDetails',
     'updateMachEmb', 'updateHandEmb', 'updateMaster', 'updateTailor',
-    'markDone', 'undoMarkDone', 'updateUrgent',
+    'markDone', 'undoMarkDone', 'updateUrgent', 'atelierJobsForLine',
     'getSamples', 'addSample', 'assignSampleTailor', 'assignSampleMaster',
     'markSampleDone', 'undoSampleDone', 'sendSampleEmb', 'receiveSampleEmb',
     'listStaff', 'addStaff', 'reorderStaff'
@@ -610,7 +610,7 @@ function parseRow(params) {
 // ORDERS — reconstructs the exact same 34-column array shape the
 // frontend's parseOrders() already expects.
 // ============================================================
-function buildOrderRowArray(rec, inQC) {
+function buildOrderRowArray(rec, inQC, workMs) {
   const row = new Array(41).fill('');
   if (!rec) return row;
 
@@ -645,6 +645,8 @@ function buildOrderRowArray(rec, inQC) {
   row[13] = inQC ? 'QC' : '';
   row[14] = rec.mach_emb_person || '';
   row[15] = rec.hand_emb_person || '';
+  // Total tailor working time on this line, in seconds (all finished attempts).
+  row[16] = workMs ? String(Math.round(workMs / 1000)) : '';
 
   row[21] = rec.remarks || '';
   row[22] = rec.is_done ? 'Done' : '';
@@ -681,16 +683,50 @@ async function doGetOrders() {
   // Which (order_no, sku) lines are currently sitting in QC — an
   // atelier_jobs row with status 'pending' — so the dashboard can show
   // "QC" as its own stage instead of lumping it in with "With tailor".
-  const qcJobs = (await sbFetch('GET', 'atelier_jobs?status=eq.pending&select=order_no,sku')) || [];
-  const qcSet = new Set(qcJobs.map(j => (j.order_no || '') + '|' + (j.sku || '')));
+  // Same query also totals each line's finished tailor time (see below).
+  const lineInfo = await getAtelierLineInfoMap();
 
   const data = [new Array(41).fill(''), new Array(41).fill('')];
   for (let id = 1; id <= maxId; id++) {
     const rec = byId[id];
-    const inQC = rec ? qcSet.has((rec.order_no || '') + '|' + (rec.sku || '')) : false;
-    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec, inQC));
+    const info = rec ? lineInfo.get((rec.order_no || '') + '|' + (rec.sku || '')) : null;
+    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec, !!(info && info.qc), info ? info.ms : 0));
   }
   return { success: true, data };
+}
+
+// Every finished Atelier attempt (pending QC, approved, or sent back for
+// rework) keeps the exact time the tailor's timer showed when they hit
+// Finish. Adding those up per order line means the time is visible the
+// moment the tailor finishes — not only once QC approves — and a redo after
+// a rejection simply adds its extra time on top of the earlier attempt(s).
+async function getAtelierLineInfoMap() {
+  const map = new Map();
+  const pageSize = 1000;
+  let offset = 0;
+  while (true) {
+    const page = (await sbFetch('GET',
+      `atelier_jobs?status=in.(pending,approved,rework)&select=order_no,sku,status,duration_ms&order=id.asc&limit=${pageSize}&offset=${offset}`)) || [];
+    page.forEach(j => {
+      const key = (j.order_no || '') + '|' + (j.sku || '');
+      const e = map.get(key) || { ms: 0, qc: false };
+      e.ms += Number(j.duration_ms || 0);
+      if (j.status === 'pending') e.qc = true;
+      map.set(key, e);
+    });
+    if (page.length < pageSize) break;
+    offset += pageSize;
+  }
+  return map;
+}
+
+// Single-order version, used when just one order is refreshed.
+async function getOrderLineInfo(orderNo, sku) {
+  if (!orderNo) return { qc: false, ms: 0 };
+  let q = `atelier_jobs?order_no=eq.${encodeURIComponent(orderNo)}&status=in.(pending,approved,rework)&select=status,duration_ms`;
+  if (sku) q += `&sku=eq.${encodeURIComponent(sku)}`;
+  const rows = (await sbFetch('GET', q)) || [];
+  return { qc: rows.some(r => r.status === 'pending'), ms: rows.reduce((a, r) => a + Number(r.duration_ms || 0), 0) };
 }
 
 // Single-order version of the QC check used in doGetOrders — is there a
@@ -714,8 +750,8 @@ async function doGetOrder(params) {
   const recs = await sbFetch('GET', `orders?id=eq.${row - 2}&select=*&limit=1`);
   const rec = recs && recs[0];
   if (!rec || isBlankOrder_(rec)) return { success: false, error: 'Order not found.' };
-  const inQC = await isOrderInQC(rec.order_no, rec.sku);
-  return { success: true, row, data: buildOrderRowArray(rec, inQC) };
+  const info = await getOrderLineInfo(rec.order_no, rec.sku);
+  return { success: true, row, data: buildOrderRowArray(rec, info.qc, info.ms) };
 }
 
 // Same idea as doGetOrder, but for when the caller only has the order
@@ -732,8 +768,8 @@ async function doGetOrderByOrderNo(params) {
   const recs = await sbFetch('GET', query);
   const rec = recs && recs[0];
   if (!rec) return { success: false, error: 'Order "' + orderNo + '" not found.' };
-  const inQC = await isOrderInQC(rec.order_no, rec.sku);
-  return { success: true, row: rec.id + 2, data: buildOrderRowArray(rec, inQC) };
+  const info = await getOrderLineInfo(rec.order_no, rec.sku);
+  return { success: true, row: rec.id + 2, data: buildOrderRowArray(rec, info.qc, info.ms) };
 }
 
 function isBlankOrder_(rec) {
@@ -1624,6 +1660,7 @@ function formatAtelierJob(j) {
     qty: j.qty, status: j.status, manual: j.manual, urgent: j.urgent,
     startAt: j.start_at, endAt: j.end_at,
     durationMinutes: j.duration_ms != null ? Math.round(j.duration_ms / 60000) : null,
+    durationSeconds: j.duration_ms != null ? Math.round(j.duration_ms / 1000) : null,
     accumMs: j.accum_ms, runSince: j.run_since,
     standardMinutes: j.standard_min, payAmount: j.pay_amount,
     approvedAt: j.approved_at, reworkAt: j.rework_at,
@@ -1669,9 +1706,30 @@ async function doAtelierMyEarnings(params) {
 }
 
 // ---- Supervisor/admin: approvals ----
+// Adds this-round / earlier / total seconds to each job, where "earlier" is
+// every other finished attempt on the same order line (e.g. before a QC
+// rejection), so the supervisor sees the whole time the tailor has spent.
+async function withLineTotals(rows) {
+  const out = [];
+  for (const j of rows) {
+    const f = formatAtelierJob(j);
+    const thisSec = Math.round(Number(j.duration_ms || 0) / 1000);
+    let priorSec = 0;
+    if (j.order_no) {
+      let q = `atelier_jobs?order_no=eq.${encodeURIComponent(j.order_no)}&id=neq.${j.id}&status=in.(pending,approved,rework)&duration_ms=not.is.null&select=duration_ms`;
+      if (j.sku) q += `&sku=eq.${encodeURIComponent(j.sku)}`;
+      const others = (await sbFetch('GET', q)) || [];
+      priorSec = Math.round(others.reduce((a, r) => a + Number(r.duration_ms || 0), 0) / 1000);
+    }
+    f.thisSeconds = thisSec; f.priorSeconds = priorSec; f.totalSeconds = thisSec + priorSec;
+    out.push(f);
+  }
+  return out;
+}
+
 async function doAtelierApprovalsList() {
   const rows = (await sbFetch('GET', 'atelier_jobs?status=eq.pending&select=*&order=end_at.asc')) || [];
-  return { success: true, jobs: rows.map(formatAtelierJob) };
+  return { success: true, jobs: await withLineTotals(rows) };
 }
 
 // ---- Supervisor scan-to-approve: look up the Atelier job for a scanned
@@ -1692,7 +1750,7 @@ async function doAtelierFindPendingByCode(params) {
       : `sku=eq.${encodeURIComponent(sku)}`;
 
   const pending = await sbFetch('GET', `atelier_jobs?${base}&status=eq.pending&select=*&order=created_at.desc&limit=1`);
-  if (pending && pending[0]) return { success: true, job: formatAtelierJob(pending[0]), matchStatus: 'pending' };
+  if (pending && pending[0]) return { success: true, job: (await withLineTotals([pending[0]]))[0], matchStatus: 'pending' };
 
   const any = await sbFetch('GET', `atelier_jobs?${base}&select=*&order=created_at.desc&limit=1`);
   if (any && any[0]) return { success: true, job: formatAtelierJob(any[0]), matchStatus: any[0].status };
@@ -1857,7 +1915,9 @@ async function doAtelierRevertJob(params) {
 async function doAtelierJobsForLine(params) {
   const orderNo = (params.orderNo || '').toString().trim();
   if (!orderNo) return { success: false, error: 'Order number is required.' };
-  const rows = await sbFetch('GET', `atelier_jobs?order_no=eq.${encodeURIComponent(orderNo)}&select=*&order=start_at.desc`);
+  const sku = (params.sku || '').toString().trim();
+  const skuQ = sku ? `&sku=eq.${encodeURIComponent(sku)}` : '';
+  const rows = await sbFetch('GET', `atelier_jobs?order_no=eq.${encodeURIComponent(orderNo)}${skuQ}&select=*&order=start_at.desc`);
   return { success: true, jobs: (rows || []).map(formatAtelierJob) };
 }
 
