@@ -258,7 +258,7 @@ const ROLE_PERMISSIONS = {
   // *viewing*, payroll and mechanic calls. Cannot see/edit pay rates or
   // write standard times — those stay admin-only per spec.
   atelier_supervisor: [
-    'atelierApprovalsList', 'atelierApproveJob', 'atelierRejectJob', 'atelierTeamToday',
+    'atelierApprovalsList', 'atelierApproveJob', 'atelierRejectJob', 'atelierRevertJob', 'atelierTeamToday',
     'atelierStandardsList', 'atelierPayrollReport', 'atelierMechanicCallsList', 'atelierMechanicResolve',
     'atelierGetWorkingTimeConfig', 'atelierFindPendingByCode', 'atelierJobsForLine', 'atelierCancelJob'
   ],
@@ -580,6 +580,7 @@ async function routeAction(action, params) {
     case 'atelierApprovalsList': return doAtelierApprovalsList();
     case 'atelierApproveJob': return doAtelierApproveJob(params);
     case 'atelierRejectJob': return doAtelierRejectJob(params);
+    case 'atelierRevertJob': return doAtelierRevertJob(params);
     case 'atelierTeamToday': return doAtelierTeamToday();
     case 'atelierStandardsList': return doAtelierStandardsList();
     case 'atelierMechanicCallsList': return doAtelierMechanicCallsList();
@@ -609,7 +610,7 @@ function parseRow(params) {
 // ORDERS — reconstructs the exact same 34-column array shape the
 // frontend's parseOrders() already expects.
 // ============================================================
-function buildOrderRowArray(rec) {
+function buildOrderRowArray(rec, inQC) {
   const row = new Array(41).fill('');
   if (!rec) return row;
 
@@ -637,8 +638,13 @@ function buildOrderRowArray(rec) {
   row[10] = rec.tailor || '';
   row[11] = rec.tailor_assigned_at || '';
   row[12] = rec.rework_note || '';
-  row[13] = rec.mach_emb_person || '';
-  row[14] = rec.hand_emb_person || '';
+  // Whether the tailor has already finished this line and it's sitting
+  // in QC awaiting supervisor approval (an atelier_jobs row with status
+  // 'pending' for this order_no+sku). Lets the main order dashboard show
+  // "QC" as its own stage instead of still lumping it in with "With tailor".
+  row[13] = inQC ? 'QC' : '';
+  row[14] = rec.mach_emb_person || '';
+  row[15] = rec.hand_emb_person || '';
 
   row[21] = rec.remarks || '';
   row[22] = rec.is_done ? 'Done' : '';
@@ -672,12 +678,29 @@ async function doGetOrders() {
     if (rec.id > maxId) maxId = rec.id;
   });
 
+  // Which (order_no, sku) lines are currently sitting in QC — an
+  // atelier_jobs row with status 'pending' — so the dashboard can show
+  // "QC" as its own stage instead of lumping it in with "With tailor".
+  const qcJobs = (await sbFetch('GET', 'atelier_jobs?status=eq.pending&select=order_no,sku')) || [];
+  const qcSet = new Set(qcJobs.map(j => (j.order_no || '') + '|' + (j.sku || '')));
+
   const data = [new Array(41).fill(''), new Array(41).fill('')];
   for (let id = 1; id <= maxId; id++) {
     const rec = byId[id];
-    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec));
+    const inQC = rec ? qcSet.has((rec.order_no || '') + '|' + (rec.sku || '')) : false;
+    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec, inQC));
   }
   return { success: true, data };
+}
+
+// Single-order version of the QC check used in doGetOrders — is there a
+// pending (QC) atelier job for this exact order line right now?
+async function isOrderInQC(orderNo, sku) {
+  if (!orderNo) return false;
+  let q = `atelier_jobs?order_no=eq.${encodeURIComponent(orderNo)}&status=eq.pending&select=id&limit=1`;
+  if (sku) q = `atelier_jobs?order_no=eq.${encodeURIComponent(orderNo)}&sku=eq.${encodeURIComponent(sku)}&status=eq.pending&select=id&limit=1`;
+  const rows = await sbFetch('GET', q);
+  return !!(rows && rows[0]);
 }
 
 // Fetches just ONE order (instead of the whole table) — used to refresh a
@@ -691,7 +714,8 @@ async function doGetOrder(params) {
   const recs = await sbFetch('GET', `orders?id=eq.${row - 2}&select=*&limit=1`);
   const rec = recs && recs[0];
   if (!rec || isBlankOrder_(rec)) return { success: false, error: 'Order not found.' };
-  return { success: true, row, data: buildOrderRowArray(rec) };
+  const inQC = await isOrderInQC(rec.order_no, rec.sku);
+  return { success: true, row, data: buildOrderRowArray(rec, inQC) };
 }
 
 // Same idea as doGetOrder, but for when the caller only has the order
@@ -708,7 +732,8 @@ async function doGetOrderByOrderNo(params) {
   const recs = await sbFetch('GET', query);
   const rec = recs && recs[0];
   if (!rec) return { success: false, error: 'Order "' + orderNo + '" not found.' };
-  return { success: true, row: rec.id + 2, data: buildOrderRowArray(rec) };
+  const inQC = await isOrderInQC(rec.order_no, rec.sku);
+  return { success: true, row: rec.id + 2, data: buildOrderRowArray(rec, inQC) };
 }
 
 function isBlankOrder_(rec) {
@@ -889,11 +914,7 @@ async function doUpdateMachEmb(params) {
 // Masters and tailors can hand an order to a named embroiderer. The person
 // is stored alongside the usual sent ("RED|time") marker so the admin list
 // can show exactly who has it — Abdullah/Asif for machine, Akil for hand.
-const ORDER_EMB_PEOPLE = {
-  'Abdullah': 'mach',
-  'Asif': 'mach',
-  'Akil': 'hand'
-};
+const ORDER_EMB_PEOPLE = { 'Abdullah': 'mach', 'Asif': 'mach', 'Akil': 'hand' };
 async function doSendOrderEmb(params) {
   const row = parseRow(params);
   if (!row) return { success: false, error: 'Invalid row.' };
@@ -1791,7 +1812,46 @@ async function doAtelierRejectJob(params) {
   return { success: true };
 }
 
-// Troubleshooting tool: show every atelier job ever logged against a given
+// Undoes a finish that was pressed by mistake — the job never gets reviewed
+// at all; it's deleted outright (no time or pay recorded, unlike a reject)
+// and the order line is handed to whichever tailor the supervisor picks,
+// which may or may not be the same tailor who scanned it in the first place.
+async function doAtelierRevertJob(params) {
+  const id = parseInt(params.jobId, 10);
+  if (!id) return { success: false, error: 'Invalid job id.' };
+  const newTailor = (params.newTailor || '').toString().trim();
+  if (!newTailor) return { success: false, error: 'Please choose which tailor to give this to.' };
+
+  const tailors = await getActiveStaffNames('tailor');
+  if (tailors.indexOf(newTailor) === -1) {
+    return { success: false, error: 'Unknown tailor: ' + newTailor };
+  }
+
+  const approver = (params.authenticatedName || params.role || '').toString();
+  const rows = await sbFetch('GET', `atelier_jobs?id=eq.${id}&select=tailor,status,order_no,sku&limit=1`);
+  const job = rows && rows[0];
+  if (!job) return { success: false, error: 'Job not found.' };
+  if (job.status !== 'pending') return { success: false, error: 'This job is not in QC — it may have already been approved, rejected, or reverted.' };
+
+  await sbFetch('DELETE', `atelier_jobs?id=eq.${id}`, undefined, { Prefer: 'return=minimal' });
+
+  if (job.order_no && job.sku) {
+    const orderRows = await sbFetch('GET', `orders?order_no=eq.${encodeURIComponent(job.order_no)}&sku=eq.${encodeURIComponent(job.sku)}&select=id&limit=1`);
+    const orderRec = orderRows && orderRows[0];
+    if (orderRec) {
+      const stamp = new Date().toLocaleString();
+      await sbUpdate('orders', orderRec.id, {
+        tailor: newTailor, tailor_assigned_at: new Date().toISOString(),
+        rework_note: `↩️ Reverted from QC (was finished by ${job.tailor}) — reassigned to ${newTailor} by ${approver}, ${stamp}.`
+      });
+    }
+    if (SHOPIFY_ENABLED) pushShopifyUpdate(job.order_no, `Reverted from QC — reassigned to Tailor: ${newTailor}`);
+  }
+
+  return { success: true };
+}
+
+
 // order line (any status), so a supervisor can see what's actually blocking
 // a tailor from starting it again — and clear it if it's a stray one.
 async function doAtelierJobsForLine(params) {
@@ -1858,11 +1918,19 @@ function percentile(nums, p) {
 }
 
 async function doAtelierStandardsList() {
-  const jobs = (await sbFetch('GET', 'atelier_jobs?status=eq.approved&duration_ms=not.is.null&select=model,qty,duration_ms')) || [];
+  const jobs = (await sbFetch('GET', 'atelier_jobs?status=eq.approved&duration_ms=not.is.null&select=model,qty,duration_ms,tailor')) || [];
   const byModel = {};
+  // Per model, per tailor: every approved job's minutes/piece, so we can
+  // tell who is fastest/slowest at sewing that particular model.
+  const byModelTailor = {};
   jobs.forEach(j => {
     if (!j.model || !j.qty) return;
-    (byModel[j.model] = byModel[j.model] || []).push((j.duration_ms / 60000) / j.qty);
+    const minPerPiece = (j.duration_ms / 60000) / j.qty;
+    (byModel[j.model] = byModel[j.model] || []).push(minPerPiece);
+    if (j.tailor) {
+      const tByTailor = (byModelTailor[j.model] = byModelTailor[j.model] || {});
+      (tByTailor[j.tailor] = tByTailor[j.tailor] || []).push(minPerPiece);
+    }
   });
   const currentRows = (await sbFetch('GET', 'atelier_standards?select=*')) || [];
   const currentByModel = {};
@@ -1871,11 +1939,27 @@ async function doAtelierStandardsList() {
   const settings = await getAtelierSettings();
   const standards = Object.keys(byModel).map(model => {
     const vals = byModel[model];
+
+    // Rank tailors on this model by their own average minutes/piece —
+    // lower average = faster. Ties (or a single tailor) just report the
+    // same name for both.
+    const tailorStats = Object.keys(byModelTailor[model] || {}).map(tailor => {
+      const arr = byModelTailor[model][tailor];
+      const avg = arr.reduce((a, b) => a + b, 0) / arr.length;
+      return { tailor, avgMinPerPiece: +avg.toFixed(1), jobCount: arr.length };
+    });
+    let fastestTailor = null, slowestTailor = null;
+    if (tailorStats.length) {
+      fastestTailor = tailorStats.reduce((a, b) => (b.avgMinPerPiece < a.avgMinPerPiece ? b : a));
+      slowestTailor = tailorStats.reduce((a, b) => (b.avgMinPerPiece > a.avgMinPerPiece ? b : a));
+    }
+
     return {
       model, jobCount: vals.length,
       medianMinPerPiece: +median(vals).toFixed(1),
       p25MinPerPiece: +percentile(vals, 25).toFixed(1),
-      currentStandard: currentByModel[model] ? Number(currentByModel[model].min_per_piece) : null
+      currentStandard: currentByModel[model] ? Number(currentByModel[model].min_per_piece) : null,
+      fastestTailor, slowestTailor
     };
   });
   return { success: true, standards, typeDefaults: settings.type_std || {} };
