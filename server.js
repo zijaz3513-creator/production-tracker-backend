@@ -42,9 +42,7 @@ const ROLE_PASSWORDS = {
   handemb: process.env.HANDEMB_PASSWORD,
   machemb: process.env.MACHEMB_PASSWORD,
   fulfillment: process.env.FULFILLMENT_PASSWORD,
-  // Aeon Workstation supervisor — approves tailoring jobs, sees team status and
-  // payroll, but (like everyone except admin) cannot see or edit pay rates
-  // or standard times.
+  // Aeon Workstation supervisor — approves tailoring jobs only.
   atelier_supervisor: process.env.ATELIER_SUPERVISOR_PASSWORD
 };
 
@@ -254,13 +252,13 @@ const ROLE_PERMISSIONS = {
     'atelierMyOrders', 'atelierStartJob', 'atelierPauseJob', 'atelierResumeJob', 'atelierFinishJob', 'atelierReturnJob',
     'atelierMechanicCall', 'atelierMyToday', 'atelierMyHistory', 'atelierMyEarnings', 'atelierGetWorkingTimeConfig'
   ],
-  // Aeon Workstation supervisor: approvals, team status, standard-time
-  // *viewing*, payroll and mechanic calls. Cannot see/edit pay rates or
-  // write standard times — those stay admin-only per spec.
+  // Aeon Workstation supervisor: APPROVALS ONLY (list, approve, reject,
+  // revert & reassign, scan-to-approve). Team today, standard times,
+  // payroll, mechanic calls and find-job live in the Admin panel and are
+  // deliberately not granted here.
   atelier_supervisor: [
-    'atelierApprovalsList', 'atelierApproveJob', 'atelierRejectJob', 'atelierRevertJob', 'atelierTeamToday',
-    'atelierStandardsList', 'atelierPayrollReport', 'atelierMechanicCallsList', 'atelierMechanicResolve',
-    'atelierGetWorkingTimeConfig', 'atelierFindPendingByCode', 'atelierJobsForLine', 'atelierCancelJob'
+    'atelierApprovalsList', 'atelierApproveJob', 'atelierRejectJob', 'atelierRevertJob',
+    'atelierFindPendingByCode', 'atelierGetWorkingTimeConfig'
   ],
   designer: ['getSamples', 'addSample'],
   patternmaster: ['getSamples', 'assignSampleTailor'],
