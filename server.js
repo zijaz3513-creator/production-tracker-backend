@@ -1343,9 +1343,12 @@ function atelierModelFromSku(sku) {
   return i === -1 ? s : s.slice(0, i);
 }
 
-function atelierQtyFromNotes(notes) {
-  const m = (notes || '').toString().match(/(\d+)\s*(pcs|pc|pieces)/i);
-  return m ? (parseInt(m[1], 10) || 1) : 1;
+// Every order line is exactly ONE piece. If a customer needs more than one,
+// staff create a separate order with its own order number. Anything written
+// in the notes (e.g. "2 pcs") is for staff reference only and must never
+// change the quantity, so the notes argument is intentionally ignored.
+function atelierQtyFromNotes(_notes) {
+  return 1;
 }
 
 // ---- Settings (single row, id=1) — cached in memory, invalidated on write ----
@@ -1518,7 +1521,7 @@ async function doAtelierStartJob(params) {
   if (!orderNo || !sku) return { success: false, error: 'Order number and SKU are required.' };
 
   let garmentType = (params.garmentType || '').toString().trim();
-  let qty = parseInt(params.qty, 10) || 1;
+  let qty = 1; // fixed: one piece per order line
   let master = (params.master || '').toString().trim() || null;
   let notes = (params.notes || '').toString();
   let urgent = false;
