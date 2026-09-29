@@ -595,6 +595,7 @@ async function routeAction(action, params) {
     case 'atelierGetSettings': return doAtelierGetSettings();
     case 'atelierSetSettings': return doAtelierSetSettings(params);
     case 'atelierSetPin': return doAtelierSetPin(params);
+    case 'atelierListPins': return doAtelierListPins();
     default: return { success: false, error: 'Unknown action: ' + action };
   }
 }
@@ -1363,7 +1364,10 @@ function invalidateAtelierSettingsCache() { atelierSettingsCache = null; }
 
 async function getStandardMinutes(model, garmentType) {
   if (model) {
-    const rows = await sbFetch('GET', `atelier_standards?model=eq.${encodeURIComponent(model)}&select=min_per_piece&limit=1`);
+    // Case-insensitive so "abc" and "ABC" are the same model (the Standard
+    // Times list clubs them together). Backslash, % and _ are escaped so they match literally.
+    const safe = model.toString().trim().replace(/[\\%_]/g, c => '\\' + c);
+    const rows = await sbFetch('GET', `atelier_standards?model=ilike.${encodeURIComponent(safe)}&select=min_per_piece&limit=1`);
     if (rows && rows[0] && rows[0].min_per_piece != null) return Number(rows[0].min_per_piece);
   }
   const settings = await getAtelierSettings();
@@ -1431,6 +1435,12 @@ async function doAtelierTailorLogin(params) {
   const token = crypto.randomBytes(24).toString('hex');
   sessions.set(token, { role: 'tailor', name, createdAt: Date.now() });
   return { success: true, token, name };
+}
+
+// Admin-only: every active tailor (added under Staff) with whether a PIN is set.
+async function doAtelierListPins() {
+  const rows = (await sbFetch('GET', 'staff?select=id,name,atelier_pin_hash&role=eq.tailor&active=eq.true&order=sort_order.asc,created_at.asc')) || [];
+  return { success: true, tailors: rows.map(r => ({ id: r.id, name: r.name, hasPin: !!r.atelier_pin_hash })) };
 }
 
 // Admin-only: set/change a tailor's PIN (Admin > Staff, or Atelier > Settings)
@@ -1984,8 +1994,10 @@ async function doAtelierStandardsList() {
   // Per model, per tailor: every approved job's minutes/piece, so we can
   // tell who is fastest/slowest at sewing that particular model.
   const byModelTailor = {};
+  const modelKey = m => (m || '').toString().trim().toUpperCase();
   jobs.forEach(j => {
     if (!j.model || !j.qty) return;
+    j.model = modelKey(j.model); // "abc" / "ABC " / "ABC" are one model
     const minPerPiece = (j.duration_ms / 60000) / j.qty;
     (byModel[j.model] = byModel[j.model] || []).push(minPerPiece);
     if (j.tailor) {
@@ -1995,7 +2007,7 @@ async function doAtelierStandardsList() {
   });
   const currentRows = (await sbFetch('GET', 'atelier_standards?select=*')) || [];
   const currentByModel = {};
-  currentRows.forEach(r => { currentByModel[r.model] = r; });
+  currentRows.forEach(r => { currentByModel[modelKey(r.model)] = r; });
 
   const settings = await getAtelierSettings();
   const standards = Object.keys(byModel).map(model => {
@@ -2039,7 +2051,9 @@ async function doAtelierSetStandard(params) {
 async function doAtelierUseFastStandard(params) {
   const model = (params.model || '').toString().trim();
   if (!model) return { success: false, error: 'Model is required.' };
-  const jobs = (await sbFetch('GET', `atelier_jobs?status=eq.approved&model=eq.${encodeURIComponent(model)}&duration_ms=not.is.null&select=qty,duration_ms`)) || [];
+  const wantKey = model.toUpperCase();
+  const jobs = ((await sbFetch('GET', 'atelier_jobs?status=eq.approved&duration_ms=not.is.null&select=model,qty,duration_ms')) || [])
+    .filter(j => (j.model || '').toString().trim().toUpperCase() === wantKey);
   const vals = jobs.filter(j => j.qty).map(j => (j.duration_ms / 60000) / j.qty);
   const p25 = percentile(vals, 25);
   if (p25 == null) return { success: false, error: 'Not enough finished jobs for this model yet.' };
