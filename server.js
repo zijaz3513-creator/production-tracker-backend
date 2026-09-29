@@ -1651,14 +1651,39 @@ async function doAtelierStartJob(params) {
   return { success: true, job: formatAtelierJob(job) };
 }
 
+// Reasons a tailor must pick from when pausing a job.
+const ATELIER_PAUSE_REASONS = [
+  'Needs machine embroidery (Asif)',
+  'Needs machine embroidery (Abdullah)',
+  'Needs hand embroidery (Akil)',
+  'Missing fabric',
+  'Missing heat and bond (Vaslin)',
+  'Break'
+];
+// pause_reason is a text column on atelier_jobs. If it hasn't been added yet
+// the write is retried without it, so pausing never breaks.
+async function atelierUpdateJobWithReason(id, patch) {
+  try {
+    await sbUpdate('atelier_jobs', id, patch);
+  } catch (e) {
+    if (!('pause_reason' in patch)) throw e;
+    const rest = Object.assign({}, patch); delete rest.pause_reason;
+    await sbUpdate('atelier_jobs', id, rest);
+  }
+}
+
 async function doAtelierPauseJob(params) {
   const tailor = (params.authenticatedName || '').toString();
   const jobId = parseInt(params.jobId, 10) || null;
+  const reason = (params.reason || '').toString().trim();
+  if (ATELIER_PAUSE_REASONS.indexOf(reason) === -1) {
+    return { success: false, error: 'Please choose a reason to pause.' };
+  }
   const job = jobId ? await getAtelierJobForTailor(tailor, jobId) : await getAtelierActiveJob(tailor);
   if (!job) return { success: false, error: 'No running job to pause.' };
   if (!job.run_since) return { success: true };
   const accum = Number(job.accum_ms || 0) + (Date.now() - new Date(job.run_since).getTime());
-  await sbUpdate('atelier_jobs', job.id, { accum_ms: accum, run_since: null });
+  await atelierUpdateJobWithReason(job.id, { accum_ms: accum, run_since: null, pause_reason: reason });
   return { success: true };
 }
 
@@ -1671,7 +1696,7 @@ async function doAtelierResumeJob(params) {
   // Only one timer runs at a time — pause whatever else is currently
   // running before resuming this one.
   await atelierPauseRunning(tailor, job.id);
-  await sbUpdate('atelier_jobs', job.id, { run_since: new Date().toISOString() });
+  await atelierUpdateJobWithReason(job.id, { run_since: new Date().toISOString(), pause_reason: null });
   return { success: true };
 }
 
@@ -1682,7 +1707,7 @@ async function doAtelierFinishJob(params) {
   if (!job) return { success: false, error: 'No job to finish.' };
   const accum = Number(job.accum_ms || 0) + (job.run_since ? (Date.now() - new Date(job.run_since).getTime()) : 0);
   const now = new Date().toISOString();
-  await sbUpdate('atelier_jobs', job.id, { accum_ms: accum, run_since: null, status: 'pending', end_at: now, duration_ms: accum });
+  await atelierUpdateJobWithReason(job.id, { accum_ms: accum, run_since: null, status: 'pending', end_at: now, duration_ms: accum, pause_reason: null });
   return { success: true };
 }
 
@@ -1762,7 +1787,8 @@ function formatAtelierJob(j) {
     standardMinutes: j.standard_min, payAmount: j.pay_amount,
     approvedAt: j.approved_at, reworkAt: j.rework_at,
     rejectReason: j.reject_reason || null, rejectedBy: j.rejected_by || null,
-    fabricIssueType: j.fabric_issue_type || null
+    fabricIssueType: j.fabric_issue_type || null,
+    pauseReason: j.pause_reason || null
   };
 }
 
@@ -2060,7 +2086,7 @@ async function doAtelierTeamToday() {
       // showing whichever one is actually running; fall back to the first
       // paused one seen if nothing is running (yet).
       if (j.run_since || !b.currentOrder) {
-        b.currentOrder = { orderNo: j.order_no, sku: j.sku, garmentType: j.garment_type };
+        b.currentOrder = { orderNo: j.order_no, sku: j.sku, garmentType: j.garment_type, pauseReason: j.run_since ? null : (j.pause_reason || null) };
         b.status = stopped.has(j.tailor) ? 'machine_stopped' : (j.run_since ? 'working' : 'paused');
       }
     }
