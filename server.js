@@ -1882,9 +1882,16 @@ async function doAtelierApproveJob(params) {
   };
   await sbUpdate('atelier_jobs', id, patch);
   if (job.order_no && job.sku) {
-    const orderRows = await sbFetch('GET', `orders?order_no=eq.${encodeURIComponent(job.order_no)}&sku=eq.${encodeURIComponent(job.sku)}&select=id&limit=1`);
+    const orderRows = await sbFetch('GET', `orders?order_no=eq.${encodeURIComponent(job.order_no)}&sku=eq.${encodeURIComponent(job.sku)}&select=id,is_done&limit=1`);
     const orderRec = orderRows && orderRows[0];
-    if (orderRec) await sbUpdate('orders', orderRec.id, { rework_note: null });
+    if (orderRec) {
+      // Approval finishes the order: mark it Done so it moves to the
+      // Completed tab. (An order already marked Done keeps its original date.)
+      const orderPatch = { rework_note: null };
+      if (!orderRec.is_done) { orderPatch.is_done = true; orderPatch.done_at = new Date().toISOString(); }
+      await sbUpdate('orders', orderRec.id, orderPatch);
+      if (!orderRec.is_done) pushShopifyUpdate(job.order_no, 'Production complete — Done ✅');
+    }
   }
   if (SHOPIFY_ENABLED) pushShopifyUpdate(job.order_no, `Tailoring approved — ${job.tailor}, ${qty} pc(s)`);
   return { success: true };
