@@ -258,7 +258,9 @@ const ROLE_PERMISSIONS = {
   // deliberately not granted here.
   atelier_supervisor: [
     'atelierApprovalsList', 'atelierApproveJob', 'atelierRejectJob', 'atelierRevertJob',
-    'atelierFindPendingByCode', 'atelierGetWorkingTimeConfig'
+    'atelierFindPendingByCode', 'atelierGetWorkingTimeConfig',
+    // Ready-made items: supervisor scans, then approves or rejects
+    'readyMadeList', 'readyMadeFindByCode', 'readyMadeApprove', 'readyMadeReject'
   ],
   designer: ['getSamples', 'addSample'],
   patternmaster: ['getSamples', 'assignSampleTailor'],
@@ -545,6 +547,10 @@ async function routeAction(action, params) {
     case 'updateMaster': return doUpdateMaster(params);
     case 'updateTailor': return doUpdateTailor(params);
     case 'markDone': return doMarkDone(params);
+    case 'readyMadeList': return doReadyMadeList();
+    case 'readyMadeFindByCode': return doReadyMadeFindByCode(params);
+    case 'readyMadeApprove': return doReadyMadeApprove(params);
+    case 'readyMadeReject': return doReadyMadeReject(params);
     case 'undoMarkDone': return doUndoMarkDone(params);
     case 'deleteOrder': return doDeleteOrder(params);
     case 'updateUrgent': return doUpdateUrgent(params);
@@ -1029,11 +1035,91 @@ async function doMarkDone(params) {
   const rec = await sbFetch('GET', 'orders?id=eq.' + id + '&select=tailor,fabric_status,order_no');
   const s = rec && rec[0];
   if (!s) return { success: false, error: 'Order not found.' };
-  if (!s.tailor && !isReadyMadeStatus(s.fabric_status)) {
+  if (isReadyMadeStatus(s.fabric_status)) {
+    return { success: false, error: 'Ready-made items must be scanned and approved by the supervisor.' };
+  }
+  if (!s.tailor) {
     return { success: false, error: 'Cannot mark Done — no tailor has been assigned yet.' };
   }
   await sbUpdate('orders', id, { is_done: true, done_at: new Date().toISOString() });
   pushShopifyUpdate(s.order_no, 'Production complete — Done ✅');
+  return { success: true };
+}
+
+// ── READY-MADE APPROVALS (supervisor) ────────────────────────────────────
+// Ready-made pieces never get a tailor job, so they can't be finished by
+// anyone but the supervisor: scan → Approve (marks Done) or Reject (sends it
+// back to a tailor, a master, or the fabric step).
+function readyMadeLabelOf(fabric) {
+  return fabric === 'Ready Made - Found in Factory' ? 'Ready made (Factory)' : 'Ready made (Stock)';
+}
+function formatReadyMade(r) {
+  return { row: r.id + 2, orderNo: r.order_no, sku: r.sku, garmentType: r.garment_type || '',
+           fabric: readyMadeLabelOf(r.fabric_status), urgent: !!r.urgent };
+}
+async function doReadyMadeList() {
+  const rows = (await sbFetch('GET', `orders?is_done=eq.false&fabric_status=like.${encodeURIComponent('Ready Made*')}&select=id,order_no,sku,garment_type,fabric_status,urgent&order=id.asc`)) || [];
+  const [tailors, masters] = await Promise.all([getActiveStaffNames('tailor'), getActiveStaffNames('master')]);
+  return { success: true, items: rows.map(formatReadyMade), tailors, masters };
+}
+async function doReadyMadeFindByCode(params) {
+  const orderNo = (params.orderNo || '').toString().trim();
+  const sku = (params.sku || '').toString().trim();
+  if (!orderNo) return { success: false, error: "Scanned code didn't contain an order number." };
+  const q = `orders?order_no=eq.${encodeURIComponent(orderNo)}` + (sku ? `&sku=eq.${encodeURIComponent(sku)}` : '') + '&select=id,order_no,sku,garment_type,fabric_status,urgent,is_done&limit=5';
+  const rows = (await sbFetch('GET', q)) || [];
+  const rm = rows.filter(r => isReadyMadeStatus(r.fabric_status));
+  if (!rm.length) return { success: false, notReadyMade: true, error: 'Not a ready-made order.' };
+  const pending = rm.find(r => !r.is_done);
+  if (!pending) return { success: false, error: 'This ready-made order is already approved.' };
+  const [tailors, masters] = await Promise.all([getActiveStaffNames('tailor'), getActiveStaffNames('master')]);
+  return { success: true, item: formatReadyMade(pending), tailors, masters };
+}
+async function getPendingReadyMade(params) {
+  const row = parseRow(params);
+  if (!row) return { error: 'Invalid row.' };
+  const rec = ((await sbFetch('GET', 'orders?id=eq.' + (row - 2) + '&select=id,order_no,fabric_status,is_done')) || [])[0];
+  if (!rec) return { error: 'Order not found.' };
+  if (!isReadyMadeStatus(rec.fabric_status)) return { error: 'This order is not a ready-made item.' };
+  if (rec.is_done) return { error: 'This order is already approved.' };
+  return { rec };
+}
+async function doReadyMadeApprove(params) {
+  const chk = await getPendingReadyMade(params);
+  if (chk.error) return { success: false, error: chk.error };
+  await sbUpdate('orders', chk.rec.id, { is_done: true, done_at: new Date().toISOString(), rework_note: null });
+  pushShopifyUpdate(chk.rec.order_no, 'Production complete — Done ✅');
+  return { success: true };
+}
+async function doReadyMadeReject(params) {
+  const chk = await getPendingReadyMade(params);
+  if (chk.error) return { success: false, error: chk.error };
+  const reason = (params.reason || '').toString();
+  const person = (params.person || '').toString().trim();
+  const approver = (params.authenticatedName || params.role || '').toString();
+  const stamp = new Date().toLocaleString();
+  const now = new Date().toISOString();
+  // Leaves the ready-made status so the piece re-enters normal production.
+  const base = { fabric_source: null, fabric_purchase_status: null };
+  let patch;
+  if (reason === 'tailor') {
+    if (!person) return { success: false, error: 'Please select the tailor number.' };
+    if ((await getActiveStaffNames('tailor')).indexOf(person) === -1) return { success: false, error: 'Unknown tailor: ' + person };
+    patch = Object.assign(base, { fabric_status: 'Available', tailor: person, tailor_assigned_at: now,
+      rework_note: `⚠️ Ready-made rejected — Tailor's issue (${person}) — please redo. By ${approver}, ${stamp}.` });
+  } else if (reason === 'master') {
+    if (!person) return { success: false, error: 'Please select the master.' };
+    if ((await getActiveStaffNames('master')).indexOf(person) === -1) return { success: false, error: 'Unknown master: ' + person };
+    patch = Object.assign(base, { fabric_status: 'Available', master: person, master_assigned_at: now, tailor: null, tailor_assigned_at: null,
+      rework_note: `⚠️ Ready-made rejected — Master's issue (${person}) — needs re-cut. By ${approver}, ${stamp}.` });
+  } else if (reason === 'fabric') {
+    // Back to the fabric-check step with "Remake" written on the order.
+    patch = Object.assign(base, { fabric_status: null, master: null, master_assigned_at: null, tailor: null, tailor_assigned_at: null,
+      rework_note: `⚠️ Remake — ready-made rejected (fabric). By ${approver}, ${stamp}.` });
+  } else {
+    return { success: false, error: 'Please choose Tailor, Master or Fabric.' };
+  }
+  await sbUpdate('orders', chk.rec.id, patch);
   return { success: true };
 }
 
