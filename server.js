@@ -262,6 +262,10 @@ const ROLE_PERMISSIONS = {
     // Ready-made items: supervisor scans, then approves or rejects
     'readyMadeList', 'readyMadeFindByCode', 'readyMadeApprove', 'readyMadeReject'
   ],
+  // Order embroidery desks: scan to receive, scan to start the timer, then
+  // pause / finish / return. Each role is locked to its own kind server-side.
+  handemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'embReceive', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn'],
+  machemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'embReceive', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn'],
   designer: ['getSamples', 'addSample'],
   patternmaster: ['getSamples', 'assignSampleTailor'],
   samplemachemb: ['getSamples', 'receiveSampleEmb'],
@@ -544,6 +548,12 @@ async function routeAction(action, params) {
     case 'updateMachEmb': return doUpdateMachEmb(params);
     case 'updateHandEmb': return doUpdateHandEmb(params);
     case 'sendOrderEmb': return doSendOrderEmb(params);
+    case 'embReceive': return doEmbReceive(params);
+    case 'embStart': return doEmbStart(params);
+    case 'embPause': return doEmbPause(params);
+    case 'embResume': return doEmbResume(params);
+    case 'embFinish': return doEmbFinish(params);
+    case 'embReturn': return doEmbReturn(params);
     case 'updateMaster': return doUpdateMaster(params);
     case 'updateTailor': return doUpdateTailor(params);
     case 'markDone': return doMarkDone(params);
@@ -918,7 +928,7 @@ async function doUpdateMachEmb(params) {
     return { success: true };
   }
 
-  if (!/^(RED|GREEN|SKIP)\|/.test(value || '')) {
+  if (!/^(NEED|RED|GREEN|SKIP)\|/.test(value || '')) {
     return { success: false, error: 'Invalid machine embroidery value format.' };
   }
 
@@ -962,12 +972,152 @@ async function doSendOrderEmb(params) {
   const person = (params.person || '').toString();
   const kind = ORDER_EMB_PEOPLE[person];
   if (!kind) return { success: false, error: 'Unknown embroidery person: ' + person };
+  // Don't overwrite a job the embroidery desk has already received/started/finished.
+  const curCol = kind === 'mach' ? 'machine_emb' : 'hand_emb';
+  const curRows = await sbFetch('GET', `orders?id=eq.${row - 2}&select=${curCol}&limit=1`);
+  const curCode = parseEmbValue(curRows && curRows[0] ? curRows[0][curCol] : '').code;
+  if (['RCVD', 'WORK', 'PAUSE', 'DONE', 'GREEN'].indexOf(curCode) !== -1) {
+    return { success: false, error: 'This order is already with (or finished by) ' + (kind === 'mach' ? 'machine' : 'hand') + ' embroidery.' };
+  }
   const ts = new Date().toLocaleString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
   const patch = kind === 'mach'
     ? { machine_emb: 'RED|' + ts, mach_emb_person: person }
     : { hand_emb: 'RED|' + ts, hand_emb_person: person };
   await sbUpdate('orders', row - 2, patch);
   return { success: true, kind, person };
+}
+
+// ============================================================
+// EMBROIDERY WORKFLOW (hand + machine desks)
+// Stored as text in orders.hand_emb / orders.machine_emb — no new columns:
+//   NEED|<stamp>                         needs embroidery (set when the order is added)
+//   RED|<stamp>                          legacy "sent out" — treated exactly like NEED
+//   RCVD|<stamp>                         desk scanned it and received it
+//   WORK|<startStamp>|<accumMs>|<runSinceEpochMs>   timer running
+//   PAUSE|<stamp>|<accumMs>|<reason>     timer paused with a reason
+//   DONE|<stamp>|<totalMs>               finished
+//   GREEN|<stamp>                        legacy "returned" — treated like DONE
+//   SKIP|<stamp>                         not needed
+// ============================================================
+const EMB_PAUSE_REASONS = {
+  hand: ['No Material', 'Break', 'Need Fabric'],
+  mach: ['No Thread', "Designer's Confirmation", 'Break']
+};
+function embStampNow() {
+  return new Date().toLocaleString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+function parseEmbValue(val) {
+  const p = (val || '').toString().split('|');
+  const code = p[0] || '';
+  if (code === 'WORK')  return { code, stamp: p[1] || '', accumMs: Number(p[2]) || 0, runSince: Number(p[3]) || 0 };
+  if (code === 'PAUSE') return { code, stamp: p[1] || '', accumMs: Number(p[2]) || 0, reason: p[3] || '' };
+  if (code === 'DONE')  return { code, stamp: p[1] || '', totalMs: Number(p[2]) || 0 };
+  return { code, stamp: p[1] || '' };
+}
+// Server-side guard: an embroidery desk may only touch its own kind.
+function embKindFor(params) {
+  const kind = (params.kind || '').toString();
+  if (kind !== 'mach' && kind !== 'hand') return { error: 'Invalid embroidery kind.' };
+  const role = (params.role || '').toString();
+  if (role === 'handemb' && kind !== 'hand') return { error: 'Hand embroidery desk can only work on hand embroidery.' };
+  if (role === 'machemb' && kind !== 'mach') return { error: 'Machine embroidery desk can only work on machine embroidery.' };
+  return { kind };
+}
+async function loadEmbOrder(params) {
+  const row = parseRow(params);
+  if (!row) return { error: 'Invalid row.' };
+  const k = embKindFor(params);
+  if (k.error) return { error: k.error };
+  const col = k.kind === 'mach' ? 'machine_emb' : 'hand_emb';
+  const rows = await sbFetch('GET', `orders?id=eq.${row - 2}&select=id,order_no,master,is_done,${col}&limit=1`);
+  const rec = rows && rows[0];
+  if (!rec) return { error: 'Order not found.' };
+  return { rec, col, kind: k.kind, id: row - 2, cur: parseEmbValue(rec[col]) };
+}
+async function saveEmb(ctx, value) {
+  await sbUpdate('orders', ctx.id, { [ctx.col]: value });
+}
+const embKindWord = kind => (kind === 'mach' ? 'machine' : 'hand');
+
+async function doEmbReceive(params) {
+  const ctx = await loadEmbOrder(params);
+  if (ctx.error) return { success: false, error: ctx.error };
+  if (ctx.cur.code === 'RCVD') return { success: true, already: true };
+  if (ctx.cur.code !== 'NEED' && ctx.cur.code !== 'RED') {
+    return { success: false, error: 'This order is not waiting to be received for ' + embKindWord(ctx.kind) + ' embroidery.' };
+  }
+  if (!ctx.rec.master) {
+    return { success: false, error: 'A master has not been assigned to this order yet — it can be received once the master is assigned.' };
+  }
+  const value = 'RCVD|' + embStampNow();
+  await saveEmb(ctx, value);
+  pushShopifyUpdate(ctx.rec.order_no, `${embKindWord(ctx.kind)} embroidery — received`);
+  return { success: true, value };
+}
+
+async function doEmbStart(params) {
+  const ctx = await loadEmbOrder(params);
+  if (ctx.error) return { success: false, error: ctx.error };
+  if (ctx.cur.code === 'WORK') return { success: true, already: true };
+  if (ctx.cur.code !== 'RCVD') {
+    return { success: false, error: ctx.cur.code === 'NEED' || ctx.cur.code === 'RED'
+      ? 'Scan to receive this order first, then scan again to start.'
+      : 'This order cannot be started right now.' };
+  }
+  const value = `WORK|${embStampNow()}|0|${Date.now()}`;
+  await saveEmb(ctx, value);
+  pushShopifyUpdate(ctx.rec.order_no, `${embKindWord(ctx.kind)} embroidery — working`);
+  return { success: true, value };
+}
+
+async function doEmbPause(params) {
+  const ctx = await loadEmbOrder(params);
+  if (ctx.error) return { success: false, error: ctx.error };
+  const reason = (params.reason || '').toString().trim();
+  if (EMB_PAUSE_REASONS[ctx.kind].indexOf(reason) === -1) {
+    return { success: false, error: 'Please choose a reason to pause.' };
+  }
+  if (ctx.cur.code !== 'WORK') return { success: false, error: 'Nothing is running to pause.' };
+  const accum = ctx.cur.accumMs + (ctx.cur.runSince ? Date.now() - ctx.cur.runSince : 0);
+  const value = `PAUSE|${embStampNow()}|${Math.round(accum)}|${reason}`;
+  await saveEmb(ctx, value);
+  return { success: true, value };
+}
+
+async function doEmbResume(params) {
+  const ctx = await loadEmbOrder(params);
+  if (ctx.error) return { success: false, error: ctx.error };
+  if (ctx.cur.code === 'WORK') return { success: true, already: true };
+  if (ctx.cur.code !== 'PAUSE') return { success: false, error: 'This order is not paused.' };
+  const value = `WORK|${embStampNow()}|${ctx.cur.accumMs}|${Date.now()}`;
+  await saveEmb(ctx, value);
+  return { success: true, value };
+}
+
+async function doEmbFinish(params) {
+  const ctx = await loadEmbOrder(params);
+  if (ctx.error) return { success: false, error: ctx.error };
+  if (ctx.cur.code !== 'WORK' && ctx.cur.code !== 'PAUSE') {
+    return { success: false, error: 'Start this order before finishing it.' };
+  }
+  const total = ctx.cur.accumMs + (ctx.cur.code === 'WORK' && ctx.cur.runSince ? Date.now() - ctx.cur.runSince : 0);
+  const value = `DONE|${embStampNow()}|${Math.round(total)}`;
+  await saveEmb(ctx, value);
+  pushShopifyUpdate(ctx.rec.order_no, `${embKindWord(ctx.kind)} embroidery — done ✅`);
+  return { success: true, value };
+}
+
+// Gives the order back: it goes to "needs embroidery" again and must be
+// scanned in to receive from the start. The timer for that attempt is dropped.
+async function doEmbReturn(params) {
+  const ctx = await loadEmbOrder(params);
+  if (ctx.error) return { success: false, error: ctx.error };
+  if (['RCVD', 'WORK', 'PAUSE'].indexOf(ctx.cur.code) === -1) {
+    return { success: false, error: 'Nothing to return — this order is not with you.' };
+  }
+  const value = 'NEED|' + embStampNow();
+  await saveEmb(ctx, value);
+  return { success: true, value };
 }
 
 async function doUpdateHandEmb(params) {
@@ -980,7 +1130,7 @@ async function doUpdateHandEmb(params) {
     return { success: true };
   }
 
-  if (!/^(RED|GREEN|SKIP)\|/.test(value || '')) {
+  if (!/^(NEED|RED|GREEN|SKIP)\|/.test(value || '')) {
     return { success: false, error: 'Invalid hand embroidery value format.' };
   }
   await sbUpdate('orders', row - 2, { hand_emb: value, hand_emb_person: value.startsWith('RED|') ? ((params.person || '').toString() || null) : null });
@@ -2276,11 +2426,16 @@ async function doAtelierGetWorkingTimeConfig() {
 // ============================================================
 
 function embLabel(raw) {
-  const m = (raw || '').match(/^(RED|GREEN|SKIP)\|(.*)$/);
+  const m = (raw || '').match(/^(NEED|RED|RCVD|WORK|PAUSE|DONE|GREEN|SKIP)\|([^|]*)(?:\|([^|]*))?(?:\|([^|]*))?/);
   if (!m) return 'not started';
-  if (m[1] === 'SKIP') return 'not needed';
-  if (m[1] === 'RED') return 'out — sent ' + m[2];
-  return 'received ' + m[2];
+  switch (m[1]) {
+    case 'SKIP': return 'not needed';
+    case 'NEED': case 'RED': return 'needs embroidery';
+    case 'RCVD': return 'received — not started (' + m[2] + ')';
+    case 'WORK': return 'working — started ' + m[2];
+    case 'PAUSE': return 'paused — ' + (m[4] || 'no reason') ;
+    default: return 'done ' + m[2];
+  }
 }
 
 function orderStatusLabel(rec) {
@@ -2401,10 +2556,10 @@ function buildMcpServer() {
 
     const ts = new Date().toLocaleString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
     if (p.orderType === 'Hand Embroidery') {
-      await doUpdateHandEmb({ row: result.row, value: 'RED|' + ts });
+      await doUpdateHandEmb({ row: result.row, value: 'NEED|' + ts });
       await doUpdateMachEmb({ row: result.row, value: 'SKIP|' + ts });
     } else if (p.orderType === 'Machine Embroidery') {
-      await doUpdateMachEmb({ row: result.row, value: 'RED|' + ts });
+      await doUpdateMachEmb({ row: result.row, value: 'NEED|' + ts });
       await doUpdateHandEmb({ row: result.row, value: 'SKIP|' + ts });
     } else {
       await doUpdateMachEmb({ row: result.row, value: 'SKIP|' + ts });
