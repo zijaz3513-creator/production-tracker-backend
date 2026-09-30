@@ -773,7 +773,9 @@ function buildOrderRowArray(rec, inQC, workMs) {
   // in QC awaiting supervisor approval (an atelier_jobs row with status
   // 'pending' for this order_no+sku). Lets the main order dashboard show
   // "QC" as its own stage instead of still lumping it in with "With tailor".
-  row[13] = inQC ? 'QC' : '';
+  // inQC is the pending atelier job id (number) when in QC, so the admin
+  // Edit Order modal can revert it; any truthy value still means "in QC".
+  row[13] = inQC ? String(inQC === true ? 'QC' : inQC) : '';
   row[14] = rec.mach_emb_person || '';
   row[15] = rec.hand_emb_person || '';
   // Total tailor working time on this line, in seconds (all finished attempts).
@@ -821,7 +823,7 @@ async function doGetOrders() {
   for (let id = 1; id <= maxId; id++) {
     const rec = byId[id];
     const info = rec ? lineInfo.get((rec.order_no || '') + '|' + (rec.sku || '')) : null;
-    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec, !!(info && info.qc), info ? info.ms : 0));
+    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec, (info && info.qc) || false, info ? info.ms : 0));
   }
   return { success: true, data };
 }
@@ -837,12 +839,12 @@ async function getAtelierLineInfoMap() {
   let offset = 0;
   while (true) {
     const page = (await sbFetch('GET',
-      `atelier_jobs?status=in.(pending,approved,rework)&select=order_no,sku,status,duration_ms&order=id.asc&limit=${pageSize}&offset=${offset}`)) || [];
+      `atelier_jobs?status=in.(pending,approved,rework)&select=id,order_no,sku,status,duration_ms&order=id.asc&limit=${pageSize}&offset=${offset}`)) || [];
     page.forEach(j => {
       const key = (j.order_no || '') + '|' + (j.sku || '');
       const e = map.get(key) || { ms: 0, qc: false };
       e.ms += Number(j.duration_ms || 0);
-      if (j.status === 'pending') e.qc = true;
+      if (j.status === 'pending') e.qc = j.id;
       map.set(key, e);
     });
     if (page.length < pageSize) break;
@@ -854,10 +856,11 @@ async function getAtelierLineInfoMap() {
 // Single-order version, used when just one order is refreshed.
 async function getOrderLineInfo(orderNo, sku) {
   if (!orderNo) return { qc: false, ms: 0 };
-  let q = `atelier_jobs?order_no=eq.${encodeURIComponent(orderNo)}&status=in.(pending,approved,rework)&select=status,duration_ms`;
+  let q = `atelier_jobs?order_no=eq.${encodeURIComponent(orderNo)}&status=in.(pending,approved,rework)&select=id,status,duration_ms`;
   if (sku) q += `&sku=eq.${encodeURIComponent(sku)}`;
   const rows = (await sbFetch('GET', q)) || [];
-  return { qc: rows.some(r => r.status === 'pending'), ms: rows.reduce((a, r) => a + Number(r.duration_ms || 0), 0) };
+  const pend = rows.find(r => r.status === 'pending');
+  return { qc: pend ? pend.id : false, ms: rows.reduce((a, r) => a + Number(r.duration_ms || 0), 0) };
 }
 
 // Single-order version of the QC check used in doGetOrders — is there a
