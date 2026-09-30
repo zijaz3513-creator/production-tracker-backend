@@ -244,10 +244,10 @@ const MAX_FABRIC_SLOTS = 6;
 
 // Which actions each role may call. Admin bypasses this check entirely.
 const ROLE_PERMISSIONS = {
-  inventory: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'updateFabric', 'updateFabricDetails', 'updateMachEmb', 'updateHandEmb', 'markDone'],
-  master: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'updateTailor', 'sendOrderEmb'],
+  inventory: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'updateFabric', 'updateFabricDetails', 'updateMachEmb', 'updateHandEmb', 'markDone'],
+  master: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'updateTailor', 'sendOrderEmb'],
   tailor: [
-    'getOrders', 'getOrder', 'getOrderByOrderNo', 'markDone', 'sendOrderEmb', 'getSamples', 'markSampleDone', 'sendSampleEmb',
+    'getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'markDone', 'sendOrderEmb', 'getSamples', 'markSampleDone', 'sendSampleEmb',
     // Aeon Workstation — tailor floor
     'atelierMyOrders', 'atelierStartJob', 'atelierPauseJob', 'atelierResumeJob', 'atelierFinishJob', 'atelierReturnJob',
     'atelierMechanicCall', 'atelierMyToday', 'atelierMyHistory', 'atelierMyEarnings', 'atelierGetWorkingTimeConfig'
@@ -264,8 +264,8 @@ const ROLE_PERMISSIONS = {
   ],
   // Order embroidery desks: scan to receive, scan to start the timer, then
   // pause / finish / return. Each role is locked to its own kind server-side.
-  handemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'embReceive', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn'],
-  machemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'embReceive', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn'],
+  handemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'embReceive', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn'],
+  machemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'embReceive', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn'],
   designer: ['getSamples', 'addSample'],
   patternmaster: ['getSamples', 'assignSampleTailor'],
   samplemachemb: ['getSamples', 'receiveSampleEmb'],
@@ -273,7 +273,7 @@ const ROLE_PERMISSIONS = {
   // Same access as Admin, except it cannot delete orders/samples or remove
   // staff — those three stay Admin-only.
   fulfillment: [
-    'getOrders', 'getOrder', 'getOrderByOrderNo', 'addOrder', 'updateFabric', 'updateFabricDetails',
+    'getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'addOrder', 'updateFabric', 'updateFabricDetails',
     'updateMachEmb', 'updateHandEmb', 'updateMaster', 'updateTailor',
     'markDone', 'undoMarkDone', 'updateUrgent', 'atelierJobsForLine',
     'getSamples', 'addSample', 'assignSampleTailor', 'assignSampleMaster',
@@ -537,11 +537,127 @@ function checkPermission(action, role) {
   return null;
 }
 
+// ============================================================
+// ORDER TIMELINE — a permanent, local history of every step an order goes
+// through (added, fabric, cutting, tailoring, QC, embroidery, done...).
+// Stored in the Supabase table `order_events` (see order_events.sql).
+// Logging is best-effort: it can never block or break the action itself.
+// ============================================================
+function actorOf(params) {
+  return ((params && (params.authenticatedName || params.role)) || '').toString();
+}
+
+// Fire-and-forget insert. `line` = { orderId?, orderNo, sku }.
+function logOrderEvent(line, kind, text, actor) {
+  if (!line || (!line.orderId && !line.orderNo)) return;
+  sbFetch('POST', 'order_events', {
+    order_id: line.orderId || null,
+    order_no: line.orderNo || null,
+    sku: line.sku || null,
+    kind, text: String(text || ''), actor: actor || null,
+    at: new Date().toISOString()
+  }, { Prefer: 'return=minimal' }).catch(e => console.error('order_events insert failed:', e.message));
+}
+
+// For handlers that only know order_no + sku (Atelier jobs): resolve the row id.
+async function logLineEvent(orderNo, sku, kind, text, actor) {
+  try {
+    if (!orderNo) return;
+    let id = null;
+    if (sku) {
+      const r = await sbFetch('GET', `orders?order_no=eq.${encodeURIComponent(orderNo)}&sku=eq.${encodeURIComponent(sku)}&select=id&limit=1`);
+      id = r && r[0] ? r[0].id : null;
+    }
+    logOrderEvent({ orderId: id, orderNo, sku }, kind, text, actor);
+  } catch (e) { console.error('logLineEvent failed:', e.message); }
+}
+
+const EMB_WORD = { mach: 'Machine embroidery', hand: 'Hand embroidery' };
+function describeEmbValue(kindWord, value, params) {
+  const code = (value || '').split('|')[0];
+  if (value === 'CLEAR') return ['embroidery', `${kindWord} — reset`];
+  if (code === 'NEED') return ['embroidery', `${kindWord} — marked as needed`];
+  if (code === 'SKIP') return ['embroidery', `${kindWord} — skipped (not needed)`];
+  if (code === 'RED') {
+    const bits = [];
+    if (params.person) bits.push('to ' + params.person);
+    if (params.metersSent) bits.push(params.metersSent + 'm sent');
+    return ['embroidery', `${kindWord} — sent out${bits.length ? ' (' + bits.join(', ') + ')' : ''}`];
+  }
+  if (code === 'GREEN') {
+    return ['embroidery', `${kindWord} — received back${params.metersReceived ? ' (' + params.metersReceived + 'm)' : ''}`];
+  }
+  return ['embroidery', `${kindWord} — ${value}`];
+}
+
+// Turns a successful action into a human-readable timeline entry.
+// Returns [kind, text] or null when the action is not a status change.
+function describeAction(action, p, result) {
+  const kindWord = (p.kind === 'hand' ? EMB_WORD.hand : EMB_WORD.mach);
+  switch (action) {
+    case 'updateFabric':
+      if (p.value === 'Not Available') return ['fabric', `Fabric: Not Available (${p.source}, ${p.purchaseStatus})`];
+      return ['fabric', `Fabric: ${p.value}`];
+    case 'updateFabricDetails': {
+      const bits = [p.fabricName, p.madeIn].filter(Boolean).join(', ');
+      return ['fabric', bits ? `Fabric details set: ${bits}` : 'Fabric details cleared'];
+    }
+    case 'updateMachEmb': return describeEmbValue(EMB_WORD.mach, p.value, p);
+    case 'updateHandEmb': return describeEmbValue(EMB_WORD.hand, p.value, p);
+    case 'sendOrderEmb': return ['embroidery', `${result.kind === 'hand' ? EMB_WORD.hand : EMB_WORD.mach} — handed to ${result.person}`];
+    case 'embReceive': return result.already ? null : ['embroidery', `${kindWord} — received at the embroidery desk`];
+    case 'embStart': return result.already ? null : ['embroidery', `${kindWord} — work started`];
+    case 'embPause': return ['embroidery', `${kindWord} — paused (${p.reason})`];
+    case 'embResume': return result.already ? null : ['embroidery', `${kindWord} — resumed`];
+    case 'embFinish': return ['embroidery', `${kindWord} — finished`];
+    case 'embReturn': return ['embroidery', `${kindWord} — returned, needs to be received again`];
+    case 'updateMaster':
+      return p.master ? ['cutting', `In cutting — assigned to Master: ${p.master}`] : ['cutting', 'Master unassigned'];
+    case 'updateTailor':
+      return p.tailor ? ['tailoring', `Assigned to Tailor: ${p.tailor}`] : ['tailoring', 'Tailor unassigned'];
+    case 'markDone': return ['done', 'Marked Done — production complete'];
+    case 'undoMarkDone': return ['reopened', 'Done status undone — order reopened'];
+    case 'updateUrgent':
+      return p.urgent === 'Yes' ? ['urgent', `Marked URGENT — produce by ${p.urgentDate}`] : ['urgent', 'Urgent flag removed'];
+    case 'readyMadeApprove': return ['done', 'Ready-made approved — production complete'];
+    case 'readyMadeReject': {
+      const to = p.reason === 'tailor' ? `Tailor ${p.person}` : p.reason === 'master' ? `Master ${p.person}` : 'the fabric step';
+      return ['rework', `Ready-made rejected — sent back to ${to}`];
+    }
+    default: return null;
+  }
+}
+
 async function routeAction(action, params) {
+  const result = await routeActionInner(action, params);
+  try {
+    if (result && result.success) {
+      if (action === 'addOrder' && result.row) {
+        const bits = [params.sku && ('SKU ' + params.sku), params.garmentType, params.orderType].filter(Boolean).join(' · ');
+        logOrderEvent({ orderId: result.row - 2, orderNo: (params.orderNo || '').toString().trim(), sku: (params.sku || '').toString().trim() },
+          'added', `Order added to production${bits ? ' (' + bits + ')' : ''}` + (params.urgent === 'Yes' ? ` — URGENT, produce by ${params.urgentDate}` : ''),
+          actorOf(params));
+      } else {
+        const d = describeAction(action, params, result);
+        const row = parseInt(params.row, 10);
+        if (d && row >= 2) {
+          sbFetch('GET', `orders?id=eq.${row - 2}&select=order_no,sku&limit=1`).then(r => {
+            const rec = r && r[0];
+            if (rec) logOrderEvent({ orderId: row - 2, orderNo: rec.order_no, sku: rec.sku }, d[0], d[1], actorOf(params));
+          }).catch(e => console.error('order event lookup failed:', e.message));
+        }
+      }
+    }
+  } catch (e) { console.error('order event hook failed:', e.message); }
+  return result;
+}
+
+async function routeActionInner(action, params) {
   switch (action) {
     case 'getOrders': return doGetOrders();
     case 'getOrder': return doGetOrder(params);
     case 'getOrderByOrderNo': return doGetOrderByOrderNo(params);
+    case 'getOrderTimeline': return doGetOrderTimeline(params);
     case 'addOrder': return doAddOrder(params);
     case 'updateFabric': return doUpdateFabric(params);
     case 'updateFabricDetails': return doUpdateFabricDetails(params);
@@ -785,6 +901,64 @@ async function doGetOrderByOrderNo(params) {
   if (!rec) return { success: false, error: 'Order "' + orderNo + '" not found.' };
   const info = await getOrderLineInfo(rec.order_no, rec.sku);
   return { success: true, row: rec.id + 2, data: buildOrderRowArray(rec, info.qc, info.ms) };
+}
+
+// Full timeline for one order line: recorded events, plus (for anything that
+// happened before logging existed) milestones rebuilt from the timestamps
+// already saved on the order and its tailoring jobs — flagged `legacy`.
+async function doGetOrderTimeline(params) {
+  const row = parseRow(params);
+  if (!row) return { success: false, error: 'Invalid row.' };
+  const id = row - 2;
+  const recs = await sbFetch('GET', `orders?id=eq.${id}&select=*&limit=1`);
+  const rec = recs && recs[0];
+  if (!rec || isBlankOrder_(rec)) return { success: false, error: 'Order not found.' };
+
+  let events = [];
+  let loggingReady = true;
+  try {
+    events = (await sbFetch('GET', `order_events?order_id=eq.${id}&select=at,kind,text,actor&order=at.asc,id.asc&limit=1000`)) || [];
+  } catch (e) {
+    loggingReady = false;
+    console.error('order_events read failed (table missing?):', e.message);
+  }
+  events = events.map(e => ({ at: e.at, kind: e.kind, text: e.text, actor: e.actor || '', legacy: false }));
+
+  // Rebuild what we can from saved timestamps, only for the period before
+  // the first recorded event (so nothing is ever shown twice).
+  const firstLogged = events.length ? new Date(events[0].at).getTime() : Infinity;
+  const legacy = [];
+  const push = (at, kind, text, actor) => {
+    if (!at) return;
+    const t = new Date(at).getTime();
+    if (isNaN(t) || t >= firstLogged) return;
+    legacy.push({ at: new Date(t).toISOString(), kind, text, actor: actor || '', legacy: true });
+  };
+  push(rec.created_at, 'added', 'Order added to production', '');
+  if (rec.master) push(rec.master_assigned_at, 'cutting', `In cutting — assigned to Master: ${rec.master}`, '');
+  if (rec.tailor) push(rec.tailor_assigned_at, 'tailoring', `Assigned to Tailor: ${rec.tailor}`, '');
+  try {
+    if (rec.order_no && rec.sku) {
+      const jobs = (await sbFetch('GET', `atelier_jobs?order_no=eq.${encodeURIComponent(rec.order_no)}&sku=eq.${encodeURIComponent(rec.sku)}&select=*&order=start_at.asc`)) || [];
+      jobs.forEach(j => {
+        push(j.start_at, 'tailoring', `Tailoring started by ${j.tailor}`, j.tailor);
+        push(j.end_at, 'qc', `Tailoring finished by ${j.tailor} — sent to QC`, j.tailor);
+        if (j.approved_at) push(j.approved_at, 'qc', `QC approved by ${j.approved_by || 'supervisor'}`, j.approved_by);
+        if (j.rework_at) push(j.rework_at, 'rework', `QC rejected${j.rejected_by ? ' by ' + j.rejected_by : ''} — ${j.reject_reason || 'rework'}`, j.rejected_by);
+      });
+    }
+  } catch (e) { /* jobs are a bonus — never fail the timeline over them */ }
+  if (rec.is_done && rec.done_at) push(rec.done_at, 'done', 'Marked Done — production complete', '');
+
+  const all = legacy.concat(events).sort((a, b) => new Date(a.at) - new Date(b.at));
+  return {
+    success: true, loggingReady,
+    order: {
+      orderNo: rec.order_no, sku: rec.sku, garmentType: rec.garment_type || '', orderType: rec.order_type || '',
+      createdAt: rec.created_at || null, isDone: !!rec.is_done, urgent: !!rec.urgent
+    },
+    events: all
+  };
 }
 
 function isBlankOrder_(rec) {
@@ -1798,6 +1972,7 @@ async function doAtelierStartJob(params) {
     master, urgent, notes, manual, status: 'active', standard_min: standardMin,
     start_at: now, run_since: now, accum_ms: 0
   });
+  logLineEvent(orderNo, sku, 'tailoring', `Tailoring started by ${tailor}${manual ? ' (manual entry)' : ''}`, tailor);
   return { success: true, job: formatAtelierJob(job) };
 }
 
@@ -1834,6 +2009,7 @@ async function doAtelierPauseJob(params) {
   if (!job.run_since) return { success: true };
   const accum = Number(job.accum_ms || 0) + (Date.now() - new Date(job.run_since).getTime());
   await atelierUpdateJobWithReason(job.id, { accum_ms: accum, run_since: null, pause_reason: reason });
+  logLineEvent(job.order_no, job.sku, 'tailoring', `Tailoring paused — ${reason}`, tailor);
   return { success: true };
 }
 
@@ -1847,6 +2023,7 @@ async function doAtelierResumeJob(params) {
   // running before resuming this one.
   await atelierPauseRunning(tailor, job.id);
   await atelierUpdateJobWithReason(job.id, { run_since: new Date().toISOString(), pause_reason: null });
+  logLineEvent(job.order_no, job.sku, 'tailoring', 'Tailoring resumed', tailor);
   return { success: true };
 }
 
@@ -1858,6 +2035,7 @@ async function doAtelierFinishJob(params) {
   const accum = Number(job.accum_ms || 0) + (job.run_since ? (Date.now() - new Date(job.run_since).getTime()) : 0);
   const now = new Date().toISOString();
   await atelierUpdateJobWithReason(job.id, { accum_ms: accum, run_since: null, status: 'pending', end_at: now, duration_ms: accum, pause_reason: null });
+  logLineEvent(job.order_no, job.sku, 'qc', `Tailoring finished by ${tailor} — waiting for QC approval (worked ${Math.round(accum / 60000)} min)`, tailor);
   return { success: true };
 }
 
@@ -1868,6 +2046,7 @@ async function doAtelierReturnJob(params) {
   const job = jobId ? await getAtelierJobForTailor(tailor, jobId) : await getAtelierActiveJob(tailor);
   if (!job) return { success: false, error: 'No job to return.' };
   await sbFetch('DELETE', `atelier_jobs?id=eq.${job.id}`, undefined, { Prefer: 'return=minimal' });
+  logLineEvent(job.order_no, job.sku, 'tailoring', `Job given back by ${tailor} — line is available again`, tailor);
   return { success: true };
 }
 
@@ -1883,6 +2062,7 @@ async function doAtelierMechanicCall(params) {
     await sbUpdate('atelier_jobs', job.id, { accum_ms: accum, run_since: null });
   }
   await sbInsertOne('atelier_calls', { tailor, reason, job_id: job ? job.id : null, at: new Date().toISOString(), open: true });
+  if (job) logLineEvent(job.order_no, job.sku, 'tailoring', `Mechanic called by ${tailor} — ${reason} (timer paused)`, tailor);
   return { success: true };
 }
 
@@ -1903,6 +2083,7 @@ async function doAtelierMechanicResolve(params) {
       // mechanic — pause that one before resuming the fixed job's timer.
       await atelierPauseRunning(job.tailor, job.id);
       await sbUpdate('atelier_jobs', call.job_id, { run_since: now });
+      logLineEvent(job.order_no, job.sku, 'tailoring', 'Mechanic fixed the machine — timer resumed', actorOf(params));
     }
   }
   return { success: true };
@@ -2057,6 +2238,7 @@ async function doAtelierApproveJob(params) {
     pay_amount: settings.mode === 'trial' ? +(Number(rate || 0) * qty).toFixed(3) : null
   };
   await sbUpdate('atelier_jobs', id, patch);
+  logLineEvent(job.order_no, job.sku, 'qc', `QC approved by ${approver} — tailoring by ${job.tailor}, ${qty} pc(s)`, approver);
   if (job.order_no && job.sku) {
     const orderRows = await sbFetch('GET', `orders?order_no=eq.${encodeURIComponent(job.order_no)}&sku=eq.${encodeURIComponent(job.sku)}&select=id,is_done&limit=1`);
     const orderRec = orderRows && orderRows[0];
@@ -2066,7 +2248,10 @@ async function doAtelierApproveJob(params) {
       const orderPatch = { rework_note: null };
       if (!orderRec.is_done) { orderPatch.is_done = true; orderPatch.done_at = new Date().toISOString(); }
       await sbUpdate('orders', orderRec.id, orderPatch);
-      if (!orderRec.is_done) pushShopifyUpdate(job.order_no, 'Production complete — Done ✅');
+      if (!orderRec.is_done) {
+        pushShopifyUpdate(job.order_no, 'Production complete — Done ✅');
+        logOrderEvent({ orderId: orderRec.id, orderNo: job.order_no, sku: job.sku }, 'done', 'Production complete — order marked Done', approver);
+      }
     }
   }
   if (SHOPIFY_ENABLED) pushShopifyUpdate(job.order_no, `Tailoring approved — ${job.tailor}, ${qty} pc(s)`);
@@ -2110,6 +2295,12 @@ async function doAtelierRejectJob(params) {
     status: 'rework', rework_at: new Date().toISOString(), pay_amount: 0,
     reject_reason: reason, rejected_by: approver, fabric_issue_type: fabricIssueType
   });
+  {
+    const routed = reason === "Master's issue" ? `sent back to Master (${job.master || 'cutting master'}) for re-cut`
+      : reason === 'Fabric issue' ? 'sent back to the fabric check' : `sent back to Tailor ${job.tailor} to redo`;
+    logLineEvent(job.order_no, job.sku, 'rework',
+      `QC rejected by ${approver} — ${reason}${fabricIssueType ? ' (' + fabricIssueType + ')' : ''}; ${routed}`, approver);
+  }
 
   // Route it back to whoever's responsible. Tailor's issue needs nothing
   // extra — the order line is still assigned to that tailor, so it's
@@ -2183,6 +2374,8 @@ async function doAtelierRevertJob(params) {
         rework_note: `↩️ Reverted from QC (was finished by ${job.tailor}) — reassigned to ${newTailor} by ${approver}, ${stamp}.`
       });
     }
+    logOrderEvent({ orderId: orderRec ? orderRec.id : null, orderNo: job.order_no, sku: job.sku }, 'rework',
+      `Reverted from QC (finished by ${job.tailor}) — reassigned to Tailor ${newTailor}`, approver);
     if (SHOPIFY_ENABLED) pushShopifyUpdate(job.order_no, `Reverted from QC — reassigned to Tailor: ${newTailor}`);
   }
 
@@ -2207,13 +2400,14 @@ async function doAtelierJobsForLine(params) {
 async function doAtelierCancelJob(params) {
   const id = parseInt(params.jobId, 10);
   if (!id) return { success: false, error: 'Invalid job id.' };
-  const rows = await sbFetch('GET', `atelier_jobs?id=eq.${id}&select=status&limit=1`);
+  const rows = await sbFetch('GET', `atelier_jobs?id=eq.${id}&select=status,order_no,sku,tailor&limit=1`);
   const job = rows && rows[0];
   if (!job) return { success: false, error: 'Job not found.' };
   if (job.status !== 'active' && job.status !== 'pending') {
     return { success: false, error: 'Only an active or pending job can be cancelled.' };
   }
   await sbUpdate('atelier_jobs', id, { status: 'cancelled', run_since: null, pay_amount: 0 });
+  logLineEvent(job.order_no, job.sku, 'tailoring', `Tailoring job by ${job.tailor} cancelled`, actorOf(params));
   return { success: true };
 }
 
