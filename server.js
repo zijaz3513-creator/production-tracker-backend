@@ -278,7 +278,9 @@ const ROLE_PERMISSIONS = {
     'markDone', 'undoMarkDone', 'updateUrgent', 'atelierJobsForLine',
     'getSamples', 'addSample', 'assignSampleTailor', 'assignSampleMaster',
     'markSampleDone', 'undoSampleDone', 'sendSampleEmb', 'receiveSampleEmb',
-    'listStaff', 'addStaff', 'reorderStaff'
+    'listStaff', 'addStaff', 'reorderStaff',
+    // Live tailor timers + "By Time" report (read-only)
+    'atelierLiveJobs', 'atelierTimeReport'
   ]
 };
 
@@ -712,6 +714,8 @@ async function routeActionInner(action, params) {
     case 'atelierRejectJob': return doAtelierRejectJob(params);
     case 'atelierRevertJob': return doAtelierRevertJob(params);
     case 'atelierTeamToday': return doAtelierTeamToday();
+    case 'atelierLiveJobs': return doAtelierLiveJobs();
+    case 'atelierTimeReport': return doAtelierTimeReport(params);
     case 'atelierStandardsList': return doAtelierStandardsList();
     case 'atelierMechanicCallsList': return doAtelierMechanicCallsList();
     case 'atelierMechanicResolve': return doAtelierMechanicResolve(params);
@@ -2439,6 +2443,53 @@ async function doAtelierTeamToday() {
     }
   });
   return { success: true, team: Object.values(byTailor).map(b => Object.assign({}, b, { minutes: Math.round(b.minutes) })) };
+}
+
+// ---- Live floor view: every job currently in progress in the tailor portal ----
+// Read-only. Returns the raw timer state (accum_ms + run_since) plus the
+// server clock, so the browser can tick each timer every second on its own
+// and only needs to re-poll every ~15s to pick up starts / pauses / finishes.
+async function doAtelierLiveJobs() {
+  const [jobs, openCalls] = await Promise.all([
+    sbFetch('GET', 'atelier_jobs?status=eq.active&select=*&order=start_at.asc'),
+    sbFetch('GET', 'atelier_calls?open=eq.true&select=tailor')
+  ]);
+  const stopped = new Set((openCalls || []).map(c => c.tailor));
+  return {
+    success: true,
+    now: Date.now(),
+    jobs: (jobs || []).map(j => ({
+      id: j.id, tailor: j.tailor, orderNo: j.order_no, sku: j.sku,
+      garmentType: j.garment_type, startAt: j.start_at,
+      accumMs: Number(j.accum_ms || 0), runSince: j.run_since || null,
+      pauseReason: j.pause_reason || null, manual: !!j.manual,
+      machineStopped: stopped.has(j.tailor)
+    }))
+  };
+}
+
+// ---- "By Time" report: finished tailoring time per SKU / tailor ----
+// Returns one compact row per finished attempt (finished = waiting for QC,
+// approved, or sent back for rework) that ended inside the window. The
+// browser groups them into pieces and SKUs, so switching SKU <-> Model or
+// re-sorting is instant and needs no extra round trip.
+async function doAtelierTimeReport(params) {
+  let days = parseInt(params && params.days, 10);
+  if (!days || days < 1) days = 30;
+  if (days > 365) days = 365;
+  const since = new Date(Date.now() - days * 86400000).toISOString();
+  const pageSize = 1000, rows = [];
+  for (let page = 0; page < 20; page++) {
+    const chunk = (await sbFetch('GET',
+      `atelier_jobs?status=in.(pending,approved,rework)&duration_ms=not.is.null&end_at=gte.${encodeURIComponent(since)}` +
+      `&select=id,tailor,order_no,sku,model,garment_type,status,duration_ms,end_at&order=id.asc&limit=${pageSize}&offset=${page * pageSize}`)) || [];
+    chunk.forEach(j => rows.push({
+      t: j.tailor, o: j.order_no || '', s: j.sku || '', m: j.model || atelierModelFromSku(j.sku),
+      g: j.garment_type || '', st: j.status, d: Number(j.duration_ms || 0), e: j.end_at
+    }));
+    if (chunk.length < pageSize) break;
+  }
+  return { success: true, days, now: Date.now(), rows };
 }
 
 // ---- Standard times (median/P25 from finished jobs) — admin-only to edit ----
