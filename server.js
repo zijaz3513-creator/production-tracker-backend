@@ -976,7 +976,38 @@ async function doGetOrderTimeline(params) {
   } catch (e) { /* jobs are a bonus — never fail the timeline over them */ }
   if (rec.is_done && rec.done_at) push(rec.done_at, 'done', 'Marked Done — production complete', '');
 
-  const all = legacy.concat(events).sort((a, b) => new Date(a.at) - new Date(b.at));
+  // Show how long the tailor actually spent stitching. Every finished attempt
+  // (a job with a duration) gets its time attached to its "finished" event;
+  // events written before this feature (or by the old "worked N min" wording)
+  // are matched to their job by tailor + finish time.
+  try {
+    if (rec.order_no && rec.sku) {
+      const jobs = (await sbFetch('GET', `atelier_jobs?order_no=eq.${encodeURIComponent(rec.order_no)}&sku=eq.${encodeURIComponent(rec.sku)}&duration_ms=not.is.null&select=tailor,end_at,duration_ms,status&order=end_at.asc`)) || [];
+      const all0 = legacy.concat(events);
+      let total = 0;
+      jobs.forEach(j => {
+        const dur = fmtDurationMs(j.duration_ms);
+        total += Number(j.duration_ms || 0);
+        const endT = j.end_at ? new Date(j.end_at).getTime() : NaN;
+        const ev = all0.find(e => !e._durDone && /^Tailoring finished by/.test(e.text || '') && (e.text || '').indexOf(j.tailor) !== -1 &&
+          !isNaN(endT) && Math.abs(new Date(e.at).getTime() - endT) < 120000);
+        if (ev) {
+          ev._durDone = true;
+          ev.text = ev.text.replace(/\s*\(worked \d+ min\)/, '').replace(/\s*— stitching time .*$/, '') + ` — stitching time ${dur}`;
+        } else if (!isNaN(endT)) {
+          all0.push({ at: new Date(endT).toISOString(), kind: 'tailoring', text: `Stitching time by ${j.tailor}: ${dur}`, actor: j.tailor, legacy: true, _durDone: true });
+          events.push(all0[all0.length - 1]);
+        }
+      });
+      if (jobs.length > 1) {
+        const last = all0.slice().reverse().find(e => e._durDone);
+        if (last) last.text += ` (total across ${jobs.length} attempts: ${fmtDurationMs(total)})`;
+      }
+    }
+  } catch (e) { /* timing is a bonus — never fail the timeline over it */ }
+
+  const all = legacy.concat(events).filter((e, i, arr) => arr.indexOf(e) === i).sort((a, b) => new Date(a.at) - new Date(b.at));
+  all.forEach(e => { delete e._durDone; });
   return {
     success: true, loggingReady,
     order: {
@@ -2057,6 +2088,16 @@ async function doAtelierResumeJob(params) {
   return { success: true };
 }
 
+// 7500000 ms -> "2h 5m", 90000 -> "1m 30s"
+function fmtDurationMs(ms) {
+  ms = Math.max(0, Number(ms) || 0);
+  const totalSec = Math.round(ms / 1000);
+  const h = Math.floor(totalSec / 3600), m = Math.floor((totalSec % 3600) / 60), sec = totalSec % 60;
+  if (h) return h + 'h ' + m + 'm';
+  if (m) return m + 'm' + (sec && m < 10 ? ' ' + sec + 's' : '');
+  return sec + 's';
+}
+
 async function doAtelierFinishJob(params) {
   const tailor = (params.authenticatedName || '').toString();
   const jobId = parseInt(params.jobId, 10) || null;
@@ -2065,7 +2106,7 @@ async function doAtelierFinishJob(params) {
   const accum = Number(job.accum_ms || 0) + (job.run_since ? (Date.now() - new Date(job.run_since).getTime()) : 0);
   const now = new Date().toISOString();
   await atelierUpdateJobWithReason(job.id, { accum_ms: accum, run_since: null, status: 'pending', end_at: now, duration_ms: accum, pause_reason: null });
-  logLineEvent(job.order_no, job.sku, 'qc', `Tailoring finished by ${tailor} — waiting for QC approval (worked ${Math.round(accum / 60000)} min)`, tailor);
+  logLineEvent(job.order_no, job.sku, 'qc', `Tailoring finished by ${tailor} — waiting for QC approval — stitching time ${fmtDurationMs(accum)}`, tailor);
   return { success: true };
 }
 
@@ -2223,6 +2264,7 @@ async function doAtelierRecentApproved(params) {
   const since = new Date(Date.now() - days * 86400000).toISOString();
   const rows = (await sbFetch('GET',
     `atelier_jobs?status=eq.approved&approved_at=gte.${encodeURIComponent(since)}&select=*&order=approved_at.desc&limit=60`)) || [];
+  rows.reverse(); // newest 60 fetched, shown oldest -> newest
   return {
     success: true, days,
     jobs: rows.map(j => Object.assign(formatAtelierJob(j), {
