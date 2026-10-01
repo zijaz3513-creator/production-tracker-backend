@@ -1885,9 +1885,13 @@ async function doAtelierMyOrders(params) {
   const orders = (await sbFetch('GET', `orders?tailor=eq.${encodeURIComponent(tailor)}&is_done=eq.false&select=order_no,sku,garment_type,order_type,master,urgent,urgent_due_date,notes,created_at`)) || [];
   if (!orders.length) return { success: true, lines: [] };
 
-  // Rule: a line is hidden once a non-rework job exists for (orderNo, sku).
+  // Rule: a line is hidden only while a job for it is in progress or awaiting QC.
+  // Approved jobs never hide a line: approving marks the order Done, and this
+  // query only returns NOT-done orders, so an approved job here is stale (order
+  // reopened / re-assigned / duplicate order_no+sku row). Hiding on it was the
+  // bug where Orders showed "With tailor M4" but M4's Work screen was empty.
+  const jobs = (await sbFetch('GET', `atelier_jobs?tailor=eq.${encodeURIComponent(tailor)}&status=in.(active,pending)&select=order_no,sku`)) || [];
   const blockKey = new Set();
-  const jobs = (await sbFetch('GET', `atelier_jobs?tailor=eq.${encodeURIComponent(tailor)}&status=in.(active,pending,approved)&select=order_no,sku`)) || [];
   jobs.forEach(j => blockKey.add(j.order_no + '|' + j.sku));
 
   const lines = [];
@@ -2272,8 +2276,10 @@ async function doAtelierApproveJob(params) {
   await sbUpdate('atelier_jobs', id, patch);
   logLineEvent(job.order_no, job.sku, 'qc', `QC approved by ${approver} — tailoring by ${job.tailor}, ${qty} pc(s)`, approver);
   if (job.order_no && job.sku) {
-    const orderRows = await sbFetch('GET', `orders?order_no=eq.${encodeURIComponent(job.order_no)}&sku=eq.${encodeURIComponent(job.sku)}&select=id,is_done&limit=1`);
-    const orderRec = orderRows && orderRows[0];
+    const orderRows = await sbFetch('GET', `orders?order_no=eq.${encodeURIComponent(job.order_no)}&sku=eq.${encodeURIComponent(job.sku)}&select=id,is_done,tailor&order=id.desc`);
+    // If duplicate order_no+sku rows exist, finish the one this tailor actually
+    // holds (not-done first) instead of whichever row the DB returns first.
+    const orderRec = (orderRows || []).find(r => !r.is_done && r.tailor === job.tailor) || (orderRows || []).find(r => !r.is_done) || (orderRows || [])[0];
     if (orderRec) {
       // Approval finishes the order: mark it Done so it moves to the
       // Completed tab. (An order already marked Done keeps its original date.)
