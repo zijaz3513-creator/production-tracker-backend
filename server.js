@@ -155,22 +155,35 @@ async function getOrderNo(row) {
   return (rows && rows[0]) ? rows[0].order_no : null;
 }
 
-// Simple in-memory session store: token -> { role, name, createdAt }. Good
-// enough for a single small server instance. Sessions are lost on restart
-// (e.g. Render free tier spinning down after inactivity) — logging back in
-// takes a few seconds, it's not an error.
-const sessions = new Map();
-const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
+// Stateless signed session tokens. A token is  base64url(JSON{role,name,iat}).HMAC
+// and is verified with a server-side secret, so:
+//   - it never expires on its own — people stay logged in until they press Logout;
+//   - it survives server restarts / redeploys (nothing is kept in memory).
+// Set SESSION_SECRET in the environment to a long random string. If it's missing
+// we derive a stable secret from the Supabase key, so tokens still survive restarts.
+// Changing the secret logs everybody out. Logout revokes the token (in memory).
+const SESSION_SECRET = process.env.SESSION_SECRET ||
+  crypto.createHash('sha256').update('aeon-session|' + (process.env.SUPABASE_SECRET_KEY || '') + '|' + (process.env.ADMIN_PASSWORD || '')).digest('hex');
+const revokedTokens = new Set();
 
+function b64u(buf) { return Buffer.from(buf).toString('base64').replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_'); }
+function signTokenPart(part) { return b64u(crypto.createHmac('sha256', SESSION_SECRET).update(part).digest()); }
+function makeToken(role, name) {
+  const part = b64u(JSON.stringify({ role, name: name || '', iat: Date.now(), n: crypto.randomBytes(6).toString('hex') }));
+  return part + '.' + signTokenPart(part);
+}
 function getSession(token) {
-  if (!token) return null;
-  const s = sessions.get(token);
-  if (!s) return null;
-  if (Date.now() - s.createdAt > SESSION_TTL_MS) {
-    sessions.delete(token);
-    return null;
-  }
-  return s;
+  if (!token || typeof token !== 'string' || revokedTokens.has(token)) return null;
+  const dot = token.indexOf('.');
+  if (dot < 1) return null;
+  const part = token.slice(0, dot), sig = token.slice(dot + 1);
+  const expect = signTokenPart(part);
+  const a = Buffer.from(sig), b = Buffer.from(expect);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  try {
+    const p = JSON.parse(Buffer.from(part.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
+    return { role: p.role, name: p.name || '', createdAt: p.iat };
+  } catch (e) { return null; }
 }
 
 // --- Password hashing for individual master/tailor accounts (scrypt) ---
@@ -207,8 +220,7 @@ async function doLoginAction(params) {
     if (!rec || !verifyPassword(password, rec.password_hash, rec.password_salt)) {
       return { success: false, error: 'Incorrect name or password.' };
     }
-    const token = crypto.randomBytes(24).toString('hex');
-    sessions.set(token, { role, name, createdAt: Date.now() });
+    const token = makeToken(role, name);
     return { success: true, token };
   }
 
@@ -223,8 +235,7 @@ async function doLoginAction(params) {
     return { success: false, error: 'Incorrect password.' };
   }
 
-  const token = crypto.randomBytes(24).toString('hex');
-  sessions.set(token, { role, name, createdAt: Date.now() });
+  const token = makeToken(role, name);
   return { success: true, token };
 }
 
@@ -482,7 +493,7 @@ app.all('/api', async (req, res) => {
       return res.json(await doLoginAction(params));
     }
     if (action === 'logout') {
-      if (params.token) sessions.delete(params.token);
+      if (params.token) revokedTokens.add(params.token);
       return res.json({ success: true });
     }
     if (action === 'getRoster') {
@@ -1926,8 +1937,7 @@ async function doAtelierTailorLogin(params) {
   if (!rec || !rec.atelier_pin_hash || !verifyPassword(pin, rec.atelier_pin_hash, rec.atelier_pin_salt)) {
     return { success: false, error: 'Incorrect name or PIN.' };
   }
-  const token = crypto.randomBytes(24).toString('hex');
-  sessions.set(token, { role: 'tailor', name, createdAt: Date.now() });
+  const token = makeToken('tailor', name);
   return { success: true, token, name };
 }
 
