@@ -279,8 +279,13 @@ const ROLE_PERMISSIONS = {
     'getSamples', 'addSample', 'assignSampleTailor', 'assignSampleMaster',
     'markSampleDone', 'undoSampleDone', 'sendSampleEmb', 'receiveSampleEmb',
     'listStaff', 'addStaff', 'reorderStaff',
-    // Live tailor timers + "By Time" report (read-only)
-    'atelierLiveJobs', 'atelierTimeReport'
+    // Live tailor timers (read-only)
+    'atelierLiveJobs',
+    // QC-style approvals: approve when QC is not available, or send a piece
+    // back (Tailor / Master / Fabric) — including ones QC approved by mistake.
+    'atelierApprovalsList', 'atelierApproveJob', 'atelierRejectJob', 'atelierRevertJob',
+    'atelierRecentApproved',
+    'readyMadeList', 'readyMadeFindByCode', 'readyMadeApprove', 'readyMadeReject'
   ]
 };
 
@@ -715,6 +720,7 @@ async function routeActionInner(action, params) {
     case 'atelierRevertJob': return doAtelierRevertJob(params);
     case 'atelierTeamToday': return doAtelierTeamToday();
     case 'atelierLiveJobs': return doAtelierLiveJobs();
+    case 'atelierRecentApproved': return doAtelierRecentApproved(params);
     case 'atelierTimeReport': return doAtelierTimeReport(params);
     case 'atelierStandardsList': return doAtelierStandardsList();
     case 'atelierMechanicCallsList': return doAtelierMechanicCallsList();
@@ -2188,6 +2194,25 @@ async function withLineTotals(rows) {
   return out;
 }
 
+// Jobs approved in the last N days — lets Admin / Fulfillment send back a
+// piece that QC approved by mistake (see doAtelierRejectJob).
+async function doAtelierRecentApproved(params) {
+  let days = parseInt(params && params.days, 10);
+  if (!days || days < 1) days = 7;
+  if (days > 60) days = 60;
+  const since = new Date(Date.now() - days * 86400000).toISOString();
+  const rows = (await sbFetch('GET',
+    `atelier_jobs?status=eq.approved&approved_at=gte.${encodeURIComponent(since)}&select=*&order=approved_at.desc&limit=60`)) || [];
+  return {
+    success: true, days,
+    jobs: rows.map(j => Object.assign(formatAtelierJob(j), {
+      approvedBy: j.approved_by || null,
+      thisSeconds: Math.round(Number(j.duration_ms || 0) / 1000), priorSeconds: 0,
+      totalSeconds: Math.round(Number(j.duration_ms || 0) / 1000)
+    }))
+  };
+}
+
 async function doAtelierApprovalsList() {
   const rows = (await sbFetch('GET', 'atelier_jobs?status=eq.pending&select=*&order=end_at.asc')) || [];
   return { success: true, jobs: await withLineTotals(rows) };
@@ -2295,16 +2320,22 @@ async function doAtelierRejectJob(params) {
   const rows = await sbFetch('GET', `atelier_jobs?id=eq.${id}&select=tailor,status,order_no,sku,master&limit=1`);
   const job = rows && rows[0];
   if (!job) return { success: false, error: 'Job not found.' };
-  if (job.status !== 'pending') return { success: false, error: 'This job is not pending approval.' };
+  // Admin / Fulfillment may also send back a job that was already approved
+  // (QC made a mistake) — that reopens the order, which approval had marked Done.
+  const wasApproved = job.status === 'approved' && (params.role === 'admin' || params.role === 'fulfillment');
+  if (job.status !== 'pending' && !wasApproved) return { success: false, error: 'This job is not pending approval.' };
   if (job.tailor === approver) return { success: false, error: 'You cannot review your own work.' };
+  const reopen = wasApproved ? { is_done: false, done_at: null } : {};
 
-  await sbUpdate('atelier_jobs', id, {
+  const jobPatch = {
     status: 'rework', rework_at: new Date().toISOString(), pay_amount: 0,
     reject_reason: reason, rejected_by: approver, fabric_issue_type: fabricIssueType
-  });
+  };
+  if (wasApproved) { jobPatch.approved_at = null; jobPatch.approved_by = null; }
+  await sbUpdate('atelier_jobs', id, jobPatch);
   {
     const routed = reason === "Master's issue" ? `sent back to Master (${job.master || 'cutting master'}) for re-cut`
-      : reason === 'Fabric issue' ? 'sent back to the fabric check' : `sent back to Tailor ${job.tailor} to redo`;
+      : reason === 'Fabric issue' ? 'sent back to the fabric check — WHOLE GARMENT to be redone (fabric, cutting, tailoring)' : `sent back to Tailor ${job.tailor} to redo`;
     logLineEvent(job.order_no, job.sku, 'rework',
       `QC rejected by ${approver} — ${reason}${fabricIssueType ? ' (' + fabricIssueType + ')' : ''}; ${routed}`, approver);
   }
@@ -2324,23 +2355,29 @@ async function doAtelierRejectJob(params) {
         // drops out of the tailor's queue until the master re-cuts and
         // reassigns, but leave `master` untouched so it's obvious whose
         // re-cut this is.
-        await sbUpdate('orders', orderRec.id, {
+        await sbUpdate('orders', orderRec.id, Object.assign({
           tailor: null, tailor_assigned_at: null,
           rework_note: `⚠️ Rejected — Master's issue (${job.master || 'cutting master'}) — needs re-cut. By ${approver}, ${stamp}.`
-        });
+        }, reopen));
       } else if (reason === 'Fabric issue') {
         // Send it back to Inventory/Admin: reopen the fabric-check step so
         // it shows up wherever "awaiting fabric" is tracked, tagged with
         // exactly what's wrong with the fabric.
-        await sbUpdate('orders', orderRec.id, {
+        // Fabric issue = the whole garment has to be remade. Back to the very
+        // start: fabric check, then cutting, then tailoring (and embroidery,
+        // which was done on the faulty piece) all happen again from scratch.
+        await sbUpdate('orders', orderRec.id, Object.assign({
           fabric_status: null, fabric_source: null, fabric_purchase_status: null,
-          rework_note: `⚠️ Rejected — Fabric issue: ${fabricIssueType}. By ${approver}, ${stamp}.`
-        });
+          master: null, master_assigned_at: null, tailor: null, tailor_assigned_at: null,
+          machine_emb: null, hand_emb: null, mach_emb_person: null, hand_emb_person: null,
+          mach_emb_fabric: null, mach_emb_meters_sent: null, mach_emb_meters_received: null,
+          rework_note: `⚠️ Rejected — Fabric issue: ${fabricIssueType}. WHOLE GARMENT TO BE REDONE from fabric check. By ${approver}, ${stamp}.`
+        }, reopen));
       } else {
         // Tailor's issue — just leave a visible note; no reassignment needed.
-        await sbUpdate('orders', orderRec.id, {
+        await sbUpdate('orders', orderRec.id, Object.assign({
           rework_note: `⚠️ Rejected — Tailor's issue (${job.tailor}) — please redo. By ${approver}, ${stamp}.`
-        });
+        }, reopen));
       }
     }
   }
