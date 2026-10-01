@@ -916,13 +916,10 @@ async function doGetOrder(params) {
 // cache) and doesn't know the internal row id yet.
 async function doGetOrderByOrderNo(params) {
   const orderNo = (params.orderNo || '').toString().trim();
-  const sku = (params.sku || '').toString().trim();
   if (!orderNo) return { success: false, error: 'Order number is required.' };
-
-  let query = `orders?order_no=eq.${encodeURIComponent(orderNo)}&select=*&limit=1`;
-  if (sku) query = `orders?order_no=eq.${encodeURIComponent(orderNo)}&sku=eq.${encodeURIComponent(sku)}&select=*&limit=1`;
-
-  const recs = await sbFetch('GET', query);
+  const res = await resolveScannedLine(params);
+  if (!res.ok) return { success: false, error: res.error, ambiguous: !!res.ambiguous };
+  const recs = await sbFetch('GET', `orders?id=eq.${res.rec.id}&select=*&limit=1`);
   const rec = recs && recs[0];
   if (!rec) return { success: false, error: 'Order "' + orderNo + '" not found.' };
   const info = await getOrderLineInfo(rec.order_no, rec.sku);
@@ -1443,18 +1440,48 @@ async function doReadyMadeList() {
   const [tailors, masters] = await Promise.all([getActiveStaffNames('tailor'), getActiveStaffNames('master')]);
   return { success: true, items: rows.map(formatReadyMade), tailors, masters };
 }
-async function doReadyMadeFindByCode(params) {
+// ---- Resolve a scanned label to ONE exact order line ----------------------
+// A label's QR holds order number, SKU and the row id. The same order number
+// can exist on several lines (different SKUs, or "-ex" remakes), so matching
+// on the order number alone can open the WRONG line. Resolution order:
+//   1) row id (unique) — accepted only if its order number (and SKU, when the
+//      label has one) agree with what the label says;
+//   2) order number + SKU;
+//   3) order number alone — only when exactly ONE line has that number.
+// Otherwise the scan is refused (ambiguous) instead of guessing.
+async function resolveScannedLine(params) {
+  const norm = v => (v == null ? '' : String(v)).trim().toLowerCase();
   const orderNo = (params.orderNo || '').toString().trim();
   const sku = (params.sku || '').toString().trim();
-  if (!orderNo) return { success: false, error: "Scanned code didn't contain an order number." };
-  const q = `orders?order_no=eq.${encodeURIComponent(orderNo)}` + (sku ? `&sku=eq.${encodeURIComponent(sku)}` : '') + '&select=id,order_no,sku,garment_type,fabric_status,urgent,is_done&limit=5';
+  const rowId = parseInt(params.row, 10);
+  const id = rowId > 2 ? rowId - 2 : null;
+  if (id) {
+    const r = ((await sbFetch('GET', `orders?id=eq.${id}&select=id,order_no,sku,garment_type,fabric_status,is_done,tailor&limit=1`)) || [])[0];
+    if (r && norm(r.order_no) === norm(orderNo) && (!sku || norm(r.sku) === norm(sku))) return { ok: true, rec: r };
+    // row didn't agree with the label -> don't trust it, fall through to order+sku
+  }
+  if (!orderNo) return { ok: false, error: "Scanned code didn't contain an order number." };
+  let q = `orders?order_no=eq.${encodeURIComponent(orderNo)}&select=id,order_no,sku,garment_type,fabric_status,is_done,tailor&order=id.asc&limit=50`;
+  if (sku) q += `&sku=eq.${encodeURIComponent(sku)}`;
   const rows = (await sbFetch('GET', q)) || [];
-  const rm = rows.filter(r => isReadyMadeStatus(r.fabric_status));
-  if (!rm.length) return { success: false, notReadyMade: true, error: 'Not a ready-made order.' };
-  const pending = rm.find(r => !r.is_done);
-  if (!pending) return { success: false, error: 'This ready-made order is already approved.' };
+  if (!rows.length) return { ok: false, error: 'Order "' + orderNo + '"' + (sku ? ' / SKU ' + sku : '') + ' not found.' };
+  if (rows.length === 1) return { ok: true, rec: rows[0] };
+  // Several rows share this order number (+SKU). Prefer the only one that is still open.
+  const open = rows.filter(r => !r.is_done);
+  if (sku && open.length === 1) return { ok: true, rec: open[0] };
+  const list = rows.map(r => (r.sku || '—') + (r.is_done ? ' (done)' : '')).join(', ');
+  return { ok: false, ambiguous: true,
+    error: `Order ${orderNo} has ${rows.length} lines (SKU: ${list}). This label can't identify which one — scan the label that includes the SKU, or open it from the list.` };
+}
+
+async function doReadyMadeFindByCode(params) {
+  const res = await resolveScannedLine(params);
+  if (!res.ok) return { success: false, error: res.error };
+  const rec = res.rec;
+  if (!isReadyMadeStatus(rec.fabric_status)) return { success: false, notReadyMade: true, error: 'Not a ready-made order.' };
+  if (rec.is_done) return { success: false, error: 'This ready-made order is already approved.' };
   const [tailors, masters] = await Promise.all([getActiveStaffNames('tailor'), getActiveStaffNames('master')]);
-  return { success: true, item: formatReadyMade(pending), tailors, masters };
+  return { success: true, item: formatReadyMade(rec), tailors, masters };
 }
 async function getPendingReadyMade(params) {
   const row = parseRow(params);
@@ -2291,15 +2318,24 @@ async function doAtelierFindPendingByCode(params) {
   const sku = (params.sku || '').toString().trim();
   if (!orderNo && !sku) return { success: false, error: "Scanned code didn't contain an order number or SKU." };
 
-  const base = orderNo && sku
-    ? `order_no=eq.${encodeURIComponent(orderNo)}&sku=eq.${encodeURIComponent(sku)}`
-    : orderNo
-      ? `order_no=eq.${encodeURIComponent(orderNo)}`
-      : `sku=eq.${encodeURIComponent(sku)}`;
+  // Pin the scan to ONE exact order line first, then look up that line's job.
+  let lineOrder = orderNo, lineSku = sku;
+  if (orderNo) {
+    const res = await resolveScannedLine(params);
+    if (res.ok) { lineOrder = res.rec.order_no; lineSku = res.rec.sku || ''; }
+    else if (res.ambiguous) return { success: false, error: res.error };
+    // not found in orders -> fall through to the job tables with what was scanned
+  }
+  const base = lineOrder && lineSku
+    ? `order_no=eq.${encodeURIComponent(lineOrder)}&sku=eq.${encodeURIComponent(lineSku)}`
+    : lineOrder
+      ? `order_no=eq.${encodeURIComponent(lineOrder)}`
+      : `sku=eq.${encodeURIComponent(lineSku)}`;
 
-  const pending = await sbFetch('GET', `atelier_jobs?${base}&status=eq.pending&select=*&order=created_at.desc&limit=1`);
-  if (pending && pending[0]) return { success: true, job: (await withLineTotals([pending[0]]))[0], matchStatus: 'pending' };
-
+  const pending = (await sbFetch('GET', `atelier_jobs?${base}&status=eq.pending&select=*&order=created_at.desc&limit=3`)) || [];
+  if (pending.length) {
+    return { success: true, job: (await withLineTotals([pending[0]]))[0], matchStatus: 'pending' };
+  }
   const any = await sbFetch('GET', `atelier_jobs?${base}&select=*&order=created_at.desc&limit=1`);
   if (any && any[0]) return { success: true, job: formatAtelierJob(any[0]), matchStatus: any[0].status };
 
