@@ -751,7 +751,7 @@ function parseRow(params) {
 // ORDERS — reconstructs the exact same 34-column array shape the
 // frontend's parseOrders() already expects.
 // ============================================================
-function buildOrderRowArray(rec, inQC, workMs) {
+function buildOrderRowArray(rec, inQC, workMs, pausedReason) {
   const row = new Array(41).fill('');
   if (!rec) return row;
 
@@ -790,6 +790,11 @@ function buildOrderRowArray(rec, inQC, workMs) {
   row[15] = rec.hand_emb_person || '';
   // Total tailor working time on this line, in seconds (all finished attempts).
   row[16] = workMs ? String(Math.round(workMs / 1000)) : '';
+  // The tailor has this line open in the Atelier app but the timer is paused.
+  // pausedReason is the pause reason text, or true when no reason was stored.
+  // Lets Admin/Fulfillment see "Paused" instead of just "With tailor".
+  row[17] = pausedReason ? 'Paused' : '';
+  row[18] = (pausedReason && pausedReason !== true) ? String(pausedReason) : '';
 
   row[21] = rec.remarks || '';
   row[22] = rec.is_done ? 'Done' : '';
@@ -833,7 +838,7 @@ async function doGetOrders() {
   for (let id = 1; id <= maxId; id++) {
     const rec = byId[id];
     const info = rec ? lineInfo.get((rec.order_no || '') + '|' + (rec.sku || '')) : null;
-    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec, (info && info.qc) || false, info ? info.ms : 0));
+    data.push(isBlankOrder_(rec) ? null : buildOrderRowArray(rec, (info && info.qc) || false, info ? info.ms : 0, (info && info.paused) || false));
   }
   return { success: true, data };
 }
@@ -849,10 +854,16 @@ async function getAtelierLineInfoMap() {
   let offset = 0;
   while (true) {
     const page = (await sbFetch('GET',
-      `atelier_jobs?status=in.(pending,approved,rework)&select=id,order_no,sku,status,duration_ms&order=id.asc&limit=${pageSize}&offset=${offset}`)) || [];
+      `atelier_jobs?status=in.(pending,approved,rework,active)&select=*&order=id.asc&limit=${pageSize}&offset=${offset}`)) || [];
     page.forEach(j => {
       const key = (j.order_no || '') + '|' + (j.sku || '');
-      const e = map.get(key) || { ms: 0, qc: false };
+      const e = map.get(key) || { ms: 0, qc: false, paused: false };
+      if (j.status === 'active') {
+        // In progress on the tailor's tablet: paused when its timer isn't running.
+        if (!j.run_since) e.paused = j.pause_reason || true;
+        map.set(key, e);
+        return;
+      }
       e.ms += Number(j.duration_ms || 0);
       if (j.status === 'pending') e.qc = j.id;
       map.set(key, e);
@@ -866,11 +877,13 @@ async function getAtelierLineInfoMap() {
 // Single-order version, used when just one order is refreshed.
 async function getOrderLineInfo(orderNo, sku) {
   if (!orderNo) return { qc: false, ms: 0 };
-  let q = `atelier_jobs?order_no=eq.${encodeURIComponent(orderNo)}&status=in.(pending,approved,rework)&select=id,status,duration_ms`;
+  let q = `atelier_jobs?order_no=eq.${encodeURIComponent(orderNo)}&status=in.(pending,approved,rework,active)&select=id,status,duration_ms,run_since,pause_reason`;
   if (sku) q += `&sku=eq.${encodeURIComponent(sku)}`;
   const rows = (await sbFetch('GET', q)) || [];
   const pend = rows.find(r => r.status === 'pending');
-  return { qc: pend ? pend.id : false, ms: rows.reduce((a, r) => a + Number(r.duration_ms || 0), 0) };
+  const act = rows.find(r => r.status === 'active' && !r.run_since);
+  return { qc: pend ? pend.id : false, paused: act ? (act.pause_reason || true) : false,
+    ms: rows.filter(r => r.status !== 'active').reduce((a, r) => a + Number(r.duration_ms || 0), 0) };
 }
 
 // Single-order version of the QC check used in doGetOrders — is there a
@@ -895,7 +908,7 @@ async function doGetOrder(params) {
   const rec = recs && recs[0];
   if (!rec || isBlankOrder_(rec)) return { success: false, error: 'Order not found.' };
   const info = await getOrderLineInfo(rec.order_no, rec.sku);
-  return { success: true, row, data: buildOrderRowArray(rec, info.qc, info.ms) };
+  return { success: true, row, data: buildOrderRowArray(rec, info.qc, info.ms, info.paused) };
 }
 
 // Same idea as doGetOrder, but for when the caller only has the order
@@ -913,7 +926,7 @@ async function doGetOrderByOrderNo(params) {
   const rec = recs && recs[0];
   if (!rec) return { success: false, error: 'Order "' + orderNo + '" not found.' };
   const info = await getOrderLineInfo(rec.order_no, rec.sku);
-  return { success: true, row: rec.id + 2, data: buildOrderRowArray(rec, info.qc, info.ms) };
+  return { success: true, row: rec.id + 2, data: buildOrderRowArray(rec, info.qc, info.ms, info.paused) };
 }
 
 // Full timeline for one order line: recorded events, plus (for anything that
