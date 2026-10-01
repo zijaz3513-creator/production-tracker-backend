@@ -2143,7 +2143,10 @@ function formatAtelierJob(j) {
 async function doAtelierMyToday(params) {
   const tailor = (params.authenticatedName || '').toString();
   const jobs = (await sbFetch('GET', `atelier_jobs?tailor=eq.${encodeURIComponent(tailor)}&created_at=gte.${atelierTodayStartIso()}&select=*`)) || [];
-  const activeJobs = jobs.filter(j => j.status === 'active').sort((a, b) => new Date(a.start_at) - new Date(b.start_at));
+  // In-progress jobs are NOT limited to today: a job started on an earlier day
+  // and never finished/paused must still show on the Work screen. Otherwise it
+  // is invisible there yet still hides its order line from the tailor's list.
+  const activeJobs = (await getAtelierActiveJobs(tailor)).slice().sort((a, b) => new Date(a.start_at) - new Date(b.start_at));
   let pieces = 0, minutesWorked = 0, earnedApproved = 0, earnedPending = 0;
   jobs.forEach(j => {
     if (j.status === 'approved' || j.status === 'pending') pieces += (j.qty || 0);
