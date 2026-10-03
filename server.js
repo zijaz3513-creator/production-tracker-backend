@@ -49,7 +49,7 @@ const ROLE_PASSWORDS = {
 // Roles managed as individual people in the "staff" table instead of a
 // single shared password. Tailors are capped (MAX_TAILOR_SLOTS) because
 // of the order row layout; the others aren't.
-const STAFF_ROLES = ['master', 'tailor', 'designer', 'patternmaster', 'samplemachemb', 'samplehandemb'];
+const STAFF_ROLES = ['master', 'tailor', 'designer', 'patternmaster', 'samplemachemb', 'samplehandemb', 'handembworker'];
 
 Object.keys(ROLE_PASSWORDS).forEach(role => {
   if (!ROLE_PASSWORDS[role]) {
@@ -256,7 +256,7 @@ const MAX_FABRIC_SLOTS = 6;
 // Which actions each role may call. Admin bypasses this check entirely.
 const ROLE_PERMISSIONS = {
   inventory: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'updateFabric', 'updateFabricDetails', 'updateMachEmb', 'updateHandEmb', 'markDone'],
-  master: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'updateTailor', 'sendOrderEmb'],
+  master: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'updateTailor', 'embReady', 'embMasterReceive'],
   tailor: [
     'getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'markDone', 'sendOrderEmb', 'getSamples', 'markSampleDone', 'sendSampleEmb',
     // Aeon Workstation — tailor floor
@@ -275,7 +275,7 @@ const ROLE_PERMISSIONS = {
   ],
   // Order embroidery desks: scan to receive, scan to start the timer, then
   // pause / finish / return. Each role is locked to its own kind server-side.
-  handemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'embReceive', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn'],
+  handemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'embReceive', 'embAssignWorker', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn'],
   machemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'embReceive', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn'],
   designer: ['getSamples', 'addSample'],
   patternmaster: ['getSamples', 'assignSampleTailor'],
@@ -286,6 +286,7 @@ const ROLE_PERMISSIONS = {
   fulfillment: [
     'getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'addOrder', 'updateFabric', 'updateFabricDetails',
     'updateMachEmb', 'updateHandEmb', 'updateMaster', 'updateTailor',
+    'setEmbPerson', 'embAdminReceive', 'embReady', 'embMasterReceive', 'embAssignWorker',
     'markDone', 'undoMarkDone', 'updateUrgent', 'atelierJobsForLine',
     'getSamples', 'addSample', 'assignSampleTailor', 'assignSampleMaster',
     'markSampleDone', 'undoSampleDone', 'sendSampleEmb', 'receiveSampleEmb',
@@ -377,15 +378,16 @@ async function getActiveStaffNames(staffRole) {
 }
 
 async function doGetRoster() {
-  const [masters, tailors, designers, patternmasters, sampleMachEmb, sampleHandEmb] = await Promise.all([
+  const [masters, tailors, designers, patternmasters, sampleMachEmb, sampleHandEmb, handEmbWorkers] = await Promise.all([
     getActiveStaffNames('master'),
     getActiveStaffNames('tailor'),
     getActiveStaffNames('designer'),
     getActiveStaffNames('patternmaster'),
     getActiveStaffNames('samplemachemb'),
-    getActiveStaffNames('samplehandemb')
+    getActiveStaffNames('samplehandemb'),
+    getActiveStaffNames('handembworker')
   ]);
-  return { success: true, masters, tailors, designers, patternmasters, sampleMachEmb, sampleHandEmb };
+  return { success: true, masters, tailors, designers, patternmasters, sampleMachEmb, sampleHandEmb, handEmbWorkers };
 }
 
 async function doListStaff(params) {
@@ -622,13 +624,18 @@ function describeAction(action, p, result) {
     }
     case 'updateMachEmb': return describeEmbValue(EMB_WORD.mach, p.value, p);
     case 'updateHandEmb': return describeEmbValue(EMB_WORD.hand, p.value, p);
-    case 'sendOrderEmb': return ['embroidery', `${result.kind === 'hand' ? EMB_WORD.hand : EMB_WORD.mach} — handed to ${result.person}`];
+    case 'sendOrderEmb': return ['embroidery', `Machine embroidery — tailor${result.tailor ? ' ' + result.tailor : ''} sent it to ${result.person}`];
+    case 'setEmbPerson': return ['embroidery', result.person ? `Machine embroidery — admin chose ${result.person}` : 'Machine embroidery — person cleared'];
+    case 'embReady': return ['embroidery', 'Hand embroidery — cutting done, ready for hand embroidery (Akil)'];
+    case 'embAssignWorker': return ['embroidery', `Hand embroidery — assigned to ${result.person}`];
+    case 'embAdminReceive': return ['embroidery', `Machine embroidery — admin received it back from ${result.person || 'Abdullah'}`];
+    case 'embMasterReceive': return ['embroidery', `Hand embroidery — master received the item${result.person ? ' from ' + result.person : ''}`];
     case 'embReceive': return result.already ? null : ['embroidery', `${kindWord} — received at the embroidery desk`];
-    case 'embStart': return result.already ? null : ['embroidery', `${kindWord} — work started`];
-    case 'embPause': return ['embroidery', `${kindWord} — paused (${p.reason})`];
-    case 'embResume': return result.already ? null : ['embroidery', `${kindWord} — resumed`];
-    case 'embFinish': return ['embroidery', `${kindWord} — finished`];
-    case 'embReturn': return ['embroidery', `${kindWord} — returned, needs to be received again`];
+    case 'embStart': return result.already ? null : ['embroidery', `${kindWord}${result.person ? ' (' + result.person + ')' : ''} — work started`];
+    case 'embPause': return ['embroidery', `${kindWord}${result.person ? ' (' + result.person + ')' : ''} — paused (${p.reason})`];
+    case 'embResume': return result.already ? null : ['embroidery', `${kindWord}${result.person ? ' (' + result.person + ')' : ''} — resumed`];
+    case 'embFinish': return ['embroidery', `${kindWord}${result.person ? ' (' + result.person + ')' : ''} — finished${result.backTo ? ' — back with ' + result.backTo : result.readyFor ? ' — ready for ' + result.readyFor : ''}`];
+    case 'embReturn': return ['embroidery', `${kindWord} — returned, needs to be picked up again`];
     case 'updateMaster':
       return p.master ? ['cutting', `In cutting — assigned to Master: ${p.master}`] : ['cutting', 'Master unassigned'];
     case 'updateTailor':
@@ -682,6 +689,11 @@ async function routeActionInner(action, params) {
     case 'updateMachEmb': return doUpdateMachEmb(params);
     case 'updateHandEmb': return doUpdateHandEmb(params);
     case 'sendOrderEmb': return doSendOrderEmb(params);
+    case 'setEmbPerson': return doSetEmbPerson(params);
+    case 'embReady': return doEmbReady(params);
+    case 'embAssignWorker': return doEmbAssignWorker(params);
+    case 'embAdminReceive': return doEmbAdminReceive(params);
+    case 'embMasterReceive': return doEmbMasterReceive(params);
     case 'embReceive': return doEmbReceive(params);
     case 'embStart': return doEmbStart(params);
     case 'embPause': return doEmbPause(params);
@@ -1204,26 +1216,104 @@ async function doUpdateMachEmb(params) {
 // Masters and tailors can hand an order to a named embroiderer. The person
 // is stored alongside the usual sent ("RED|time") marker so the admin list
 // can show exactly who has it — Abdullah/Asif for machine, Akil for hand.
-const ORDER_EMB_PEOPLE = { 'Abdullah': 'mach', 'Asif': 'mach', 'Akil': 'hand' };
+// ── Machine embroidery person (admin choice) ─────────────────────────────
+// Fulfillment marks machine embroidery as needed; the ADMIN decides whether
+// Abdullah (before cutting) or Asif (after the tailor has stitched) does it.
+const MACH_PEOPLE = ['Abdullah', 'Asif'];
+async function loadEmbRec(row) {
+  const rows = await sbFetch('GET', `orders?id=eq.${row - 2}&select=id,order_no,sku,master,tailor,is_done,machine_emb,hand_emb,mach_emb_person,hand_emb_person&limit=1`);
+  return rows && rows[0];
+}
+async function doSetEmbPerson(params) {
+  const row = parseRow(params);
+  if (!row) return { success: false, error: 'Invalid row.' };
+  const person = (params.person || '').toString();
+  if (person && MACH_PEOPLE.indexOf(person) === -1) return { success: false, error: 'Choose Abdullah or Asif.' };
+  const rec = await loadEmbRec(row);
+  if (!rec) return { success: false, error: 'Order not found.' };
+  const cur = parseEmbValue(rec.machine_emb).code;
+  if (['NEED', 'RED'].indexOf(cur) === -1) return { success: false, error: 'Machine embroidery is not waiting to be assigned (it has already started, finished or is not needed).' };
+  await sbUpdate('orders', row - 2, { machine_emb: 'NEED|' + embStampNow(), mach_emb_person: person || null });
+  return { success: true, kind: 'mach', person };
+}
+
+// Tailor (after stitching) scans and hands the piece to Asif.
 async function doSendOrderEmb(params) {
   const row = parseRow(params);
   if (!row) return { success: false, error: 'Invalid row.' };
   const person = (params.person || '').toString();
-  const kind = ORDER_EMB_PEOPLE[person];
-  if (!kind) return { success: false, error: 'Unknown embroidery person: ' + person };
-  // Don't overwrite a job the embroidery desk has already received/started/finished.
-  const curCol = kind === 'mach' ? 'machine_emb' : 'hand_emb';
-  const curRows = await sbFetch('GET', `orders?id=eq.${row - 2}&select=${curCol}&limit=1`);
-  const curCode = parseEmbValue(curRows && curRows[0] ? curRows[0][curCol] : '').code;
-  if (['RCVD', 'WORK', 'PAUSE', 'DONE', 'GREEN'].indexOf(curCode) !== -1) {
-    return { success: false, error: 'This order is already with (or finished by) ' + (kind === 'mach' ? 'machine' : 'hand') + ' embroidery.' };
-  }
-  const ts = new Date().toLocaleString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
-  const patch = kind === 'mach'
-    ? { machine_emb: 'RED|' + ts, mach_emb_person: person }
-    : { hand_emb: 'RED|' + ts, hand_emb_person: person };
-  await sbUpdate('orders', row - 2, patch);
-  return { success: true, kind, person };
+  if (person === 'Akil') return { success: false, error: 'Hand embroidery is sent by the master once cutting is done.' };
+  if (person !== 'Asif') return { success: false, error: person === 'Abdullah' ? 'Abdullah works before cutting — the admin receives it from him.' : 'Unknown embroidery person: ' + person };
+  const rec = await loadEmbRec(row);
+  if (!rec) return { success: false, error: 'Order not found.' };
+  if (!rec.tailor) return { success: false, error: 'No tailor is assigned to this order yet.' };
+  const cur = parseEmbValue(rec.machine_emb).code;
+  if (['NEED', 'RED'].indexOf(cur) === -1) return { success: false, error: 'This order is not waiting for machine embroidery.' };
+  if (rec.mach_emb_person !== 'Asif') return { success: false, error: rec.mach_emb_person ? 'Admin chose ' + rec.mach_emb_person + ' for this order, not Asif.' : 'The admin has not chosen Asif for this order yet.' };
+  const value = 'SENT|' + embStampNow();
+  await sbUpdate('orders', row - 2, { machine_emb: value });
+  pushShopifyUpdate(rec.order_no, 'Machine embroidery — with Asif');
+  return { success: true, kind: 'mach', person, tailor: rec.tailor, value };
+}
+
+// Master scans when cutting is done → ready for hand embroidery (Akil).
+async function doEmbReady(params) {
+  const row = parseRow(params);
+  if (!row) return { success: false, error: 'Invalid row.' };
+  const rec = await loadEmbRec(row);
+  if (!rec) return { success: false, error: 'Order not found.' };
+  if (!rec.master) return { success: false, error: 'No master is assigned to this order yet.' };
+  const cur = parseEmbValue(rec.hand_emb).code;
+  if (cur === 'READY') return { success: true, already: true, kind: 'hand' };
+  if (['NEED', 'RED'].indexOf(cur) === -1) return { success: false, error: 'This order is not waiting for hand embroidery.' };
+  const value = 'READY|' + embStampNow();
+  await sbUpdate('orders', row - 2, { hand_emb: value });
+  pushShopifyUpdate(rec.order_no, 'Hand embroidery — ready for Akil');
+  return { success: true, kind: 'hand', value };
+}
+
+// Akil (hand desk) picks the person who will do the work.
+async function doEmbAssignWorker(params) {
+  const row = parseRow(params);
+  if (!row) return { success: false, error: 'Invalid row.' };
+  const worker = (params.worker || '').toString().trim();
+  const names = await getActiveStaffNames('handembworker');
+  if (names.indexOf(worker) === -1) return { success: false, error: 'Unknown hand-embroidery person: ' + worker };
+  const rec = await loadEmbRec(row);
+  if (!rec) return { success: false, error: 'Order not found.' };
+  if (parseEmbValue(rec.hand_emb).code !== 'RCVD') return { success: false, error: 'Receive the order first, then assign a person.' };
+  await sbUpdate('orders', row - 2, { hand_emb_person: worker });
+  return { success: true, kind: 'hand', person: worker };
+}
+
+// Admin receives Abdullah's finished piece; the master can be chosen after this.
+async function doEmbAdminReceive(params) {
+  const row = parseRow(params);
+  if (!row) return { success: false, error: 'Invalid row.' };
+  const rec = await loadEmbRec(row);
+  if (!rec) return { success: false, error: 'Order not found.' };
+  const cur = parseEmbValue(rec.machine_emb).code;
+  if (cur === 'AREC') return { success: true, already: true, kind: 'mach' };
+  if (['DONE', 'GREEN'].indexOf(cur) === -1) return { success: false, error: 'Machine embroidery is not finished yet.' };
+  const value = 'AREC|' + embStampNow();
+  await sbUpdate('orders', row - 2, { machine_emb: value });
+  pushShopifyUpdate(rec.order_no, 'Machine embroidery — received by admin');
+  return { success: true, kind: 'mach', person: rec.mach_emb_person, value };
+}
+
+// Master receives the piece back from hand embroidery; then assigns the tailor.
+async function doEmbMasterReceive(params) {
+  const row = parseRow(params);
+  if (!row) return { success: false, error: 'Invalid row.' };
+  const rec = await loadEmbRec(row);
+  if (!rec) return { success: false, error: 'Order not found.' };
+  const cur = parseEmbValue(rec.hand_emb).code;
+  if (cur === 'MREC') return { success: true, already: true, kind: 'hand' };
+  if (['DONE', 'GREEN'].indexOf(cur) === -1) return { success: false, error: 'Hand embroidery is not finished yet.' };
+  const value = 'MREC|' + embStampNow();
+  await sbUpdate('orders', row - 2, { hand_emb: value });
+  pushShopifyUpdate(rec.order_no, 'Hand embroidery — received by master');
+  return { success: true, kind: 'hand', person: rec.hand_emb_person, value };
 }
 
 // ============================================================
@@ -1268,45 +1358,57 @@ async function loadEmbOrder(params) {
   const k = embKindFor(params);
   if (k.error) return { error: k.error };
   const col = k.kind === 'mach' ? 'machine_emb' : 'hand_emb';
-  const rows = await sbFetch('GET', `orders?id=eq.${row - 2}&select=id,order_no,master,is_done,${col}&limit=1`);
+  const rows = await sbFetch('GET', `orders?id=eq.${row - 2}&select=id,order_no,master,tailor,is_done,mach_emb_person,hand_emb_person,${col}&limit=1`);
   const rec = rows && rows[0];
   if (!rec) return { error: 'Order not found.' };
-  return { rec, col, kind: k.kind, id: row - 2, cur: parseEmbValue(rec[col]) };
+  const person = k.kind === 'mach' ? rec.mach_emb_person : rec.hand_emb_person;
+  return { rec, col, kind: k.kind, id: row - 2, person: person || '', cur: parseEmbValue(rec[col]) };
 }
 async function saveEmb(ctx, value) {
   await sbUpdate('orders', ctx.id, { [ctx.col]: value });
 }
 const embKindWord = kind => (kind === 'mach' ? 'machine' : 'hand');
 
+// New value codes (same text columns, no DB change):
+//   SENT|<stamp>   machine: tailor handed the piece to Asif
+//   READY|<stamp>  hand: master finished cutting, ready for Akil
+//   AREC|<stamp>   machine: admin received Abdullah's finished piece
+//   MREC|<stamp>   hand: master received the finished piece
 async function doEmbReceive(params) {
   const ctx = await loadEmbOrder(params);
   if (ctx.error) return { success: false, error: ctx.error };
+  if (ctx.kind === 'mach') return { success: false, error: 'Machine embroidery starts directly — scan the label to start work.' };
   if (ctx.cur.code === 'RCVD') return { success: true, already: true };
-  if (ctx.cur.code !== 'NEED' && ctx.cur.code !== 'RED') {
-    return { success: false, error: 'This order is not waiting to be received for ' + embKindWord(ctx.kind) + ' embroidery.' };
-  }
-  if (!ctx.rec.master) {
-    return { success: false, error: 'A master has not been assigned to this order yet — it can be received once the master is assigned.' };
+  if (ctx.cur.code !== 'READY') {
+    return { success: false, error: ['NEED', 'RED'].indexOf(ctx.cur.code) !== -1
+      ? 'Not ready yet — the master must scan it first once cutting is done.'
+      : 'This order is not waiting to be received for hand embroidery.' };
   }
   const value = 'RCVD|' + embStampNow();
   await saveEmb(ctx, value);
-  pushShopifyUpdate(ctx.rec.order_no, `${embKindWord(ctx.kind)} embroidery — received`);
+  pushShopifyUpdate(ctx.rec.order_no, 'hand embroidery — received');
   return { success: true, value };
 }
 
 async function doEmbStart(params) {
   const ctx = await loadEmbOrder(params);
   if (ctx.error) return { success: false, error: ctx.error };
-  if (ctx.cur.code === 'WORK') return { success: true, already: true };
-  if (ctx.cur.code !== 'RCVD') {
-    return { success: false, error: ctx.cur.code === 'NEED' || ctx.cur.code === 'RED'
-      ? 'Scan to receive this order first, then scan again to start.'
-      : 'This order cannot be started right now.' };
+  if (ctx.cur.code === 'WORK') return { success: true, already: true, person: ctx.person };
+  const code = ctx.cur.code;
+  if (ctx.kind === 'mach') {
+    if (!ctx.person) return { success: false, error: 'The admin has not chosen Abdullah or Asif for this order yet.' };
+    if (ctx.person === 'Abdullah' && ['NEED', 'RED', 'RCVD'].indexOf(code) === -1) return { success: false, error: 'This order cannot be started right now.' };
+    if (ctx.person === 'Asif' && ['SENT', 'RCVD'].indexOf(code) === -1) {
+      return { success: false, error: ['NEED', 'RED'].indexOf(code) !== -1 ? 'Waiting for the tailor to hand this to Asif first.' : 'This order cannot be started right now.' };
+    }
+  } else {
+    if (code !== 'RCVD') return { success: false, error: ['NEED', 'RED', 'READY'].indexOf(code) !== -1 ? 'Receive this order first (the master must have marked it ready).' : 'This order cannot be started right now.' };
+    if (!ctx.person) return { success: false, error: 'Assign a person to this order before starting.' };
   }
   const value = `WORK|${embStampNow()}|0|${Date.now()}`;
   await saveEmb(ctx, value);
-  pushShopifyUpdate(ctx.rec.order_no, `${embKindWord(ctx.kind)} embroidery — working`);
-  return { success: true, value };
+  pushShopifyUpdate(ctx.rec.order_no, `${embKindWord(ctx.kind)} embroidery — working${ctx.person ? ' (' + ctx.person + ')' : ''}`);
+  return { success: true, value, person: ctx.person };
 }
 
 async function doEmbPause(params) {
@@ -1320,17 +1422,17 @@ async function doEmbPause(params) {
   const accum = ctx.cur.accumMs + (ctx.cur.runSince ? Date.now() - ctx.cur.runSince : 0);
   const value = `PAUSE|${embStampNow()}|${Math.round(accum)}|${reason}`;
   await saveEmb(ctx, value);
-  return { success: true, value };
+  return { success: true, value, person: ctx.person };
 }
 
 async function doEmbResume(params) {
   const ctx = await loadEmbOrder(params);
   if (ctx.error) return { success: false, error: ctx.error };
-  if (ctx.cur.code === 'WORK') return { success: true, already: true };
+  if (ctx.cur.code === 'WORK') return { success: true, already: true, person: ctx.person };
   if (ctx.cur.code !== 'PAUSE') return { success: false, error: 'This order is not paused.' };
   const value = `WORK|${embStampNow()}|${ctx.cur.accumMs}|${Date.now()}`;
   await saveEmb(ctx, value);
-  return { success: true, value };
+  return { success: true, value, person: ctx.person };
 }
 
 async function doEmbFinish(params) {
@@ -1343,20 +1445,27 @@ async function doEmbFinish(params) {
   const value = `DONE|${embStampNow()}|${Math.round(total)}`;
   await saveEmb(ctx, value);
   pushShopifyUpdate(ctx.rec.order_no, `${embKindWord(ctx.kind)} embroidery — done ✅`);
-  return { success: true, value };
+  const out = { success: true, value, person: ctx.person };
+  if (ctx.kind === 'mach' && ctx.person === 'Asif') out.backTo = 'tailor' + (ctx.rec.tailor ? ' ' + ctx.rec.tailor : '');
+  else if (ctx.kind === 'mach') out.readyFor = 'admin to receive';
+  else out.readyFor = 'master' + (ctx.rec.master ? ' ' + ctx.rec.master : '');
+  return out;
 }
 
-// Gives the order back: it goes to "needs embroidery" again and must be
-// scanned in to receive from the start. The timer for that attempt is dropped.
+// Gives the order back to the start of this desk's step. The timer for that
+// attempt is dropped.
 async function doEmbReturn(params) {
   const ctx = await loadEmbOrder(params);
   if (ctx.error) return { success: false, error: ctx.error };
-  if (['RCVD', 'WORK', 'PAUSE'].indexOf(ctx.cur.code) === -1) {
+  if (['RCVD', 'WORK', 'PAUSE'].indexOf(ctx.cur.code) === -1 && !(ctx.kind === 'mach' && ctx.cur.code === 'SENT') && !(ctx.kind === 'hand' && ctx.cur.code === 'READY')) {
     return { success: false, error: 'Nothing to return — this order is not with you.' };
   }
-  const value = 'NEED|' + embStampNow();
-  await saveEmb(ctx, value);
-  return { success: true, value };
+  let value;
+  if (ctx.kind === 'mach') value = (ctx.person === 'Asif' ? 'SENT|' : 'NEED|') + embStampNow();
+  else value = 'READY|' + embStampNow();
+  if (ctx.kind === 'hand') await sbUpdate('orders', ctx.id, { hand_emb: value, hand_emb_person: null });
+  else await saveEmb(ctx, value);
+  return { success: true, value, person: ctx.person };
 }
 
 async function doUpdateHandEmb(params) {
@@ -1391,6 +1500,12 @@ async function doUpdateMaster(params) {
   if (masters.indexOf(master) === -1) {
     return { success: false, error: 'Unknown master: ' + master };
   }
+  {
+    const rec = await loadEmbRec(row);
+    if (rec && !rec.master && rec.mach_emb_person === 'Abdullah' && ['NEED', 'RED', 'RCVD', 'WORK', 'PAUSE', 'DONE', 'GREEN'].indexOf(parseEmbValue(rec.machine_emb).code) !== -1) {
+      return { success: false, error: 'Abdullah must finish the machine embroidery and the admin must receive it before a master is chosen.' };
+    }
+  }
   await sbUpdate('orders', id, { master, master_assigned_at: new Date().toISOString() });
   pushShopifyUpdate(await getOrderNo(row), `In cutting — assigned to Master: ${master}`);
   return { success: true };
@@ -1410,6 +1525,13 @@ async function doUpdateTailor(params) {
   const tailors = await getActiveStaffNames('tailor');
   if (tailors.indexOf(tailor) === -1) {
     return { success: false, error: 'Unknown tailor: ' + tailor };
+  }
+  if ((params.role || '') === 'master') {
+    const rec = await loadEmbRec(row);
+    const hc = rec ? parseEmbValue(rec.hand_emb).code : '';
+    if (['NEED', 'RED', 'READY', 'RCVD', 'WORK', 'PAUSE', 'DONE', 'GREEN'].indexOf(hc) !== -1) {
+      return { success: false, error: hc === 'DONE' || hc === 'GREEN' ? 'Receive the item from hand embroidery first, then assign the tailor.' : 'This order needs hand embroidery first — scan it as ready, then receive it back before assigning a tailor.' };
+    }
   }
   await sbUpdate('orders', id, { tailor, tailor_assigned_at: new Date().toISOString(), rework_note: null });
   pushShopifyUpdate(await getOrderNo(row), `With Tailor: ${tailor}`);
