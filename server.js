@@ -250,7 +250,7 @@ if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
   process.exit(1);
 }
 
-const MAX_TAILOR_SLOTS = 11; // fixed by the order row layout (columns 10-20)
+const MAX_TAILOR_SLOTS = Infinity; // no limit on tailors
 const MAX_FABRIC_SLOTS = 6;
 
 // Which actions each role may call. Admin bypasses this check entirely.
@@ -412,9 +412,7 @@ async function doAddStaff(params) {
   }
 
   const current = await getActiveStaff(staffRole);
-  if (staffRole === 'tailor' && current.length >= MAX_TAILOR_SLOTS) {
-    return { success: false, error: `Maximum of ${MAX_TAILOR_SLOTS} active tailors — remove one before adding another.` };
-  }
+  // No cap on the number of tailors — the tailor name is stored directly on each order.
 
   const existing = await sbFetch(
     'GET',
@@ -619,7 +617,7 @@ function describeAction(action, p, result) {
       if (p.value === 'Not Available') return ['fabric', `Fabric: Not Available (${p.source}, ${p.purchaseStatus})`];
       return ['fabric', `Fabric: ${p.value}`];
     case 'updateFabricDetails': {
-      const bits = [p.fabricName, p.madeIn].filter(Boolean).join(', ');
+      const bits = [p.fabricName, p.fabricColor, p.meters ? p.meters + ' m' : ''].filter(Boolean).join(', ');
       return ['fabric', bits ? `Fabric details set: ${bits}` : 'Fabric details cleared'];
     }
     case 'updateMachEmb': return describeEmbValue(EMB_WORD.mach, p.value, p);
@@ -1155,10 +1153,13 @@ async function doUpdateFabricDetails(params) {
   const row = parseRow(params);
   if (!row) return { success: false, error: 'Invalid row.' };
   const fabricName = (params.fabricName || '').toString().trim();
-  const madeIn = (params.madeIn || '').toString().trim();
+  const color = (params.fabricColor || '').toString().trim().replace(/\|/g, '/');
+  const metersRaw = (params.meters || '').toString().trim();
+  const meters = metersRaw !== '' && !isNaN(parseFloat(metersRaw)) ? String(parseFloat(metersRaw)) : '';
+  // Color + meters are packed into the existing fabric_made_in column (no DB change).
   await sbUpdate('orders', row - 2, {
     fabric_name: fabricName || null,
-    fabric_made_in: madeIn || null
+    fabric_made_in: (color || meters) ? 'C:' + color + '|M:' + meters : null
   });
   return { success: true };
 }
