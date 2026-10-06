@@ -673,7 +673,7 @@ function describeAction(action, p, result) {
     case 'updateHandEmb': return describeEmbValue(EMB_WORD.hand, p.value, p);
     case 'sendOrderEmb': return ['embroidery', `Machine embroidery — tailor${result.tailor ? ' ' + result.tailor : ''} sent it to ${result.person}`];
     case 'setEmbPerson': return ['embroidery', result.person ? `Machine embroidery — admin chose ${result.person}` : 'Machine embroidery — person cleared'];
-    case 'embReady': return ['embroidery', 'Hand embroidery — cutting done, ready for hand embroidery (Akil)'];
+    case 'embReady': return ['embroidery', 'Hand embroidery — cutting done, ready for hand embroidery (Akil)' + (result.totalMs ? ` · master cutting time stopped (${Math.max(1, Math.round(result.totalMs / 60000))} min)` : '')];
     case 'embAssignWorker': return ['embroidery', `Hand embroidery — assigned to ${result.person}`];
     case 'embAdminReceive': return ['embroidery', `Machine embroidery — admin received it back from ${result.person || 'Abdullah'}`];
     case 'embMasterReceive': return ['embroidery', `Hand embroidery — master received the item${result.person ? ' from ' + result.person : ''}`];
@@ -1330,9 +1330,19 @@ async function doEmbReady(params) {
   if (cur === 'READY') return { success: true, already: true, kind: 'hand' };
   if (['NEED', 'RED'].indexOf(cur) === -1) return { success: false, error: 'This order is not waiting for hand embroidery.' };
   const value = 'READY|' + embStampNow();
-  await sbUpdate('orders', row - 2, { hand_emb: value });
+  const patch = { hand_emb: value };
+  // Handing over to hand embroidery ends the master's cutting time (timer stops here).
+  const mw = parseMasterWork(rec.master_work);
+  let totalMs = 0;
+  if (mw.st === 'WORK' || mw.st === 'PAUSE') {
+    const acc = (Number(mw.acc) || 0) + (mw.st === 'WORK' ? Math.max(0, Date.now() - Number(mw.run || Date.now())) : 0);
+    const w = Object.assign({}, mw, { st: 'DONE', fin: new Date().toISOString(), acc, run: 0, reason: '' });
+    patch.master_work = JSON.stringify(w);
+    totalMs = mwTotal(w);
+  }
+  await sbUpdate('orders', row - 2, patch);
   pushShopifyUpdate(rec.order_no, 'Hand embroidery — ready for Akil');
-  return { success: true, kind: 'hand', value };
+  return { success: true, kind: 'hand', value, totalMs };
 }
 
 // Akil (hand desk) picks the person who will do the work.
