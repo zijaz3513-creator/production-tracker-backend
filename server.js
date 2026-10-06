@@ -2824,7 +2824,9 @@ async function doAtelierRevertJob(params) {
       const stamp = new Date().toLocaleString();
       await sbUpdate('orders', orderRec.id, {
         tailor: newTailor, tailor_assigned_at: new Date().toISOString(),
-        rework_note: `↩️ Reverted from QC (was finished by ${job.tailor}) — reassigned to ${newTailor} by ${approver}, ${stamp}.`
+        // Admin reverts (a tailor's mis-click) carry no rework tag; QC / Fulfillment reverts do.
+        rework_note: (params.role || '') === 'admin' ? null
+          : `↩️ Reverted from QC (was finished by ${job.tailor}) — reassigned to ${newTailor} by ${approver}, ${stamp}.`
       });
     }
     logOrderEvent({ orderId: orderRec ? orderRec.id : null, orderNo: job.order_no, sku: job.sku }, 'rework',
