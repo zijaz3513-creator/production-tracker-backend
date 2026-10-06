@@ -256,7 +256,7 @@ const MAX_FABRIC_SLOTS = 6;
 // Which actions each role may call. Admin bypasses this check entirely.
 const ROLE_PERMISSIONS = {
   inventory: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'updateFabric', 'updateFabricDetails', 'updateMachEmb', 'updateHandEmb', 'markDone'],
-  master: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'updateTailor', 'embReady', 'embMasterReceive'],
+  master: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'updateTailor', 'embReady', 'embMasterReceive', 'masterStart', 'masterPause', 'masterResume', 'masterFinish', 'masterReturn'],
   tailor: [
     'getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'markDone', 'sendOrderEmb', 'getSamples', 'markSampleDone', 'sendSampleEmb',
     // Aeon Workstation — tailor floor
@@ -286,6 +286,7 @@ const ROLE_PERMISSIONS = {
   fulfillment: [
     'getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'addOrder', 'updateFabric', 'updateFabricDetails',
     'updateMachEmb', 'updateHandEmb', 'updateMaster', 'updateTailor',
+    'masterStart', 'masterPause', 'masterResume', 'masterFinish', 'masterReturn',
     'setEmbPerson', 'embAdminReceive', 'embReady', 'embMasterReceive', 'embAssignWorker',
     'markDone', 'undoMarkDone', 'updateUrgent', 'atelierJobsForLine',
     'getSamples', 'addSample', 'assignSampleTailor', 'assignSampleMaster',
@@ -634,6 +635,11 @@ function describeAction(action, p, result) {
     case 'embResume': return result.already ? null : ['embroidery', `${kindWord}${result.person ? ' (' + result.person + ')' : ''} — resumed`];
     case 'embFinish': return ['embroidery', `${kindWord}${result.person ? ' (' + result.person + ')' : ''} — finished${result.backTo ? ' — back with ' + result.backTo : result.readyFor ? ' — ready for ' + result.readyFor : ''}`];
     case 'embReturn': return ['embroidery', `${kindWord} — returned, needs to be picked up again`];
+    case 'masterStart': return result.already ? null : ['cutting', `Cutting started — Master ${result.master || ''}`];
+    case 'masterPause': return ['cutting', `Cutting paused — Master ${result.master || ''} (${result.reason || 'no reason'})`];
+    case 'masterResume': return result.already ? null : ['cutting', `Cutting resumed — Master ${result.master || ''}`];
+    case 'masterFinish': return result.already ? null : ['cutting', `Cutting finished — Master ${result.master || ''}${result.totalMs ? ' (took ' + Math.max(1, Math.round(result.totalMs / 60000)) + ' min)' : ''}`];
+    case 'masterReturn': return ['cutting', `Returned by master ${result.master || ''} — ${result.reason}; back to unassigned`];
     case 'updateMaster':
       return p.master ? ['cutting', `In cutting — assigned to Master: ${p.master}`] : ['cutting', 'Master unassigned'];
     case 'updateTailor':
@@ -699,6 +705,11 @@ async function routeActionInner(action, params) {
     case 'embFinish': return doEmbFinish(params);
     case 'embReturn': return doEmbReturn(params);
     case 'updateMaster': return doUpdateMaster(params);
+    case 'masterStart': return doMasterStart(params);
+    case 'masterPause': return doMasterPause(params);
+    case 'masterResume': return doMasterResume(params);
+    case 'masterFinish': return doMasterFinish(params);
+    case 'masterReturn': return doMasterReturn(params);
     case 'updateTailor': return doUpdateTailor(params);
     case 'markDone': return doMarkDone(params);
     case 'readyMadeList': return doReadyMadeList();
@@ -773,7 +784,7 @@ function parseRow(params) {
 // frontend's parseOrders() already expects.
 // ============================================================
 function buildOrderRowArray(rec, inQC, workMs, pausedReason) {
-  const row = new Array(41).fill('');
+  const row = new Array(42).fill('');
   if (!rec) return row;
 
   row[0] = rec.sr_no || '';
@@ -837,6 +848,7 @@ function buildOrderRowArray(rec, inQC, workMs, pausedReason) {
   row[38] = rec.order_type || '';
   row[39] = rec.fabric_source || '';
   row[40] = rec.fabric_purchase_status || '';
+  row[41] = rec.master_work || '';
   return row;
 }
 
@@ -1130,7 +1142,7 @@ async function doUpdateFabric(params) {
     // No cutting/sewing needed — clear any master/tailor assignment so the
     // order doesn't get stuck waiting on a step that will never happen.
     patch.master = null;
-    patch.master_assigned_at = null;
+    patch.master_assigned_at = null; patch.master_work = null;
     patch.tailor = null;
     patch.tailor_assigned_at = null;
   }
@@ -1222,7 +1234,7 @@ async function doUpdateMachEmb(params) {
 // Abdullah (before cutting) or Asif (after the tailor has stitched) does it.
 const MACH_PEOPLE = ['Abdullah', 'Asif'];
 async function loadEmbRec(row) {
-  const rows = await sbFetch('GET', `orders?id=eq.${row - 2}&select=id,order_no,sku,master,tailor,is_done,machine_emb,hand_emb,mach_emb_person,hand_emb_person&limit=1`);
+  const rows = await sbFetch('GET', `orders?id=eq.${row - 2}&select=id,order_no,sku,master,tailor,is_done,machine_emb,hand_emb,mach_emb_person,hand_emb_person,master_work&limit=1`);
   return rows && rows[0];
 }
 async function doSetEmbPerson(params) {
@@ -1493,7 +1505,7 @@ async function doUpdateMaster(params) {
   const id = row - 2;
 
   if (master === '') {
-    await sbUpdate('orders', id, { master: null, master_assigned_at: null });
+    await sbUpdate('orders', id, { master: null, master_assigned_at: null, master_work: null, master_work: null });
     pushShopifyUpdate(await getOrderNo(row), 'Master unassigned');
     return { success: true };
   }
@@ -1507,9 +1519,85 @@ async function doUpdateMaster(params) {
       return { success: false, error: 'Abdullah must finish the machine embroidery and the admin must receive it before a master is chosen.' };
     }
   }
-  await sbUpdate('orders', id, { master, master_assigned_at: new Date().toISOString() });
+  await sbUpdate('orders', id, { master, master_assigned_at: new Date().toISOString(), master_work: null });
   pushShopifyUpdate(await getOrderNo(row), `In cutting — assigned to Master: ${master}`);
   return { success: true };
+}
+
+// ── MASTER CUTTING TIMER (scan to start / finish) ────────────────────────
+// Stored as JSON in orders.master_work (needs: ALTER TABLE orders ADD COLUMN master_work text).
+// {st:'WORK'|'PAUSE'|'DONE', start:iso, fin:iso, acc:ms, run:epochMs, reason, prev:ms (earlier attempts)}
+function parseMasterWork(v) {
+  try { const o = JSON.parse(v || '{}'); return (o && typeof o === 'object') ? o : {}; } catch (e) { return {}; }
+}
+function mwTotal(w) {
+  if (!w) return 0;
+  return (Number(w.prev) || 0) + (Number(w.acc) || 0) + (w.st === 'WORK' && w.run ? Math.max(0, Date.now() - Number(w.run)) : 0);
+}
+const MASTER_RETURN_REASONS = ['Fabric damage', 'Fabric not available'];
+const MASTER_PAUSE_REASONS = ['Break', 'No Material', 'Need Fabric', 'Other'];
+async function loadMasterCtx(params) {
+  const row = parseRow(params);
+  if (!row) return { error: 'Invalid row.' };
+  const rec = await loadEmbRec(row);
+  if (!rec) return { error: 'Order not found.' };
+  if (!rec.master) return { error: 'No cutting master is assigned to this order yet.' };
+  const role = (params.role || '').toString(), name = (params.authenticatedName || '').toString();
+  if (role === 'master' && name && rec.master !== name) return { error: 'This order is assigned to master ' + rec.master + ', not you.' };
+  return { rec, row, id: row - 2, w: parseMasterWork(rec.master_work) };
+}
+async function saveMw(ctx, w) {
+  await sbUpdate('orders', ctx.id, { master_work: JSON.stringify(w) });
+  return w;
+}
+async function doMasterStart(params) {
+  const c = await loadMasterCtx(params); if (c.error) return { success: false, error: c.error };
+  if (c.w.st === 'WORK') return { success: true, already: true, work: c.w };
+  if (c.w.st === 'PAUSE') return doMasterResume(params);
+  if (c.w.st === 'DONE') return { success: false, error: 'Cutting is already finished for this order.' };
+  if (c.rec.mach_emb_person === 'Abdullah' && ['NEED', 'RED', 'RCVD', 'WORK', 'PAUSE', 'DONE', 'GREEN'].indexOf(parseEmbValue(c.rec.machine_emb).code) !== -1) {
+    return { success: false, error: 'Abdullah must finish the machine embroidery and the admin must receive it first.' };
+  }
+  const w = await saveMw(c, { st: 'WORK', start: new Date().toISOString(), acc: 0, run: Date.now(), prev: Number(c.w.prev) || 0 });
+  pushShopifyUpdate(c.rec.order_no, `Cutting started — Master ${c.rec.master}`);
+  return { success: true, work: w, master: c.rec.master };
+}
+async function doMasterPause(params) {
+  const c = await loadMasterCtx(params); if (c.error) return { success: false, error: c.error };
+  const reason = (params.reason || '').toString().trim();
+  if (!reason) return { success: false, error: 'Please choose a reason to pause.' };
+  if (c.w.st !== 'WORK') return { success: false, error: 'The timer is not running.' };
+  const w = await saveMw(c, Object.assign({}, c.w, { st: 'PAUSE', acc: (Number(c.w.acc) || 0) + Math.max(0, Date.now() - Number(c.w.run || Date.now())), run: 0, reason }));
+  return { success: true, work: w, master: c.rec.master, reason };
+}
+async function doMasterResume(params) {
+  const c = await loadMasterCtx(params); if (c.error) return { success: false, error: c.error };
+  if (c.w.st === 'WORK') return { success: true, already: true, work: c.w };
+  if (c.w.st !== 'PAUSE') return { success: false, error: 'Nothing to resume.' };
+  const w = await saveMw(c, Object.assign({}, c.w, { st: 'WORK', run: Date.now(), reason: '' }));
+  return { success: true, work: w, master: c.rec.master };
+}
+async function doMasterFinish(params) {
+  const c = await loadMasterCtx(params); if (c.error) return { success: false, error: c.error };
+  if (c.w.st === 'DONE') return { success: true, already: true, work: c.w };
+  if (c.w.st !== 'WORK' && c.w.st !== 'PAUSE') return { success: false, error: 'Start cutting before finishing.' };
+  const acc = (Number(c.w.acc) || 0) + (c.w.st === 'WORK' ? Math.max(0, Date.now() - Number(c.w.run || Date.now())) : 0);
+  const w = await saveMw(c, Object.assign({}, c.w, { st: 'DONE', fin: new Date().toISOString(), acc, run: 0, reason: '' }));
+  pushShopifyUpdate(c.rec.order_no, `Cutting finished — Master ${c.rec.master}`);
+  return { success: true, work: w, master: c.rec.master, totalMs: mwTotal(w) };
+}
+// Master cannot cut (fabric damaged / not available): order goes back to unassigned.
+async function doMasterReturn(params) {
+  const c = await loadMasterCtx(params); if (c.error) return { success: false, error: c.error };
+  const reason = (params.reason || '').toString().trim();
+  if (MASTER_RETURN_REASONS.indexOf(reason) === -1) return { success: false, error: 'Choose Fabric damage or Fabric not available.' };
+  if (c.w.st === 'DONE') return { success: false, error: 'Cutting is already finished — it cannot be returned.' };
+  const patch = { master: null, master_assigned_at: null, master_work: null, master_work: null,
+    rework_note: `↩ Returned by master ${c.rec.master} — ${reason}. ${new Date().toLocaleString()}` };
+  patch.fabric_status = reason === 'Fabric not available' ? 'Not Available' : null;
+  await sbUpdate('orders', c.id, patch);
+  pushShopifyUpdate(c.rec.order_no, `Returned by master — ${reason}`);
+  return { success: true, master: c.rec.master, reason };
 }
 
 async function doUpdateTailor(params) {
@@ -1529,6 +1617,14 @@ async function doUpdateTailor(params) {
   }
   if ((params.role || '') === 'master') {
     const rec = await loadEmbRec(row);
+    const mw = parseMasterWork(rec && rec.master_work);
+    if (mw.st !== 'DONE') {
+      return { success: false, error: mw.st === 'WORK' || mw.st === 'PAUSE' ? 'Finish your cutting first (scan the label again or tap Finish), then assign the tailor.' : 'Scan the label to start cutting first, then finish it before assigning the tailor.' };
+    }
+    const mc = rec ? parseEmbValue(rec.machine_emb).code : '';
+    if (rec && rec.mach_emb_person === 'Abdullah' && ['NEED', 'RED', 'RCVD', 'WORK', 'PAUSE', 'DONE', 'GREEN'].indexOf(mc) !== -1) {
+      return { success: false, error: 'Machine embroidery (Abdullah) must be finished and received by the admin first.' };
+    }
     const hc = rec ? parseEmbValue(rec.hand_emb).code : '';
     if (['NEED', 'RED', 'READY', 'RCVD', 'WORK', 'PAUSE', 'DONE', 'GREEN'].indexOf(hc) !== -1) {
       return { success: false, error: hc === 'DONE' || hc === 'GREEN' ? 'Receive the item from hand embroidery first, then assign the tailor.' : 'This order needs hand embroidery first — scan it as ready, then receive it back before assigning a tailor.' };
@@ -1652,11 +1748,11 @@ async function doReadyMadeReject(params) {
   } else if (reason === 'master') {
     if (!person) return { success: false, error: 'Please select the master.' };
     if ((await getActiveStaffNames('master')).indexOf(person) === -1) return { success: false, error: 'Unknown master: ' + person };
-    patch = Object.assign(base, { fabric_status: 'Available', master: person, master_assigned_at: now, tailor: null, tailor_assigned_at: null,
+    patch = Object.assign(base, { fabric_status: 'Available', master: person, master_assigned_at: now, master_work: null, tailor: null, tailor_assigned_at: null,
       rework_note: `⚠️ Ready-made rejected — Master's issue (${person}) — needs re-cut. By ${approver}, ${stamp}.` });
   } else if (reason === 'fabric') {
     // Back to the fabric-check step with "Remake" written on the order.
-    patch = Object.assign(base, { fabric_status: null, master: null, master_assigned_at: null, tailor: null, tailor_assigned_at: null,
+    patch = Object.assign(base, { fabric_status: null, master: null, master_assigned_at: null, master_work: null, tailor: null, tailor_assigned_at: null,
       rework_note: `⚠️ Remake — ready-made rejected (fabric). By ${approver}, ${stamp}.` });
   } else {
     return { success: false, error: 'Please choose Tailor, Master or Fabric.' };
@@ -1682,7 +1778,7 @@ async function doDeleteOrder(params) {
     sr_no: null, order_no: null, sku: null, fabric_status: null,
     fabric_name: null, fabric_made_in: null, garment_type: null, order_type: null,
     fabric_source: null, fabric_purchase_status: null,
-    master: null, master_assigned_at: null, machine_emb: null, hand_emb: null,
+    master: null, master_assigned_at: null, master_work: null, machine_emb: null, hand_emb: null,
     mach_emb_fabric: null, mach_emb_meters_sent: null, mach_emb_meters_received: null,
     tailor: null, tailor_assigned_at: null, remarks: null,
     is_done: false, done_at: null, notes: null,
@@ -2526,7 +2622,7 @@ async function doAtelierApproveJob(params) {
 // Rejection must always be attributed to one of three causes, so payroll
 // and standard-time analysis (and the tailor themselves) can see *why* a
 // job was sent back rather than just that it was.
-const ATELIER_REJECT_REASONS = ["Master's issue", "Tailor's issue", "Fabric issue"];
+const ATELIER_REJECT_REASONS = ["Master's issue", "Tailor's issue", "Fabric issue", "Machine embroidery issue", "Hand embroidery issue"];
 // When the cause is the fabric itself, we also need to know *what* about
 // it was wrong, so whoever re-checks it (Inventory/Admin) knows what to
 // fix rather than just "something's wrong".
@@ -2539,7 +2635,7 @@ async function doAtelierRejectJob(params) {
   if (!id) return { success: false, error: 'Invalid job id.' };
   const reason = (params.reason || '').toString().trim();
   if (ATELIER_REJECT_REASONS.indexOf(reason) === -1) {
-    return { success: false, error: "Please select a reason: Master's issue, Tailor's issue, or Fabric issue." };
+    return { success: false, error: "Please select a reason: Master's issue, Tailor's issue, Fabric issue, Machine embroidery issue or Hand embroidery issue." };
   }
   let fabricIssueType = null;
   if (reason === 'Fabric issue') {
@@ -2567,7 +2663,7 @@ async function doAtelierRejectJob(params) {
   if (wasApproved) { jobPatch.approved_at = null; jobPatch.approved_by = null; }
   await sbUpdate('atelier_jobs', id, jobPatch);
   {
-    const routed = reason === "Master's issue" ? `sent back to Master (${job.master || 'cutting master'}) for re-cut`
+    const routed = reason === 'Machine embroidery issue' ? 'sent back to MACHINE EMBROIDERY' : reason === 'Hand embroidery issue' ? 'sent back to HAND EMBROIDERY (Akil)' : reason === "Master's issue" ? `sent back to Master (${job.master || 'cutting master'}) for re-cut`
       : reason === 'Fabric issue' ? 'sent back to the fabric check — WHOLE GARMENT to be redone (fabric, cutting, tailoring)' : `sent back to Tailor ${job.tailor} to redo`;
     logLineEvent(job.order_no, job.sku, 'rework',
       `QC rejected by ${approver} — ${reason}${fabricIssueType ? ' (' + fabricIssueType + ')' : ''}; ${routed}`, approver);
@@ -2590,8 +2686,28 @@ async function doAtelierRejectJob(params) {
         // re-cut this is.
         await sbUpdate('orders', orderRec.id, Object.assign({
           tailor: null, tailor_assigned_at: null,
+          master_work: JSON.stringify({ prev: mwTotal(parseMasterWork((await sbFetch('GET', `orders?id=eq.${orderRec.id}&select=master_work&limit=1`) || [{}])[0].master_work)) }),
           rework_note: `⚠️ Rejected — Master's issue (${job.master || 'cutting master'}) — needs re-cut. By ${approver}, ${stamp}.`
         }, reopen));
+      } else if (reason === 'Machine embroidery issue' || reason === 'Hand embroidery issue') {
+        // Back to that embroidery department.
+        const full = await sbFetch('GET', `orders?id=eq.${orderRec.id}&select=mach_emb_person,hand_emb_person,machine_emb,hand_emb&limit=1`);
+        const er = (full && full[0]) || {};
+        if (reason === 'Machine embroidery issue') {
+          const mp = er.mach_emb_person;
+          if (!mp) return { success: false, error: 'This order has no machine embroidery person recorded — pick another reason.' };
+          // Asif: back to Asif, then returns to the same tailor. Abdullah: back to Abdullah, admin receives, master re-assigns the tailor.
+          const patch = { machine_emb: (mp === 'Asif' ? 'SENT|' : 'NEED|') + embStampNow(),
+            rework_note: `⚠️ Rejected — Machine embroidery issue — back to ${mp}. By ${approver}, ${stamp}.` };
+          if (mp !== 'Asif') { patch.tailor = null; patch.tailor_assigned_at = null; }
+          await sbUpdate('orders', orderRec.id, Object.assign(patch, reopen));
+        } else {
+          // Akil receives it again, assigns a person; afterwards the master receives it and assigns the tailor.
+          await sbUpdate('orders', orderRec.id, Object.assign({
+            hand_emb: 'READY|' + embStampNow(), hand_emb_person: null, tailor: null, tailor_assigned_at: null,
+            rework_note: `⚠️ Rejected — Hand embroidery issue — back to hand embroidery (Akil). By ${approver}, ${stamp}.`
+          }, reopen));
+        }
       } else if (reason === 'Fabric issue') {
         // Send it back to Inventory/Admin: reopen the fabric-check step so
         // it shows up wherever "awaiting fabric" is tracked, tagged with
@@ -2601,7 +2717,7 @@ async function doAtelierRejectJob(params) {
         // which was done on the faulty piece) all happen again from scratch.
         await sbUpdate('orders', orderRec.id, Object.assign({
           fabric_status: null, fabric_source: null, fabric_purchase_status: null,
-          master: null, master_assigned_at: null, tailor: null, tailor_assigned_at: null,
+          master: null, master_assigned_at: null, master_work: null, tailor: null, tailor_assigned_at: null,
           machine_emb: null, hand_emb: null, mach_emb_person: null, hand_emb_person: null,
           mach_emb_fabric: null, mach_emb_meters_sent: null, mach_emb_meters_received: null,
           rework_note: `⚠️ Rejected — Fabric issue: ${fabricIssueType}. WHOLE GARMENT TO BE REDONE from fabric check. By ${approver}, ${stamp}.`
