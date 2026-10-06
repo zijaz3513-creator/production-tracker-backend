@@ -378,6 +378,24 @@ async function getActiveStaffNames(staffRole) {
   return (await getActiveStaff(staffRole)).map(s => s.name);
 }
 
+// Display names: a real name shown in front of the machine-number name (e.g. "Ayesha (M1)").
+// Stored in staff.display_name (ALTER TABLE staff ADD COLUMN IF NOT EXISTS display_name text).
+async function getDisplayNames() {
+  try {
+    const rows = (await sbFetch('GET', 'staff?select=id,name,display_name&active=eq.true&display_name=not.is.null')) || [];
+    const byName = {}, byId = {};
+    rows.forEach(r => { if (r.display_name) { byName[r.name] = r.display_name; byId[r.id] = r.display_name; } });
+    return { byName, byId };
+  } catch (e) { return { byName: {}, byId: {} }; }
+}
+async function doSetDisplayName(params) {
+  const id = parseInt(params.id, 10);
+  const dn = (params.displayName || '').toString().trim();
+  if (!id) return { success: false, error: 'Invalid id.' };
+  try { await sbUpdate('staff', id, { display_name: dn || null }); }
+  catch (e) { return { success: false, error: 'Could not save — run the SQL line: ALTER TABLE staff ADD COLUMN IF NOT EXISTS display_name text;' }; }
+  return { success: true, displayName: dn };
+}
 async function doGetRoster() {
   const [masters, tailors, designers, patternmasters, sampleMachEmb, sampleHandEmb, handEmbWorkers] = await Promise.all([
     getActiveStaffNames('master'),
@@ -388,7 +406,8 @@ async function doGetRoster() {
     getActiveStaffNames('samplehandemb'),
     getActiveStaffNames('handembworker')
   ]);
-  return { success: true, masters, tailors, designers, patternmasters, sampleMachEmb, sampleHandEmb, handEmbWorkers };
+  const dn = await getDisplayNames();
+  return { success: true, masters, tailors, designers, patternmasters, sampleMachEmb, sampleHandEmb, handEmbWorkers, displayNames: dn.byName };
 }
 
 async function doListStaff(params) {
@@ -396,7 +415,8 @@ async function doListStaff(params) {
   if (STAFF_ROLES.indexOf(staffRole) === -1) {
     return { success: false, error: 'Invalid staff role.' };
   }
-  return { success: true, staff: await getActiveStaff(staffRole) };
+  const dn = await getDisplayNames();
+  return { success: true, staff: (await getActiveStaff(staffRole)).map(x => Object.assign({}, x, { display_name: dn.byId[x.id] || '' })) };
 }
 
 async function doAddStaff(params) {
@@ -438,6 +458,34 @@ async function doRemoveStaff(params) {
   if (!id) return { success: false, error: 'Invalid id.' };
   await sbFetch('PATCH', `staff?id=eq.${id}`, { active: false }, { Prefer: 'return=minimal' });
   return { success: true };
+}
+
+// Rename a staff member everywhere (staff list + every record that stores the name as text).
+const RENAME_CASCADE = {
+  tailor: [['orders', 'tailor'], ['design_samples', 'tailor'], ['atelier_jobs', 'tailor'], ['atelier_calls', 'tailor']],
+  master: [['orders', 'master'], ['atelier_jobs', 'master']],
+  patternmaster: [['design_samples', 'master']],
+  handembworker: [['orders', 'hand_emb_person']]
+};
+async function doRenameStaff(params) {
+  const id = parseInt(params.id, 10);
+  const newName = (params.newName || '').toString().trim();
+  if (!id) return { success: false, error: 'Invalid id.' };
+  if (!newName) return { success: false, error: 'Enter the new name.' };
+  const rows = await sbFetch('GET', `staff?select=id,name,role&id=eq.${id}&limit=1`);
+  const rec = rows && rows[0];
+  if (!rec) return { success: false, error: 'Not found.' };
+  if (rec.name === newName) return { success: true, unchanged: true };
+  const dup = await sbFetch('GET', `staff?select=id&role=eq.${rec.role}&name=eq.${encodeURIComponent(newName)}&active=eq.true&limit=1`);
+  if (dup && dup.length) return { success: false, error: 'That name is already on the list.' };
+  await sbUpdate('staff', id, { name: newName });
+  const failed = [];
+  for (const [table, col] of (RENAME_CASCADE[rec.role] || [])) {
+    try {
+      await sbFetch('PATCH', `${table}?${col}=eq.${encodeURIComponent(rec.name)}`, { [col]: newName }, { Prefer: 'return=minimal' });
+    } catch (e) { failed.push(table + '.' + col); }
+  }
+  return { success: true, oldName: rec.name, newName, role: rec.role, failed };
 }
 
 async function doReorderStaff(params) {
@@ -731,6 +779,8 @@ async function routeActionInner(action, params) {
     case 'listStaff': return doListStaff(params);
     case 'addStaff': return doAddStaff(params);
     case 'removeStaff': return doRemoveStaff(params);
+    case 'renameStaff': return doRenameStaff(params);
+    case 'setDisplayName': return doSetDisplayName(params);
     case 'reorderStaff': return doReorderStaff(params);
 
     // Aeon Workstation — tailor floor
