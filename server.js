@@ -2494,6 +2494,10 @@ async function doAtelierFinishJob(params) {
   const accum = Number(job.accum_ms || 0) + (job.run_since ? (Date.now() - new Date(job.run_since).getTime()) : 0);
   const now = new Date().toISOString();
   await atelierUpdateJobWithReason(job.id, { accum_ms: accum, run_since: null, status: 'pending', end_at: now, duration_ms: accum, pause_reason: null });
+  try { // drop any other stale in-progress job for the same line
+    const dups = (await sbFetch('GET', `atelier_jobs?order_no=eq.${encodeURIComponent(job.order_no)}&sku=eq.${encodeURIComponent(job.sku)}&status=eq.active&id=neq.${job.id}&select=id`)) || [];
+    for (const d of dups) await sbFetch('DELETE', `atelier_jobs?id=eq.${d.id}`, undefined, { Prefer: 'return=minimal' });
+  } catch (e) { /* non-fatal */ }
   logLineEvent(job.order_no, job.sku, 'qc', `Tailoring finished by ${tailor} — waiting for QC approval — stitching time ${fmtDurationMs(accum)}`, tailor);
   return { success: true };
 }
@@ -2588,7 +2592,15 @@ async function doAtelierMyToday(params) {
   // In-progress jobs are NOT limited to today: a job started on an earlier day
   // and never finished/paused must still show on the Work screen. Otherwise it
   // is invisible there yet still hides its order line from the tailor's list.
-  const activeJobs = (await getAtelierActiveJobs(tailor)).slice().sort((a, b) => new Date(a.start_at) - new Date(b.start_at));
+  let activeJobs = (await getAtelierActiveJobs(tailor)).slice().sort((a, b) => new Date(a.start_at) - new Date(b.start_at));
+  // A line already finished and waiting in QC must not also show as an in-progress job
+  // (stale duplicate) — remove it so "Continue" never hits "already in process".
+  try {
+    const pend = new Set(((await sbFetch('GET', `atelier_jobs?tailor=eq.${encodeURIComponent(tailor)}&status=eq.pending&select=order_no,sku`)) || []).map(p => p.order_no + '|' + p.sku));
+    const stale = activeJobs.filter(j => pend.has(j.order_no + '|' + j.sku));
+    for (const j of stale) await sbFetch('DELETE', `atelier_jobs?id=eq.${j.id}`, undefined, { Prefer: 'return=minimal' });
+    if (stale.length) activeJobs = activeJobs.filter(j => !pend.has(j.order_no + '|' + j.sku));
+  } catch (e) { /* non-fatal */ }
   let pieces = 0, minutesWorked = 0, earnedApproved = 0, earnedPending = 0;
   jobs.forEach(j => {
     if (j.status === 'approved' || j.status === 'pending') pieces += (j.qty || 0);
