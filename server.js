@@ -683,7 +683,7 @@ function describeAction(action, p, result) {
     case 'embFinish': return ['embroidery', `${kindWord}${result.person ? ' (' + result.person + ')' : ''} — finished${result.backTo ? ' — back with ' + result.backTo : result.readyFor ? ' — ready for ' + result.readyFor : ''}`];
     case 'embReturn': return ['embroidery', `${kindWord} — returned, needs to be picked up again`];
     case 'masterStart': return result.already ? null : ['cutting', `Cutting started — Master ${result.master || ''}`];
-    case 'masterPause': return ['cutting', `Cutting paused — Master ${result.master || ''} (${result.reason || 'no reason'})`];
+    case 'masterPause': return ['cutting', result.sentToHand ? `Cutting paused — Master ${result.master || ''} sent it to hand embroidery (timer paused)` : `Cutting paused — Master ${result.master || ''} (${result.reason || 'no reason'})`];
     case 'masterResume': return result.already ? null : ['cutting', `Cutting resumed — Master ${result.master || ''}`];
     case 'masterFinish': return result.already ? null : ['cutting', `Cutting finished — Master ${result.master || ''}${result.totalMs ? ' (took ' + Math.max(1, Math.round(result.totalMs / 60000)) + ' min)' : ''}`];
     case 'masterReturn': return ['cutting', `Returned by master ${result.master || ''} — ${result.reason}; back to unassigned`];
@@ -1631,6 +1631,7 @@ function mwTotal(w) {
   return (Number(w.prev) || 0) + (Number(w.acc) || 0) + (w.st === 'WORK' && w.run ? Math.max(0, Date.now() - Number(w.run)) : 0);
 }
 const MASTER_RETURN_REASONS = ['Fabric damage', 'Fabric not available'];
+const MW_HAND_REASON = 'With hand embroidery';
 const MASTER_PAUSE_REASONS = ['Break', 'No Material', 'Need Fabric', 'Other'];
 async function loadMasterCtx(params) {
   const row = parseRow(params);
@@ -1663,6 +1664,15 @@ async function doMasterPause(params) {
   const reason = (params.reason || '').toString().trim();
   if (!reason) return { success: false, error: 'Please choose a reason to pause.' };
   if (c.w.st !== 'WORK') return { success: false, error: 'The timer is not running.' };
+  if (reason === MW_HAND_REASON) {
+    // Master sends the piece to hand embroidery mid-cutting: the timer pauses until it comes back.
+    const hc = parseEmbValue(c.rec.hand_emb).code;
+    if (['NEED', 'RED'].indexOf(hc) === -1) return { success: false, error: 'This order does not need hand embroidery (or it is already with the hand desk).' };
+    const w2 = Object.assign({}, c.w, { st: 'PAUSE', acc: (Number(c.w.acc) || 0) + Math.max(0, Date.now() - Number(c.w.run || Date.now())), run: 0, reason });
+    await sbUpdate('orders', c.id, { master_work: JSON.stringify(w2), hand_emb: 'READY|' + embStampNow() });
+    pushShopifyUpdate(c.rec.order_no, 'Hand embroidery — ready for Akil (master timer paused)');
+    return { success: true, work: w2, master: c.rec.master, reason, sentToHand: true };
+  }
   const w = await saveMw(c, Object.assign({}, c.w, { st: 'PAUSE', acc: (Number(c.w.acc) || 0) + Math.max(0, Date.now() - Number(c.w.run || Date.now())), run: 0, reason }));
   return { success: true, work: w, master: c.rec.master, reason };
 }
@@ -1670,6 +1680,9 @@ async function doMasterResume(params) {
   const c = await loadMasterCtx(params); if (c.error) return { success: false, error: c.error };
   if (c.w.st === 'WORK') return { success: true, already: true, work: c.w };
   if (c.w.st !== 'PAUSE') return { success: false, error: 'Nothing to resume.' };
+  if (c.w.reason === MW_HAND_REASON && ['READY', 'RCVD', 'WORK', 'PAUSE', 'DONE', 'GREEN'].indexOf(parseEmbValue(c.rec.hand_emb).code) !== -1) {
+    return { success: false, error: 'The piece is with hand embroidery — receive it back first, then resume.' };
+  }
   const w = await saveMw(c, Object.assign({}, c.w, { st: 'WORK', run: Date.now(), reason: '' }));
   return { success: true, work: w, master: c.rec.master };
 }
@@ -1677,6 +1690,9 @@ async function doMasterFinish(params) {
   const c = await loadMasterCtx(params); if (c.error) return { success: false, error: c.error };
   if (c.w.st === 'DONE') return { success: true, already: true, work: c.w };
   if (c.w.st !== 'WORK' && c.w.st !== 'PAUSE') return { success: false, error: 'Start cutting before finishing.' };
+  if (['READY', 'RCVD', 'WORK', 'PAUSE', 'DONE', 'GREEN'].indexOf(parseEmbValue(c.rec.hand_emb).code) !== -1 && c.w.reason === MW_HAND_REASON) {
+    return { success: false, error: 'The piece is with hand embroidery — receive it back first.' };
+  }
   const acc = (Number(c.w.acc) || 0) + (c.w.st === 'WORK' ? Math.max(0, Date.now() - Number(c.w.run || Date.now())) : 0);
   const w = await saveMw(c, Object.assign({}, c.w, { st: 'DONE', fin: new Date().toISOString(), acc, run: 0, reason: '' }));
   pushShopifyUpdate(c.rec.order_no, `Cutting finished — Master ${c.rec.master}`);
