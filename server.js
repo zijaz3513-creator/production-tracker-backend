@@ -2322,7 +2322,7 @@ async function doAtelierMyOrders(params) {
   // query only returns NOT-done orders, so an approved job here is stale (order
   // reopened / re-assigned / duplicate order_no+sku row). Hiding on it was the
   // bug where Orders showed "With tailor M4" but M4's Work screen was empty.
-  const jobs = (await sbFetch('GET', `atelier_jobs?tailor=eq.${encodeURIComponent(tailor)}&status=in.(active,pending)&select=order_no,sku`)) || [];
+  const jobs = (await sbFetch('GET', `atelier_jobs?order_no=in.(${orders.map(o => '"' + String(o.order_no).replace(/"/g, '') + '"').join(',')})&status=in.(active,pending)&select=order_no,sku`)) || [];
   const blockKey = new Set();
   jobs.forEach(j => blockKey.add(j.order_no + '|' + j.sku));
 
