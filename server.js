@@ -527,6 +527,78 @@ app.use(
   })
 );
 
+
+// ============================================================
+// SKU IMAGES FROM TELEGRAM
+// A Telegram bot receives product photos (posted/forwarded with a caption like
+// "SKU: 1300") and stores each file_id in Supabase table `sku_images`.
+// Anyone logged in can click a SKU in the tracker to view its photos.
+// Env: TELEGRAM_BOT_TOKEN (required), TELEGRAM_WEBHOOK_SECRET (optional).
+// ============================================================
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TG_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET ||
+  (TG_TOKEN ? crypto.createHash('sha256').update('tg|' + TG_TOKEN).digest('hex').slice(0, 24) : '');
+function tgParseSku(text) {
+  const m = /SKU\s*[:#\-]?\s*([A-Za-z0-9][A-Za-z0-9._\/\-]*)/i.exec(String(text || ''));
+  return m ? m[1].toUpperCase() : '';
+}
+async function tgHandleMessage(msg) {
+  if (!msg) return;
+  let fileId = '', uniq = '';
+  if (msg.photo && msg.photo.length) {
+    const p = msg.photo[msg.photo.length - 1]; fileId = p.file_id; uniq = p.file_unique_id;
+  } else if (msg.document && /^image\//.test(msg.document.mime_type || '')) {
+    fileId = msg.document.file_id; uniq = msg.document.file_unique_id;
+  }
+  if (!fileId) return;
+  const caption = msg.caption || '';
+  const group = msg.media_group_id ? String(msg.media_group_id) : '';
+  let sku = tgParseSku(caption);
+  if (!sku && group) {
+    const g = await sbFetch('GET', `sku_images?media_group_id=eq.${encodeURIComponent(group)}&sku=not.is.null&select=sku&limit=1`);
+    if (g && g[0]) sku = g[0].sku;
+  }
+  await sbFetch('POST', 'sku_images?on_conflict=file_unique_id',
+    { sku: sku || null, file_id: fileId, file_unique_id: uniq, media_group_id: group || null, caption: caption || null },
+    { Prefer: 'resolution=merge-duplicates,return=minimal' });
+  if (sku && group) {
+    await sbFetch('PATCH', `sku_images?media_group_id=eq.${encodeURIComponent(group)}&sku=is.null`, { sku }, { Prefer: 'return=minimal' });
+  }
+}
+app.post('/telegram/:secret', async (req, res) => {
+  if (!TG_TOKEN || req.params.secret !== TG_SECRET) return res.sendStatus(403);
+  res.sendStatus(200);
+  try {
+    const u = req.body || {};
+    await tgHandleMessage(u.channel_post || u.message || u.edited_channel_post || u.edited_message);
+  } catch (e) { console.error('telegram webhook:', e.message); }
+});
+async function doGetSkuImages(params) {
+  const sku = (params.sku || '').toString().trim().toUpperCase();
+  if (!sku) return { success: false, error: 'No SKU.' };
+  const rows = (await sbFetch('GET', `sku_images?sku=eq.${encodeURIComponent(sku)}&select=id,caption&order=id.asc&limit=30`)) || [];
+  return { success: true, sku, images: rows.map(r => ({ id: r.id, caption: r.caption || '' })), configured: !!TG_TOKEN };
+}
+const skuImgCache = new Map();
+async function doGetSkuImage(params) {
+  if (!TG_TOKEN) return { success: false, error: 'Telegram bot is not configured on the server.' };
+  const id = parseInt(params.id, 10);
+  if (!id) return { success: false, error: 'Invalid image.' };
+  if (skuImgCache.has(id)) return { success: true, dataUrl: skuImgCache.get(id) };
+  const rows = await sbFetch('GET', `sku_images?id=eq.${id}&select=file_id&limit=1`);
+  if (!rows || !rows[0]) return { success: false, error: 'Image not found.' };
+  const f = await (await fetch(`https://api.telegram.org/bot${TG_TOKEN}/getFile?file_id=${encodeURIComponent(rows[0].file_id)}`)).json();
+  if (!f.ok) return { success: false, error: 'Telegram: ' + (f.description || 'could not get file') };
+  const r = await fetch(`https://api.telegram.org/file/bot${TG_TOKEN}/${f.result.file_path}`);
+  if (!r.ok) return { success: false, error: 'Could not download the image.' };
+  const buf = Buffer.from(await r.arrayBuffer());
+  const mime = /\.png$/i.test(f.result.file_path) ? 'image/png' : 'image/jpeg';
+  const dataUrl = 'data:' + mime + ';base64,' + buf.toString('base64');
+  if (skuImgCache.size > 200) skuImgCache.delete(skuImgCache.keys().next().value);
+  skuImgCache.set(id, dataUrl);
+  return { success: true, dataUrl };
+}
+
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 // Accept both GET (query string) and POST (JSON body) — merged the same
@@ -590,7 +662,7 @@ app.all('/api', async (req, res) => {
 });
 
 function checkPermission(action, role) {
-  if (action === 'getOrders' || action === 'getSamples') return null;
+  if (action === 'getOrders' || action === 'getSamples' || action === 'getSkuImages' || action === 'getSkuImage') return null;
   if (!action) return { success: false, error: 'Missing action.' };
   if (!role) return { success: false, error: 'Missing role — please log in again.' };
   if (role === 'admin') return null;
@@ -783,6 +855,8 @@ async function routeActionInner(action, params) {
     case 'reorderStaff': return doReorderStaff(params);
 
     // Aeon Workstation — tailor floor
+    case 'getSkuImages': return doGetSkuImages(params);
+    case 'getSkuImage': return doGetSkuImage(params);
     case 'atelierMyOrders': return doAtelierMyOrders(params);
     case 'atelierStartJob': return doAtelierStartJob(params);
     case 'atelierPauseJob': return doAtelierPauseJob(params);
@@ -2322,7 +2396,7 @@ async function doAtelierMyOrders(params) {
   // query only returns NOT-done orders, so an approved job here is stale (order
   // reopened / re-assigned / duplicate order_no+sku row). Hiding on it was the
   // bug where Orders showed "With tailor M4" but M4's Work screen was empty.
-  const jobs = (await sbFetch('GET', `atelier_jobs?order_no=in.(${orders.map(o => '"' + String(o.order_no).replace(/"/g, '') + '"').join(',')})&status=in.(active,pending)&select=order_no,sku`)) || [];
+  const jobs = (await sbFetch('GET', `atelier_jobs?tailor=eq.${encodeURIComponent(tailor)}&status=in.(active,pending)&select=order_no,sku`)) || [];
   const blockKey = new Set();
   jobs.forEach(j => blockKey.add(j.order_no + '|' + j.sku));
 
@@ -2401,8 +2475,14 @@ async function doAtelierStartJob(params) {
     garmentType = rec.garment_type; master = rec.master || null; notes = rec.notes || ''; urgent = !!rec.urgent;
     qty = atelierQtyFromNotes(notes);
 
-    const blocked = await sbFetch('GET', `atelier_jobs?order_no=eq.${encodeURIComponent(orderNo)}&sku=eq.${encodeURIComponent(sku)}&status=in.(active,pending)&select=id&limit=1`);
-    if (blocked && blocked.length) return { success: false, error: 'This order line already has a job in progress.' };
+    const blocked = await sbFetch('GET', `atelier_jobs?order_no=eq.${encodeURIComponent(orderNo)}&sku=eq.${encodeURIComponent(sku)}&status=in.(active,pending)&select=id,tailor`);
+    // Jobs owned by another tailor are stale (this line is assigned to this tailor now) — clear them.
+    const mine = [];
+    for (const bj of (blocked || [])) {
+      if (bj.tailor === tailor) mine.push(bj);
+      else await sbFetch('DELETE', `atelier_jobs?id=eq.${bj.id}`, undefined, { Prefer: 'return=minimal' });
+    }
+    if (mine.length) return { success: false, error: 'This order line already has a job in progress.' };
   } else if (!garmentType) {
     return { success: false, error: 'Garment type is required for a manual entry.' };
   }
