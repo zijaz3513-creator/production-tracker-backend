@@ -576,8 +576,17 @@ app.post('/telegram/:secret', async (req, res) => {
 async function doGetSkuImages(params) {
   const sku = (params.sku || '').toString().trim().toUpperCase();
   if (!sku) return { success: false, error: 'No SKU.' };
-  const rows = (await sbFetch('GET', `sku_images?sku=eq.${encodeURIComponent(sku)}&select=id,caption&order=id.asc&limit=30`)) || [];
-  return { success: true, sku, images: rows.map(r => ({ id: r.id, caption: r.caption || '' })), configured: !!TG_TOKEN };
+  // Orders may carry a variant SKU like "879-XXL-60" while Telegram has the base "879".
+  // Try the full SKU first, then progressively shorter prefixes (879-XXL, 879).
+  const parts = sku.split(/[-_\s\/]+/).filter(Boolean);
+  const cands = [sku];
+  for (let n = parts.length - 1; n >= 1; n--) { const c = parts.slice(0, n).join('-'); if (cands.indexOf(c) === -1) cands.push(c); }
+  let rows = [], used = sku;
+  for (const c of cands) {
+    rows = (await sbFetch('GET', `sku_images?sku=eq.${encodeURIComponent(c)}&select=id,caption&order=id.asc&limit=30`)) || [];
+    if (rows.length) { used = c; break; }
+  }
+  return { success: true, sku, matched: used, images: rows.map(r => ({ id: r.id, caption: r.caption || '' })), configured: !!TG_TOKEN };
 }
 const skuImgCache = new Map();
 async function doGetSkuImage(params) {
