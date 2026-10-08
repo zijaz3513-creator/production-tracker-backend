@@ -277,7 +277,7 @@ const ROLE_PERMISSIONS = {
   handemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'getSamples', 'receiveSampleEmb', 'embReceive', 'embAssignWorker', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn'],
   machemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'getSamples', 'receiveSampleEmb', 'embReceive', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn'],
   designer: ['getSamples', 'addSample'],
-  patternmaster: ['getSamples', 'assignSampleTailor'],
+  patternmaster: ['getSamples', 'assignSampleTailor', 'startSamplePattern'],
   samplemachemb: ['getSamples', 'receiveSampleEmb'],
   samplehandemb: ['getSamples', 'receiveSampleEmb'],
   // Same access as Admin, except it cannot delete orders/samples or remove
@@ -855,6 +855,7 @@ async function routeActionInner(action, params) {
     case 'reorderStaff': return doReorderStaff(params);
 
     // Aeon Workstation — tailor floor
+    case 'startSamplePattern': return doStartSamplePattern(params);
     case 'getSkuImages': return doGetSkuImages(params);
     case 'getSkuImage': return doGetSkuImage(params);
     case 'atelierMyOrders': return doAtelierMyOrders(params);
@@ -1388,9 +1389,9 @@ async function doSendOrderEmb(params) {
   if (sendRole === 'master' && sendName && rec.master !== sendName) return { error: 'This order is assigned to master ' + rec.master + ', not you.', success: false };
   const cur = parseEmbValue(rec.machine_emb).code;
   if (['NEED', 'RED'].indexOf(cur) === -1) return { success: false, error: 'This order is not waiting for machine embroidery.' };
-  if (rec.mach_emb_person !== 'Asif') return { success: false, error: rec.mach_emb_person ? 'Admin chose ' + rec.mach_emb_person + ' for this order, not Asif.' : 'The admin has not chosen Asif for this order yet.' };
+  if (rec.mach_emb_person && rec.mach_emb_person !== 'Asif') return { success: false, error: 'Admin chose ' + rec.mach_emb_person + ' for this order, not Asif.' };
   const value = 'SENT|' + embStampNow();
-  const patch = { machine_emb: value };
+  const patch = { machine_emb: value, mach_emb_person: 'Asif' };
   if (fromMaster) {
     // The master's cutting time stops when the piece goes to Asif.
     const mw = parseMasterWork(rec.master_work);
@@ -1752,9 +1753,9 @@ async function doMasterPause(params) {
   if (reason === MW_MACH_REASON) {
     if (c.rec.tailor) return { success: false, error: 'A tailor is already assigned — the tailor sends it to Asif after stitching.' };
     if (['NEED', 'RED'].indexOf(parseEmbValue(c.rec.machine_emb).code) === -1) return { success: false, error: 'This order does not need machine embroidery (or it is already with the machine desk).' };
-    if (c.rec.mach_emb_person !== 'Asif') return { success: false, error: c.rec.mach_emb_person ? 'Admin chose ' + c.rec.mach_emb_person + ', not Asif.' : 'The admin has not chosen Asif for this order yet.' };
+    if (c.rec.mach_emb_person && c.rec.mach_emb_person !== 'Asif') return { success: false, error: 'Admin chose ' + c.rec.mach_emb_person + ', not Asif.' };
     const w3 = Object.assign({}, c.w, { st: 'PAUSE', acc: (Number(c.w.acc) || 0) + Math.max(0, Date.now() - Number(c.w.run || Date.now())), run: 0, reason });
-    await sbUpdate('orders', c.id, { master_work: JSON.stringify(w3), machine_emb: 'SENT|' + embStampNow() });
+    await sbUpdate('orders', c.id, { master_work: JSON.stringify(w3), machine_emb: 'SENT|' + embStampNow(), mach_emb_person: 'Asif' });
     pushShopifyUpdate(c.rec.order_no, 'Machine embroidery — with Asif (master timer paused)');
     return { success: true, work: w3, master: c.rec.master, reason, sentToMach: true };
   }
@@ -2011,7 +2012,7 @@ async function doUpdateUrgent(params) {
 // DESIGN SAMPLES
 // ============================================================
 function buildSampleRowArray(rec, fabricsBySampleId) {
-  const row = new Array(37).fill('');
+  const row = new Array(40).fill('');
   if (!rec) return row;
 
   row[0] = rec.sr_no || '';
@@ -2043,6 +2044,9 @@ function buildSampleRowArray(rec, fabricsBySampleId) {
   row[34] = rec.mach_emb_status || '';
   row[35] = rec.hand_emb_person || '';
   row[36] = rec.hand_emb_status || '';
+  row[37] = rec.pleats || '';
+  row[38] = rec.pm_started_at || '';
+  row[39] = rec.pm_ended_at || '';
   return row;
 }
 
@@ -2124,12 +2128,18 @@ async function doAddSample(params) {
 
   const srNo = (await sbGetMaxId('design_samples')) + 1;
 
-  const created = await sbInsertOne('design_samples', {
+  const sampleRec = {
     sr_no: srNo, name, code, type, fabric_color: fabricColor,
     master, machine_emb: machEmb, hand_emb: handEmb,
     mach_emb_person: machEmbPerson, hand_emb_person: handEmbPerson,
     lining_color: liningColor, piping_color: pipingColor
-  });
+  };
+  const pleats = (params.pleats || '').toString().trim();
+  let created;
+  if (pleats) {
+    try { created = await sbInsertOne('design_samples', Object.assign({ pleats }, sampleRec)); }
+    catch (e) { created = await sbInsertOne('design_samples', sampleRec); } // pleats column not added yet
+  } else created = await sbInsertOne('design_samples', sampleRec);
 
   const slotsToInsert = fabricSlots
     .filter(f => f.fabric_name || f.fabric_color || f.meters != null)
@@ -2151,6 +2161,19 @@ async function doAssignSampleMaster(params) {
   return { success: true };
 }
 
+async function doStartSamplePattern(params) {
+  const row = parseRow(params);
+  if (!row) return { success: false, error: 'Invalid row.' };
+  const rec = await sbFetch('GET', `design_samples?id=eq.${row - 1}&select=*&limit=1`);
+  const r = rec && rec[0];
+  if (!r) return { success: false, error: 'Sample not found.' };
+  if (params.role === 'patternmaster' && params.authenticatedName && r.master !== params.authenticatedName) return { success: false, error: 'This sample is assigned to ' + r.master + '.' };
+  if (r.pm_started_at) return { success: true, already: true };
+  try { await sbUpdate('design_samples', row - 1, { pm_started_at: new Date().toISOString() }); }
+  catch (e) { return { success: false, error: 'Run the SQL to add the pattern timer columns first (sku/pleats SQL file).' }; }
+  return { success: true };
+}
+
 async function doAssignSampleTailor(params) {
   const row = parseRow(params);
   if (!row) return { success: false, error: 'Invalid row.' };
@@ -2159,7 +2182,9 @@ async function doAssignSampleTailor(params) {
   if (sampleTailors.indexOf(tailor) === -1) {
     return { success: false, error: 'Unknown tailor: ' + tailor };
   }
-  await sbUpdate('design_samples', row - 1, { tailor, tailor_started_at: new Date().toISOString() });
+  const nowIso = new Date().toISOString();
+  await sbUpdate('design_samples', row - 1, { tailor, tailor_started_at: nowIso });
+  try { await sbUpdate('design_samples', row - 1, { pm_ended_at: nowIso }); } catch (e) { /* column not added yet */ }
   return { success: true };
 }
 
