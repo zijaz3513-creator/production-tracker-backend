@@ -864,6 +864,8 @@ async function routeActionInner(action, params) {
     case 'reorderStaff': return doReorderStaff(params);
 
     // Aeon Workstation — tailor floor
+    case 'dataCleanup': return doDataCleanup(params);
+    case 'undoCleanup': return doUndoCleanup(params);
     case 'startSamplePattern': return doStartSamplePattern(params);
     case 'getSkuImages': return doGetSkuImages(params);
     case 'getSkuImage': return doGetSkuImage(params);
@@ -917,7 +919,7 @@ function parseRow(params) {
 // frontend's parseOrders() already expects.
 // ============================================================
 function buildOrderRowArray(rec, inQC, workMs, pausedReason) {
-  const row = new Array(42).fill('');
+  const row = new Array(45).fill('');
   if (!rec) return row;
 
   row[0] = rec.sr_no || '';
@@ -982,6 +984,9 @@ function buildOrderRowArray(rec, inQC, workMs, pausedReason) {
   row[39] = rec.fabric_source || '';
   row[40] = rec.fabric_purchase_status || '';
   row[41] = rec.master_work || '';
+  row[42] = rec.cleanup_at || '';
+  row[43] = rec.cleanup_by || '';
+  row[44] = rec.cleanup_note || '';
   return row;
 }
 
@@ -1848,6 +1853,33 @@ async function doUpdateTailor(params) {
   }
   await sbUpdate('orders', id, { tailor, tailor_assigned_at: new Date().toISOString(), rework_note: null });
   pushShopifyUpdate(await getOrderNo(row), `With Tailor: ${tailor}`);
+  return { success: true };
+}
+
+
+// ── DATA CLEANUP (admin): close stale / duplicate / mistaken orders without counting them as real production ──
+const CLEANUP_REASONS = ['Duplicate order', 'Old / already delivered', 'Entered by mistake', 'Test order', 'Other'];
+async function doDataCleanup(params) {
+  if (params.role !== 'admin') return { success: false, error: 'Only the admin can do a data cleanup.' };
+  const row = parseRow(params);
+  if (!row) return { success: false, error: 'Invalid row.' };
+  const reason = (params.reason || '').toString().trim() || 'Other';
+  const rec = await sbFetch('GET', 'orders?id=eq.' + (row - 2) + '&select=order_no,sku,is_done');
+  if (!rec || !rec[0]) return { success: false, error: 'Order not found.' };
+  const nowIso = new Date().toISOString();
+  try {
+    await sbUpdate('orders', row - 2, { is_done: true, done_at: nowIso, cleanup_at: nowIso, cleanup_by: (params.authenticatedName || 'admin'), cleanup_note: reason });
+  } catch (e) {
+    return { success: false, error: 'Run the data-cleanup SQL (cleanup_at / cleanup_by / cleanup_note columns) first.' };
+  }
+  logOrderEvent({ orderId: row - 2, orderNo: rec[0].order_no, sku: rec[0].sku }, 'admin', 'Data cleanup — ' + reason, actorOf(params));
+  return { success: true, at: nowIso, reason };
+}
+async function doUndoCleanup(params) {
+  if (params.role !== 'admin') return { success: false, error: 'Only the admin can undo a data cleanup.' };
+  const row = parseRow(params);
+  if (!row) return { success: false, error: 'Invalid row.' };
+  await sbUpdate('orders', row - 2, { is_done: false, done_at: null, cleanup_at: null, cleanup_by: null, cleanup_note: null });
   return { success: true };
 }
 
