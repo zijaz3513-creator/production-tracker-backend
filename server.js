@@ -436,14 +436,18 @@ async function doAddStaff(params) {
 
   const existing = await sbFetch(
     'GET',
-    `staff?select=id&role=eq.${staffRole}&name=eq.${encodeURIComponent(name)}&active=eq.true&limit=1`
+    `staff?select=id,active&role=eq.${staffRole}&name=eq.${encodeURIComponent(name)}&limit=1`
   );
-  if (existing && existing.length) {
-    return { success: false, error: 'That name is already on the list.' };
-  }
-
   const nextOrder = current.reduce((max, s) => Math.max(max, s.sort_order || 0), 0) + 1;
   const { hash, salt } = hashPassword(password);
+  if (existing && existing.length) {
+    if (existing[0].active) return { success: false, error: 'That name is already on the list.' };
+    // Removed earlier (rows are only deactivated, and role+name is unique) — bring it back with the new password.
+    await sbFetch('PATCH', `staff?id=eq.${existing[0].id}`, {
+      password_hash: hash, password_salt: salt, active: true, sort_order: nextOrder
+    }, { Prefer: 'return=minimal' });
+    return { success: true };
+  }
   await sbInsertOne('staff', {
     role: staffRole, name,
     password_hash: hash, password_salt: salt,
@@ -466,6 +470,18 @@ const RENAME_CASCADE = {
   patternmaster: [['design_samples', 'master']],
   handembworker: [['orders', 'hand_emb_person']]
 };
+async function doSetStaffPassword(params) {
+  const id = parseInt(params.id, 10);
+  const password = (params.password || '').toString();
+  if (!id) return { success: false, error: 'Invalid id.' };
+  if (password.length < 4) return { success: false, error: 'Password must be at least 4 characters.' };
+  const rows = await sbFetch('GET', `staff?select=id,name&id=eq.${id}&active=eq.true&limit=1`);
+  if (!rows || !rows.length) return { success: false, error: 'Not found.' };
+  const { hash, salt } = hashPassword(password);
+  await sbFetch('PATCH', `staff?id=eq.${id}`, { password_hash: hash, password_salt: salt }, { Prefer: 'return=minimal' });
+  return { success: true, name: rows[0].name };
+}
+
 async function doRenameStaff(params) {
   const id = parseInt(params.id, 10);
   const newName = (params.newName || '').toString().trim();
@@ -860,6 +876,7 @@ async function routeActionInner(action, params) {
     case 'addStaff': return doAddStaff(params);
     case 'removeStaff': return doRemoveStaff(params);
     case 'renameStaff': return doRenameStaff(params);
+    case 'setStaffPassword': return doSetStaffPassword(params);
     case 'setDisplayName': return doSetDisplayName(params);
     case 'reorderStaff': return doReorderStaff(params);
 
