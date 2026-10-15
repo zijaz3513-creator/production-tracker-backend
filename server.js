@@ -255,11 +255,12 @@ const MAX_FABRIC_SLOTS = 6;
 // Which actions each role may call. Admin bypasses this check entirely.
 const ROLE_PERMISSIONS = {
   inventory: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'updateFabric', 'updateFabricDetails', 'updateMachEmb', 'updateHandEmb', 'markDone'],
-  master: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'updateTailor', 'sendOrderEmb', 'embReady', 'embMasterReceive', 'masterStart', 'masterPause', 'masterResume', 'masterFinish', 'masterReturn'],
+  master: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'updateTailor', 'sendOrderEmb', 'embReady', 'embMasterReceive', 'masterStart', 'masterPause', 'masterResume', 'masterFinish'], // masters can no longer return / reject — only QC rejects
   tailor: [
     'getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'markDone', 'sendOrderEmb', 'getSamples', 'markSampleDone', 'sendSampleEmb',
     // Aeon Workstation — tailor floor
-    'atelierMyOrders', 'atelierStartJob', 'atelierPauseJob', 'atelierResumeJob', 'atelierFinishJob', 'atelierReturnJob',
+    'atelierMyOrders', 'atelierStartJob', 'atelierPauseJob', 'atelierResumeJob', 'atelierFinishJob', // tailors can no longer return a job — only QC rejects
+    
     'atelierMechanicCall', 'atelierMyToday', 'atelierMyHistory', 'atelierMyEarnings', 'atelierGetWorkingTimeConfig'
   ],
   // Aeon Workstation supervisor: APPROVALS ONLY (list, approve, reject,
