@@ -902,6 +902,7 @@ async function routeActionInner(action, params) {
     case 'atelierApprovalsList': return doAtelierApprovalsList();
     case 'atelierApproveJob': return doAtelierApproveJob(params);
     case 'atelierRejectJob': return doAtelierRejectJob(params);
+    case 'atelierAdminJob': return doAtelierAdminJob(params);
     case 'atelierRevertJob': return doAtelierRevertJob(params);
     case 'atelierTeamToday': return doAtelierTeamToday();
     case 'atelierLiveJobs': return doAtelierLiveJobs();
@@ -1798,6 +1799,7 @@ async function doMasterResume(params) {
   const c = await loadMasterCtx(params); if (c.error) return { success: false, error: c.error };
   if (c.w.st === 'WORK') return { success: true, already: true, work: c.w };
   if (c.w.st !== 'PAUSE') return { success: false, error: 'Nothing to resume.' };
+  if (c.w.reason === ADMIN_STOP_REASON && (params.role || '') === 'master') return { success: false, error: 'The admin stopped this cutting — ask the admin to resume it.' };
   if (c.w.reason === MW_HAND_REASON && ['READY', 'RCVD', 'WORK', 'PAUSE', 'DONE', 'GREEN'].indexOf(parseEmbValue(c.rec.hand_emb).code) !== -1) {
     return { success: false, error: 'The piece is with hand embroidery — receive it back first, then resume.' };
   }
@@ -1811,6 +1813,7 @@ async function doMasterFinish(params) {
   const c = await loadMasterCtx(params); if (c.error) return { success: false, error: c.error };
   if (c.w.st === 'DONE') return { success: true, already: true, work: c.w };
   if (c.w.st !== 'WORK' && c.w.st !== 'PAUSE') return { success: false, error: 'Start cutting before finishing.' };
+  if (c.w.reason === ADMIN_STOP_REASON && (params.role || '') === 'master') return { success: false, error: 'The admin stopped this cutting — ask the admin to resume it.' };
   if (['READY', 'RCVD', 'WORK', 'PAUSE', 'DONE', 'GREEN'].indexOf(parseEmbValue(c.rec.hand_emb).code) !== -1 && c.w.reason === MW_HAND_REASON) {
     return { success: false, error: 'The piece is with hand embroidery — receive it back first.' };
   }
@@ -2610,6 +2613,32 @@ async function atelierUpdateJobWithReason(id, patch) {
   }
 }
 
+const ADMIN_STOP_REASON = 'Stopped by admin';
+// Admin-only: pause / stop / resume a tailor's running job from the Live Tailor View.
+// "Stop" pauses the timer and locks it — the tailor cannot resume until the admin does.
+async function doAtelierAdminJob(params) {
+  const jobId = parseInt(params.jobId, 10);
+  const mode = (params.mode || '').toString();
+  if (!jobId) return { success: false, error: 'Invalid job.' };
+  if (['pause', 'stop', 'resume'].indexOf(mode) === -1) return { success: false, error: 'Invalid action.' };
+  const rows = await sbFetch('GET', `atelier_jobs?id=eq.${jobId}&status=eq.active&select=*&limit=1`);
+  const job = rows && rows[0];
+  if (!job) return { success: false, error: 'This job is no longer in progress.' };
+  const who = (params.authenticatedName || 'Admin').toString();
+  if (mode === 'resume') {
+    if (job.run_since) return { success: true };
+    await atelierPauseRunning(job.tailor, job.id);
+    await atelierUpdateJobWithReason(job.id, { run_since: new Date().toISOString(), pause_reason: null });
+    logLineEvent(job.order_no, job.sku, 'tailoring', 'Tailoring resumed by admin', who);
+    return { success: true };
+  }
+  const reason = mode === 'stop' ? ADMIN_STOP_REASON : 'Paused by admin';
+  const accum = Number(job.accum_ms || 0) + (job.run_since ? (Date.now() - new Date(job.run_since).getTime()) : 0);
+  await atelierUpdateJobWithReason(job.id, { accum_ms: accum, run_since: null, pause_reason: reason });
+  logLineEvent(job.order_no, job.sku, 'tailoring', 'Tailoring ' + (mode === 'stop' ? 'stopped' : 'paused') + ' by admin', who);
+  return { success: true };
+}
+
 async function doAtelierPauseJob(params) {
   const tailor = (params.authenticatedName || '').toString();
   const jobId = parseInt(params.jobId, 10) || null;
@@ -2632,6 +2661,7 @@ async function doAtelierResumeJob(params) {
   const job = jobId ? await getAtelierJobForTailor(tailor, jobId) : await getAtelierActiveJob(tailor);
   if (!job) return { success: false, error: 'No job to resume.' };
   if (job.run_since) return { success: true };
+  if ((job.pause_reason || '') === ADMIN_STOP_REASON) return { success: false, error: 'The admin stopped this job — ask the admin to resume it.' };
   // Only one timer runs at a time — pause whatever else is currently
   // running before resuming this one.
   await atelierPauseRunning(tailor, job.id);
@@ -2655,6 +2685,7 @@ async function doAtelierFinishJob(params) {
   const jobId = parseInt(params.jobId, 10) || null;
   const job = jobId ? await getAtelierJobForTailor(tailor, jobId) : await getAtelierActiveJob(tailor);
   if (!job) return { success: false, error: 'No job to finish.' };
+  if ((job.pause_reason || '') === ADMIN_STOP_REASON) return { success: false, error: 'The admin stopped this job — ask the admin to resume it.' };
   const accum = Number(job.accum_ms || 0) + (job.run_since ? (Date.now() - new Date(job.run_since).getTime()) : 0);
   const now = new Date().toISOString();
   await atelierUpdateJobWithReason(job.id, { accum_ms: accum, run_since: null, status: 'pending', end_at: now, duration_ms: accum, pause_reason: null });
