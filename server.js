@@ -688,7 +688,7 @@ app.all('/api', async (req, res) => {
 });
 
 function checkPermission(action, role) {
-  if (action === 'getOrders' || action === 'getSamples' || action === 'getSkuImages' || action === 'getSkuImage') return null;
+  if (action === 'getOrders' || action === 'getFabricInventory' || action === 'getSamples' || action === 'getSkuImages' || action === 'getSkuImage') return null;
   if (!action) return { success: false, error: 'Missing action.' };
   if (!role) return { success: false, error: 'Missing role — please log in again.' };
   if (role === 'admin') return null;
@@ -829,6 +829,7 @@ async function routeAction(action, params) {
 async function routeActionInner(action, params) {
   switch (action) {
     case 'getOrders': return doGetOrders();
+    case 'getFabricInventory': return doGetFabricInventory();
     case 'getOrder': return doGetOrder(params);
     case 'getOrderByOrderNo': return doGetOrderByOrderNo(params);
     case 'getOrderTimeline': return doGetOrderTimeline(params);
@@ -1007,6 +1008,37 @@ function buildOrderRowArray(rec, inQC, workMs, pausedReason) {
   row[43] = rec.cleanup_by || '';
   row[44] = rec.cleanup_note || '';
   return row;
+}
+
+
+// ---- Fabric inventory: reads stock + SKU fabric needs from the Fabric & SKU Register (read-only) ----
+// Set FABRIC_REGISTER_URL on Render, e.g. https://yourdomain.com/fab/api.php
+let _fabInvCache = { at: 0, data: null };
+async function doGetFabricInventory() {
+  const base = (process.env.FABRIC_REGISTER_URL || 'https://hakayah.com/fab/api.php').trim();
+  if (!base) return { success: true, configured: false, skus: {} };
+  if (_fabInvCache.data && Date.now() - _fabInvCache.at < 60000) return _fabInvCache.data;
+  try {
+    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 20000);
+    const r = await fetch(base + (base.includes('?') ? '&' : '?') + 'resource=all', { signal: ctl.signal });
+    clearTimeout(t);
+    const j = await r.json();
+    const stock = {};
+    (j.fabrics || []).forEach(f => { stock[f.id] = f; });
+    const skus = {};
+    (j.skus || []).forEach(s => {
+      const lines = (s.materials || []).filter(m => m.component === 'fabric' && m.fabric_id && stock[m.fabric_id]).map(m => {
+        const f = stock[m.fabric_id];
+        return { name: f.name || m.material || '', color: f.color_name || m.color_name || '', need: Number(m.quantity) || 0, stock: Number(f.stock) || 0, unit: f.unit || m.unit || 'm' };
+      });
+      skus[String(s.sku || '').toLowerCase().replace(/\s+/g, '')] = lines;
+    });
+    const data = { success: true, configured: true, skus, fetchedAt: new Date().toISOString() };
+    _fabInvCache = { at: Date.now(), data };
+    return data;
+  } catch (e) {
+    return { success: true, configured: true, error: 'Could not read the Fabric register: ' + e.message, skus: {} };
+  }
 }
 
 async function doGetOrders() {
