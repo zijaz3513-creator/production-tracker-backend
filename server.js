@@ -254,7 +254,7 @@ const MAX_FABRIC_SLOTS = 6;
 
 // Which actions each role may call. Admin bypasses this check entirely.
 const ROLE_PERMISSIONS = {
-  inventory: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'updateFabric', 'updateFabricDetails', 'updateMachEmb', 'updateHandEmb', 'markDone'],
+  inventory: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'updateOrderDetails', 'updateFabric', 'updateFabricDetails', 'updateMachEmb', 'updateHandEmb', 'markDone'],
   master: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'updateTailor', 'sendOrderEmb', 'embReady', 'embMasterReceive', 'masterStart', 'masterPause', 'masterResume', 'masterFinish'], // masters can no longer return / reject — only QC rejects
   tailor: [
     'getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'markDone', 'sendOrderEmb', 'getSamples', 'markSampleDone', 'sendSampleEmb',
@@ -268,7 +268,7 @@ const ROLE_PERMISSIONS = {
   // payroll, mechanic calls and find-job live in the Admin panel and are
   // deliberately not granted here.
   atelier_supervisor: [
-    'atelierApprovalsList', 'atelierApproveJob', 'atelierRejectJob', 'atelierRevertJob',
+    'atelierApprovalsList', 'atelierApproveJob', 'atelierRejectJob', 'atelierRevertJob', 'atelierSendToEmbroidery',
     'atelierFindPendingByCode', 'atelierGetWorkingTimeConfig',
     // Ready-made items: supervisor scans, then approves or rejects
     'readyMadeList', 'readyMadeFindByCode', 'readyMadeApprove', 'readyMadeReject'
@@ -284,7 +284,7 @@ const ROLE_PERMISSIONS = {
   // Same access as Admin, except it cannot delete orders/samples or remove
   // staff — those three stay Admin-only.
   fulfillment: [
-    'getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'addOrder', 'updateFabric', 'updateFabricDetails',
+    'getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'addOrder', 'updateOrderDetails', 'updateFabric', 'updateFabricDetails',
     'updateMachEmb', 'updateHandEmb', 'updateMaster', 'updateTailor',
     'masterStart', 'masterPause', 'masterResume', 'masterFinish', 'masterReturn',
     'setEmbPerson', 'embAdminReceive', 'embReady', 'embMasterReceive', 'embAssignWorker',
@@ -296,7 +296,7 @@ const ROLE_PERMISSIONS = {
     'atelierLiveJobs',
     // QC-style approvals: approve when QC is not available, or send a piece
     // back (Tailor / Master / Fabric) — including ones QC approved by mistake.
-    'atelierApprovalsList', 'atelierApproveJob', 'atelierRejectJob', 'atelierRevertJob',
+    'atelierApprovalsList', 'atelierApproveJob', 'atelierRejectJob', 'atelierRevertJob', 'atelierSendToEmbroidery',
     'atelierRecentApproved',
     'readyMadeList', 'readyMadeFindByCode', 'readyMadeApprove', 'readyMadeReject'
   ]
@@ -903,6 +903,8 @@ async function routeActionInner(action, params) {
     case 'atelierApprovalsList': return doAtelierApprovalsList();
     case 'atelierApproveJob': return doAtelierApproveJob(params);
     case 'atelierRejectJob': return doAtelierRejectJob(params);
+    case 'updateOrderDetails': return doUpdateOrderDetails(params);
+    case 'atelierSendToEmbroidery': return doAtelierSendToEmbroidery(params);
     case 'atelierAdminJob': return doAtelierAdminJob(params);
     case 'atelierRevertJob': return doAtelierRevertJob(params);
     case 'atelierTeamToday': return doAtelierTeamToday();
@@ -1246,7 +1248,7 @@ async function doAddOrder(params) {
   const sku = (params.sku || '').toString().trim();
   if (!orderNo || !sku) return { success: false, error: 'Order # and SKU are required.' };
 
-  const GARMENT_TYPES = ['Abaya', 'Vest', 'Pant', 'Skirt', 'Dress', 'Bisht', 'Blouse'];
+  const GARMENT_TYPES = ['Abaya', 'Vest', 'Pant', 'Skirt', 'Dress', 'Bisht', 'Blouse', 'Jumpsuit'];
   const garmentType = (params.garmentType || '').toString().trim();
   if (GARMENT_TYPES.indexOf(garmentType) === -1) {
     return { success: false, error: 'Please select a valid garment type.' };
@@ -2089,6 +2091,31 @@ async function doDeleteOrder(params) {
   return { success: true };
 }
 
+
+// Edit an order's details exactly as they were entered when it was added (used by the "needs alteration" flow).
+async function doUpdateOrderDetails(params) {
+  const row = parseRow(params);
+  if (!row) return { success: false, error: 'Invalid row.' };
+  const GARMENT_TYPES = ['Abaya', 'Vest', 'Pant', 'Skirt', 'Dress', 'Bisht', 'Blouse', 'Jumpsuit'];
+  const ORDER_TYPES = ['Simple', 'Hand Embroidery', 'Machine Embroidery'];
+  const garmentType = (params.garmentType || '').toString().trim();
+  const orderType = (params.orderType || '').toString().trim();
+  if (GARMENT_TYPES.indexOf(garmentType) === -1) return { success: false, error: 'Please select a valid garment type.' };
+  if (ORDER_TYPES.indexOf(orderType) === -1) return { success: false, error: 'Please select a valid order type.' };
+  const urgent = (params.urgent === 'Yes');
+  const urgentDate = urgent ? (params.urgentDate || '').toString() : '';
+  if (urgent && !urgentDate) return { success: false, error: 'Urgent orders require a "Produce by" date.' };
+  const t = k => (params[k] || '').toString();
+  await sbUpdate('orders', row - 2, {
+    garment_type: garmentType, order_type: orderType, notes: t('notes'),
+    chest: t('chest'), sleeve: t('sleeve'), shoulder: t('shoulder'), armfit: t('armfit'), length: t('length'), size: t('size'),
+    urgent, urgent_due_date: urgentDate || null
+  });
+  const orderNo = await getOrderNo(row);
+  logOrderEvent({ orderId: row - 2, orderNo }, 'edited', 'Order details edited for alteration', (params.authenticatedName || params.role || '').toString());
+  return { success: true };
+}
+
 async function doUpdateUrgent(params) {
   const row = parseRow(params);
   if (!row) return { success: false, error: 'Invalid row.' };
@@ -2902,9 +2929,62 @@ async function doAtelierRecentApproved(params) {
   };
 }
 
+// ---- QC → Embroidery: after stitching, QC can send the piece to machine (Abdullah / Asif) or hand (Akil)
+// embroidery. The order carries a marker in rework_note; the embroidery desks use their normal screens, and when
+// they finish, the job is back in QC (state 'done') for final approval. No new DB columns. ----
+const QC_EMB_MARK = '🧵 QC → Embroidery';
+const EMB_ACTIVE = ['NEED', 'RED', 'SENT', 'READY', 'RCVD', 'WORK', 'PAUSE'];
+function qcEmbInfo(rec) {
+  if (!rec || !rec.rework_note || rec.rework_note.indexOf(QC_EMB_MARK) !== 0) return null;
+  const m = /\((machine|hand) · ([^)]+)\)/.exec(rec.rework_note) || [];
+  const kind = m[1] || 'mach', person = m[2] || '';
+  const k = kind === 'hand' ? 'hand' : 'mach';
+  const code = parseEmbValue(k === 'hand' ? rec.hand_emb : rec.machine_emb).code;
+  const live = k === 'hand' ? (rec.hand_emb_person || person) : (rec.mach_emb_person || person);
+  return { kind: k, person: live, code, state: EMB_ACTIVE.indexOf(code) !== -1 ? 'with' : 'done' };
+}
+async function attachEmbInfo(jobs) {
+  for (const j of jobs) {
+    if (!j.orderNo || !j.sku) continue;
+    const rows = await sbFetch('GET', `orders?order_no=eq.${encodeURIComponent(j.orderNo)}&sku=eq.${encodeURIComponent(j.sku)}&is_done=eq.false&select=rework_note,machine_emb,hand_emb,mach_emb_person,hand_emb_person&limit=1`);
+    const e = qcEmbInfo(rows && rows[0]);
+    if (e) j.emb = e;
+  }
+  return jobs;
+}
+async function doAtelierSendToEmbroidery(params) {
+  const id = parseInt(params.jobId, 10);
+  if (!id) return { success: false, error: 'Invalid job id.' };
+  const kind = (params.kind || '').toString();
+  let person = (params.person || '').toString();
+  if (kind === 'hand') person = 'Akil';
+  else if (kind === 'mach') { if (MACH_PEOPLE.indexOf(person) === -1) return { success: false, error: 'Choose Abdullah or Asif.' }; }
+  else return { success: false, error: 'Choose machine or hand embroidery.' };
+  const approver = (params.authenticatedName || params.role || '').toString();
+  const rows = await sbFetch('GET', `atelier_jobs?id=eq.${id}&select=*&limit=1`);
+  const job = rows && rows[0];
+  if (!job) return { success: false, error: 'Job not found.' };
+  if (job.status !== 'pending') return { success: false, error: 'This job is not pending approval.' };
+  if (job.tailor === approver) return { success: false, error: 'You cannot review your own work.' };
+  if (!job.order_no || !job.sku) return { success: false, error: 'This job has no order line to send.' };
+  const orows = await sbFetch('GET', `orders?order_no=eq.${encodeURIComponent(job.order_no)}&sku=eq.${encodeURIComponent(job.sku)}&is_done=eq.false&select=id,rework_note,machine_emb,hand_emb,mach_emb_person,hand_emb_person&order=id.desc&limit=1`);
+  const rec = orows && orows[0];
+  if (!rec) return { success: false, error: 'Order line not found.' };
+  const cur = qcEmbInfo(rec);
+  if (cur && cur.state === 'with') return { success: false, error: 'Already with ' + cur.person + ' for embroidery.' };
+  const stamp = embStampNow();
+  const patch = { rework_note: `${QC_EMB_MARK} (${kind === 'hand' ? 'hand' : 'machine'} · ${person}) — sent by ${approver}, ${stamp}. Comes back to QC when done.` };
+  if (kind === 'mach') { patch.machine_emb = (person === 'Asif' ? 'SENT|' : 'NEED|') + stamp; patch.mach_emb_person = person; }
+  else { patch.hand_emb = 'READY|' + stamp; patch.hand_emb_person = null; }
+  await sbUpdate('orders', rec.id, patch);
+  logLineEvent(job.order_no, job.sku, 'embroidery', `QC sent to ${kind === 'hand' ? 'HAND' : 'MACHINE'} embroidery (${person}) by ${approver} — returns to QC when done`, approver);
+  pushShopifyUpdate(job.order_no, `${kind === 'hand' ? 'Hand' : 'Machine'} embroidery — with ${person} (from QC)`);
+  return { success: true, kind, person };
+}
+
 async function doAtelierApprovalsList() {
   const rows = (await sbFetch('GET', 'atelier_jobs?status=eq.pending&select=*&order=end_at.asc')) || [];
-  return { success: true, jobs: await withLineTotals(rows) };
+  return { success: true, jobs: await attachEmbInfo(await withLineTotals(rows)) };
 }
 
 // ---- Supervisor scan-to-approve: look up the Atelier job for a scanned
@@ -2934,7 +3014,7 @@ async function doAtelierFindPendingByCode(params) {
 
   const pending = (await sbFetch('GET', `atelier_jobs?${base}&status=eq.pending&select=*&order=created_at.desc&limit=3`)) || [];
   if (pending.length) {
-    return { success: true, job: (await withLineTotals([pending[0]]))[0], matchStatus: 'pending' };
+    return { success: true, job: (await attachEmbInfo(await withLineTotals([pending[0]])))[0], matchStatus: 'pending' };
   }
   const any = await sbFetch('GET', `atelier_jobs?${base}&select=*&order=created_at.desc&limit=1`);
   if (any && any[0]) return { success: true, job: formatAtelierJob(any[0]), matchStatus: any[0].status };
@@ -2942,6 +3022,12 @@ async function doAtelierFindPendingByCode(params) {
   return { success: false, error: 'No Atelier job found yet for this order/SKU.' };
 }
 
+async function qcEmbBlock(job) {
+  if (!job.order_no || !job.sku) return null;
+  const rows = await sbFetch('GET', `orders?order_no=eq.${encodeURIComponent(job.order_no)}&sku=eq.${encodeURIComponent(job.sku)}&is_done=eq.false&select=rework_note,machine_emb,hand_emb,mach_emb_person,hand_emb_person&limit=1`);
+  const e = qcEmbInfo(rows && rows[0]);
+  return e && e.state === 'with' ? { success: false, error: 'This piece is with ' + e.person + ' for embroidery — it comes back to QC when they finish.' } : null;
+}
 async function doAtelierApproveJob(params) {
   const id = parseInt(params.jobId, 10);
   if (!id) return { success: false, error: 'Invalid job id.' };
@@ -2952,6 +3038,7 @@ async function doAtelierApproveJob(params) {
   if (!job) return { success: false, error: 'Job not found.' };
   if (job.status !== 'pending') return { success: false, error: 'This job is not pending approval.' };
   if (job.tailor === approver) return { success: false, error: 'You cannot approve your own work.' }; // enforced server-side, not just in the UI
+  { const blk = await qcEmbBlock(job); if (blk) return blk; }
 
   // Piece count is fixed — approvers can't change it (any correctedQty sent is ignored).
   const qty = job.qty;
@@ -3025,6 +3112,7 @@ async function doAtelierRejectJob(params) {
   const wasApproved = job.status === 'approved' && (params.role === 'admin' || params.role === 'fulfillment');
   if (job.status !== 'pending' && !wasApproved) return { success: false, error: 'This job is not pending approval.' };
   if (job.tailor === approver) return { success: false, error: 'You cannot review your own work.' };
+  if (job.status === 'pending') { const blk = await qcEmbBlock(job); if (blk) return blk; }
   const reopen = wasApproved ? { is_done: false, done_at: null } : {};
 
   const jobPatch = {
