@@ -1327,6 +1327,10 @@ async function doUpdateFabric(params) {
     // meaningless for Available or either Ready Made status.
     patch.fabric_source = null;
     patch.fabric_purchase_status = null;
+    // Ready-made piece that needs alteration: it continues as a normal order but keeps its ready-made tag
+    // (stored as "RM:Factory" / "RM:Stock" in fabric_source, which is otherwise only used for Not Available).
+    const rmTag = (params.rmTag || '').toString();
+    if (value === 'Available' && (rmTag === 'Factory' || rmTag === 'Stock')) patch.fabric_source = 'RM:' + rmTag;
   }
 
   if (isReadyMadeStatus(value)) {
@@ -2041,7 +2045,7 @@ async function doReadyMadeReject(params) {
   const stamp = new Date().toLocaleString();
   const now = new Date().toISOString();
   // Leaves the ready-made status so the piece re-enters normal production.
-  const base = { fabric_source: null, fabric_purchase_status: null };
+  const base = { fabric_source: (chk.rec && chk.rec.fabric_status === 'Ready Made - Found in Factory') ? 'RM:Factory' : (chk.rec && chk.rec.fabric_status === 'Ready Made - Stock') ? 'RM:Stock' : null, fabric_purchase_status: null };
   let patch;
   if (reason === 'tailor') {
     if (!person) return { success: false, error: 'Please select the tailor number.' };
