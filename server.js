@@ -143,6 +143,41 @@ async function pushShopifyUpdate(orderNo, statusLine) {
   }
 }
 
+// ============================================================
+// Dousideh (the shop) sync — every timeline step of an order line is also
+// sent to the shop, so the order page there shows the same timeline. When a
+// line is Done (QC approved / production complete) the shop marks that piece
+// fulfilled; when a Done line is reopened (QC approved it by mistake and it
+// was sent back) the shop marks it unfulfilled again.
+// Set on Render: DOUSIDEH_URL  = the "Updates address" shown in Dousideh
+//                               (Settings → Connections → Production Tracker)
+//                DOUSIDEH_SECRET = the secret shown next to it.
+// Best-effort and fire-and-forget, with a few retries; never blocks an action.
+// Dousideh sends orders IN through the normal /api with the API_KEY header.
+// ============================================================
+const DOUSIDEH_URL = process.env.DOUSIDEH_URL;
+const DOUSIDEH_SECRET = process.env.DOUSIDEH_SECRET;
+const DOUSIDEH_ENABLED = !!(DOUSIDEH_URL && DOUSIDEH_SECRET);
+if (!DOUSIDEH_ENABLED) {
+  console.warn('Dousideh sync disabled — set DOUSIDEH_URL and DOUSIDEH_SECRET to send the timeline to the shop.');
+}
+const DOUSIDEH_RETRY_MS = [5000, 30000, 120000, 600000];
+function pushDousideh(ev, attempt) {
+  attempt = attempt || 0;
+  if (!DOUSIDEH_ENABLED || !ev || !ev.orderNo) return;
+  fetch(DOUSIDEH_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-tracker-secret': DOUSIDEH_SECRET },
+    body: JSON.stringify(ev)
+  }).then(res => {
+    if (res.status === 401) { console.error('Dousideh sync: the shop did not accept DOUSIDEH_SECRET — copy it again from Dousideh.'); return; }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+  }).catch(e => {
+    if (attempt < DOUSIDEH_RETRY_MS.length) setTimeout(() => pushDousideh(ev, attempt + 1), DOUSIDEH_RETRY_MS[attempt]);
+    else console.error('Dousideh sync failed for order ' + ev.orderNo + ':', e.message);
+  });
+}
+
 // Looks up an order's order_no from its internal row/id — used by the
 // update handlers below to know what to sync to Shopify. Short-circuits
 // instantly (no DB call) when Shopify sync isn't configured, so this adds
@@ -714,13 +749,17 @@ function actorOf(params) {
 // Fire-and-forget insert. `line` = { orderId?, orderNo, sku }.
 function logOrderEvent(line, kind, text, actor) {
   if (!line || (!line.orderId && !line.orderNo)) return;
+  const at = new Date().toISOString();
   sbFetch('POST', 'order_events', {
     order_id: line.orderId || null,
     order_no: line.orderNo || null,
     sku: line.sku || null,
     kind, text: String(text || ''), actor: actor || null,
-    at: new Date().toISOString()
+    at
   }, { Prefer: 'return=minimal' }).catch(e => console.error('order_events insert failed:', e.message));
+  // the same step on the shop's order timeline (row = the line, so the shop knows which piece)
+  pushDousideh({ orderNo: line.orderNo || null, sku: line.sku || null, row: line.orderId != null ? line.orderId + 2 : null,
+                 kind, text: String(text || ''), actor: actor || null, at });
 }
 
 // For handlers that only know order_no + sku (Atelier jobs): resolve the row id.
@@ -833,6 +872,8 @@ async function routeActionInner(action, params) {
     case 'getOrder': return doGetOrder(params);
     case 'getOrderByOrderNo': return doGetOrderByOrderNo(params);
     case 'getOrderTimeline': return doGetOrderTimeline(params);
+    case 'dousidehPing': return { success: true, sendsBack: DOUSIDEH_ENABLED };
+    case 'dousidehOrderEvents': return doDousidehOrderEvents(params);
     case 'addOrder': return doAddOrder(params);
     case 'updateFabric': return doUpdateFabric(params);
     case 'updateFabricDetails': return doUpdateFabricDetails(params);
@@ -1236,6 +1277,25 @@ async function doGetOrderTimeline(params) {
       createdAt: rec.created_at || null, isDone: !!rec.is_done, urgent: !!rec.urgent
     },
     events: all
+  };
+}
+
+// For Dousideh (API key = admin only): every line of one order number and
+// every recorded step, so the shop can link its items to the Tracker lines,
+// skip pieces already here, and copy the whole timeline.
+async function doDousidehOrderEvents(params) {
+  const orderNo = (params.orderNo || '').toString().trim().replace(/^#/, '');
+  if (!orderNo) return { success: false, error: 'Order number is required.' };
+  const q = encodeURIComponent(orderNo);
+  const rows = ((await sbFetch('GET', `orders?order_no=eq.${q}&select=id,order_no,sku,is_done&order=id.asc&limit=200`)) || []).filter(r => !isBlankOrder_(r));
+  let events = [];
+  try {
+    events = (await sbFetch('GET', `order_events?order_no=eq.${q}&select=order_id,sku,at,kind,text,actor&order=at.asc,id.asc&limit=2000`)) || [];
+  } catch (e) { console.error('order_events read failed:', e.message); }
+  return {
+    success: true,
+    lines: rows.map(r => ({ row: r.id + 2, sku: r.sku || '', isDone: !!r.is_done })),
+    events: events.map(e => ({ row: e.order_id != null ? e.order_id + 2 : null, sku: e.sku || '', at: e.at, kind: e.kind, text: e.text, actor: e.actor || '' }))
   };
 }
 
@@ -3190,6 +3250,11 @@ async function doAtelierRejectJob(params) {
         await sbUpdate('orders', orderRec.id, Object.assign({
           rework_note: `⚠️ Rejected — Tailor's issue (${job.tailor}) — please redo. By ${approver}, ${stamp}.`
         }, reopen));
+      }
+      // QC had approved it by mistake: the line is open again (the shop marks the piece unfulfilled)
+      if (wasApproved) {
+        logOrderEvent({ orderId: orderRec.id, orderNo: job.order_no, sku: job.sku }, 'reopened',
+          `QC approval undone by ${approver} — the piece was sent back (${reason}), order line reopened`, approver);
       }
     }
   }
