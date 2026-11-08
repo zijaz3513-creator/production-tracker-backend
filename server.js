@@ -310,7 +310,7 @@ const ROLE_PERMISSIONS = {
   ],
   // Order embroidery desks: scan to receive, scan to start the timer, then
   // pause / finish / return. Each role is locked to its own kind server-side.
-  handemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'getSamples', 'receiveSampleEmb', 'embReceive', 'embAssignWorker', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn'],
+  handemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'getSamples', 'receiveSampleEmb', 'embReceive', 'embAssignWorker', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn', 'handPartsList', 'handPartStart', 'handPartPause', 'handPartResume', 'handPartFinish', 'handSplit', 'handPartAdd', 'handPartReassign', 'handPartRemove'],
   machemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'getSamples', 'receiveSampleEmb', 'embReceive', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn'],
   designer: ['getSamples', 'addSample'],
   patternmaster: ['getSamples', 'assignSampleTailor', 'startSamplePattern'],
@@ -504,7 +504,7 @@ const RENAME_CASCADE = {
   tailor: [['orders', 'tailor'], ['design_samples', 'tailor'], ['atelier_jobs', 'tailor'], ['atelier_calls', 'tailor']],
   master: [['orders', 'master'], ['atelier_jobs', 'master']],
   patternmaster: [['design_samples', 'master']],
-  handembworker: [['orders', 'hand_emb_person']]
+  handembworker: [['orders', 'hand_emb_person'], ['hand_emb_parts', 'person']]
 };
 async function doSetStaffPassword(params) {
   const id = parseInt(params.id, 10);
@@ -885,6 +885,12 @@ async function routeActionInner(action, params) {
     case 'embAssignWorker': return doEmbAssignWorker(params);
     case 'embAdminReceive': return doEmbAdminReceive(params);
     case 'embMasterReceive': return doEmbMasterReceive(params);
+    case 'handPartsList': return doHandPartsList(params);
+    case 'handSplit': return doHandSplit(params);
+    case 'handPartAdd': return doHandPartAdd(params);
+    case 'handPartReassign': return doHandPartReassign(params);
+    case 'handPartRemove': return doHandPartRemove(params);
+    case 'handPartStart': case 'handPartPause': case 'handPartResume': case 'handPartFinish': return doHandPartAct(action, params);
     case 'embReceive': return doEmbReceive(params);
     case 'embStart': return doEmbStart(params);
     case 'embPause': return doEmbPause(params);
@@ -1572,6 +1578,7 @@ async function doEmbAssignWorker(params) {
   const rec = await loadEmbRec(row);
   if (!rec) return { success: false, error: 'Order not found.' };
   if (parseEmbValue(rec.hand_emb).code !== 'RCVD') return { success: false, error: 'Receive the order first, then assign a person.' };
+  if ((await getHandParts(row - 2)).length) return { success: false, error: 'This order is split between several people already.' };
   await sbUpdate('orders', row - 2, { hand_emb_person: worker });
   return { success: true, kind: 'hand', person: worker };
 }
@@ -1668,6 +1675,7 @@ async function loadEmbOrder(params) {
     const workers = await getActiveStaffNames('handembworker');
     if (workers.indexOf(nm) !== -1 && person !== nm) return { error: person ? 'This order is assigned to ' + person + ', not you.' : 'This order has not been assigned to a person yet.' };
   }
+  if (k.kind === 'hand' && !params._allowSplit && (await getHandParts(row - 2)).length) return { error: 'This order is split between several people — use the parts list (each person starts and finishes their own part).' };
   return { rec, col, kind: k.kind, id: row - 2, person: person || '', cur: parseEmbValue(rec[col]) };
 }
 async function saveEmb(ctx, value) {
@@ -1770,7 +1778,7 @@ async function doEmbFinish(params) {
 // Gives the order back to the start of this desk's step. The timer for that
 // attempt is dropped.
 async function doEmbReturn(params) {
-  const ctx = await loadEmbOrder(params);
+  const ctx = await loadEmbOrder(Object.assign({}, params, { _allowSplit: true }));
   if (ctx.error) return { success: false, error: ctx.error };
   if (['RCVD', 'WORK', 'PAUSE'].indexOf(ctx.cur.code) === -1 && !(ctx.kind === 'mach' && ctx.cur.code === 'SENT') && !(ctx.kind === 'hand' && ctx.cur.code === 'READY')) {
     return { success: false, error: 'Nothing to return — this order is not with you.' };
@@ -1778,10 +1786,201 @@ async function doEmbReturn(params) {
   let value;
   if (ctx.kind === 'mach') value = (ctx.person === 'Asif' ? 'SENT|' : 'NEED|') + embStampNow();
   else value = 'READY|' + embStampNow();
-  if (ctx.kind === 'hand') await sbUpdate('orders', ctx.id, { hand_emb: value, hand_emb_person: null });
+  if (ctx.kind === 'hand') { await deleteHandParts(ctx.id); await sbUpdate('orders', ctx.id, { hand_emb: value, hand_emb_person: null }); }
   else await saveEmb(ctx, value);
   return { success: true, value, person: ctx.person };
 }
+
+
+// ============================================================
+// HAND EMBROIDERY — SPLIT BETWEEN SEVERAL PEOPLE (table hand_emb_parts, see hand_emb_parts.sql)
+// The desk (Akil) receives a piece and can either assign ONE person (old flow) or SPLIT it into parts, each
+// with its own person, label (e.g. "Sleeves"), status and timer. The order's hand_emb text still drives every
+// other screen: hand_emb_person = "Ali + Sara", state WORK while any part has started, DONE when all parts are done.
+// ============================================================
+const HAND_SEP = ' + ';
+async function getHandParts(orderId) {
+  try { return (await sbFetch('GET', `hand_emb_parts?order_id=eq.${orderId}&select=*&order=id.asc`)) || []; }
+  catch (e) { return []; }
+}
+async function deleteHandParts(orderId) {
+  try { await sbFetch('DELETE', `hand_emb_parts?order_id=eq.${orderId}`, undefined, { Prefer: 'return=minimal' }); } catch (e) {}
+}
+const handPartMs = p => Number(p.accum_ms || 0) + (p.status === 'working' && p.run_since ? Math.max(0, Date.now() - Number(p.run_since)) : 0);
+function fmtHandPart(p) {
+  return { id: p.id, row: Number(p.order_id) + 2, orderNo: p.order_no, sku: p.sku, person: p.person, label: p.label || '', status: p.status,
+    accumMs: Number(p.accum_ms || 0), runSince: p.run_since ? Number(p.run_since) : 0, pauseReason: p.pause_reason || '',
+    startedAt: p.started_at, finishedAt: p.finished_at, assignedBy: p.assigned_by || '' };
+}
+// Is the caller the hand desk (or admin)? Workers may only touch their own parts.
+async function handCallerIsWorker(params) {
+  const role = (params.role || '').toString(), nm = (params.authenticatedName || '').toString();
+  if (role !== 'handemb' || !nm) return false;
+  const workers = await getActiveStaffNames('handembworker');
+  return workers.indexOf(nm) !== -1;
+}
+// Recomputes the order's hand_emb text + person string from its parts.
+async function syncHandOrder(orderId, parts, actor) {
+  parts = parts || await getHandParts(orderId);
+  const names = []; parts.forEach(p => { if (names.indexOf(p.person) === -1) names.push(p.person); });
+  const patch = { hand_emb_person: names.length ? names.join(HAND_SEP) : null };
+  const started = parts.filter(p => p.started_at);
+  const allDone = parts.length > 0 && parts.every(p => p.status === 'done');
+  const first = started.length ? Math.min(...started.map(p => Date.parse(p.started_at))) : 0;
+  const stamp = embStampNow();
+  let done = false;
+  if (allDone) {
+    const last = Math.max(...parts.map(p => Date.parse(p.finished_at || p.started_at) || Date.now()));
+    patch.hand_emb = `DONE|${stamp}|${Math.max(0, Math.round(last - first))}`; done = true;
+  } else if (parts.some(p => p.status === 'working')) {
+    patch.hand_emb = `WORK|${stamp}|0|${first || Date.now()}`;
+  } else if (started.length) {
+    patch.hand_emb = `PAUSE|${stamp}|${Math.max(0, Math.round(Date.now() - first))}|Parts paused`;
+  }
+  await sbUpdate('orders', orderId, patch);
+  return { done, names };
+}
+async function handLoadOrder(row) {
+  const rows = await sbFetch('GET', `orders?id=eq.${row - 2}&select=id,order_no,sku,hand_emb,hand_emb_person,is_done&limit=1`);
+  return rows && rows[0];
+}
+async function doHandPartsList(params) {
+  let parts = [];
+  try {
+    if (params.row) {
+      parts = await getHandParts(parseRow(params) - 2);
+    } else {
+      const open = (await sbFetch('GET', `hand_emb_parts?status=neq.done&select=*&order=id.asc`)) || [];
+      const ids = Array.from(new Set(open.map(p => p.order_id)));
+      parts = open;
+      if (ids.length) parts = parts.concat((await sbFetch('GET', `hand_emb_parts?status=eq.done&order_id=in.(${ids.join(',')})&select=*&order=id.asc`)) || []);
+    }
+  } catch (e) { return { success: true, parts: [], setupNeeded: true }; }
+  return { success: true, parts: parts.map(fmtHandPart), now: Date.now() };
+}
+async function doHandSplit(params) {
+  const row = parseRow(params);
+  if (!row) return { success: false, error: 'Invalid row.' };
+  if (await handCallerIsWorker(params)) return { success: false, error: 'Only the hand-embroidery desk can split an order.' };
+  const rec = await handLoadOrder(row);
+  if (!rec) return { success: false, error: 'Order not found.' };
+  const code = parseEmbValue(rec.hand_emb).code;
+  if (code !== 'RCVD') return { success: false, error: 'Receive the order first (and split it before work starts).' };
+  if ((await getHandParts(rec.id)).length) return { success: false, error: 'This order is already split.' };
+  const workers = await getActiveStaffNames('handembworker');
+  const list = Array.isArray(params.parts) ? params.parts : [];
+  const seen = {};
+  for (const p of list) {
+    const person = (p.person || '').toString().trim();
+    if (workers.indexOf(person) === -1) return { success: false, error: 'Unknown hand-embroidery person: ' + person };
+    if (seen[person]) return { success: false, error: person + ' is listed twice.' };
+    seen[person] = true;
+  }
+  if (list.length < 2) return { success: false, error: 'Pick at least two people to split between.' };
+  const by = (params.authenticatedName || params.role || '').toString();
+  try {
+    await sbInsertMany('hand_emb_parts', list.map((p, i) => ({ order_id: rec.id, order_no: rec.order_no, sku: rec.sku, person: p.person.toString().trim(),
+      label: (p.label || '').toString().trim().slice(0, 60) || ('Part ' + (i + 1)), status: 'assigned', assigned_by: by })));
+  } catch (e) { return { success: false, error: 'Split needs the hand_emb_parts table — run hand_emb_parts.sql in Supabase first.' }; }
+  await syncHandOrder(rec.id);
+  logOrderEvent({ orderId: rec.id, orderNo: rec.order_no, sku: rec.sku }, 'embroidery', `Hand embroidery split between ${list.map(p => p.person + ' (' + ((p.label || '').toString().trim() || 'part') + ')').join(', ')}`, by);
+  pushShopifyUpdate(rec.order_no, `Hand embroidery — split between ${list.map(p => p.person).join(', ')}`);
+  return { success: true };
+}
+async function doHandPartAdd(params) {
+  const row = parseRow(params);
+  if (!row) return { success: false, error: 'Invalid row.' };
+  if (await handCallerIsWorker(params)) return { success: false, error: 'Only the hand-embroidery desk can add people.' };
+  const rec = await handLoadOrder(row);
+  if (!rec) return { success: false, error: 'Order not found.' };
+  if (['RCVD', 'WORK', 'PAUSE'].indexOf(parseEmbValue(rec.hand_emb).code) === -1) return { success: false, error: 'This order is not in hand embroidery right now.' };
+  const parts = await getHandParts(rec.id);
+  if (!parts.length) return { success: false, error: 'This order is not split.' };
+  const person = (params.person || '').toString().trim();
+  if ((await getActiveStaffNames('handembworker')).indexOf(person) === -1) return { success: false, error: 'Unknown hand-embroidery person: ' + person };
+  if (parts.some(p => p.person === person && p.status !== 'done')) return { success: false, error: person + ' already has an open part on this order.' };
+  const by = (params.authenticatedName || params.role || '').toString();
+  const label = (params.label || '').toString().trim().slice(0, 60) || ('Part ' + (parts.length + 1));
+  await sbInsertOne('hand_emb_parts', { order_id: rec.id, order_no: rec.order_no, sku: rec.sku, person, label, status: 'assigned', assigned_by: by });
+  await syncHandOrder(rec.id);
+  logOrderEvent({ orderId: rec.id, orderNo: rec.order_no, sku: rec.sku }, 'embroidery', `Hand embroidery — ${person} added (${label})`, by);
+  return { success: true };
+}
+async function handLoadPart(params) {
+  const id = parseInt(params.partId, 10);
+  if (!id) return { error: 'Invalid part.' };
+  const rows = await sbFetch('GET', `hand_emb_parts?id=eq.${id}&select=*&limit=1`);
+  const part = rows && rows[0];
+  if (!part) return { error: 'Part not found.' };
+  return { part };
+}
+async function doHandPartReassign(params) {
+  if (await handCallerIsWorker(params)) return { success: false, error: 'Only the hand-embroidery desk can reassign.' };
+  const r = await handLoadPart(params); if (r.error) return { success: false, error: r.error };
+  const part = r.part;
+  if (part.status === 'done') return { success: false, error: 'This part is already finished.' };
+  const person = (params.person || '').toString().trim();
+  if ((await getActiveStaffNames('handembworker')).indexOf(person) === -1) return { success: false, error: 'Unknown hand-embroidery person: ' + person };
+  if (person === part.person) return { success: true };
+  const parts = await getHandParts(part.order_id);
+  if (parts.some(p => p.id !== part.id && p.person === person && p.status !== 'done')) return { success: false, error: person + ' already has an open part on this order.' };
+  const by = (params.authenticatedName || params.role || '').toString();
+  // a running timer is paused so the new person starts clean; time already worked stays with the part
+  const patch = { person };
+  if (part.status === 'working') { patch.accum_ms = handPartMs(part); patch.run_since = null; patch.status = 'paused'; patch.pause_reason = 'Reassigned'; }
+  await sbUpdate('hand_emb_parts', part.id, patch);
+  await syncHandOrder(part.order_id);
+  logOrderEvent({ orderId: part.order_id, orderNo: part.order_no, sku: part.sku }, 'embroidery', `Hand embroidery part "${part.label}" moved from ${part.person} to ${person}`, by);
+  return { success: true };
+}
+async function doHandPartRemove(params) {
+  if (await handCallerIsWorker(params)) return { success: false, error: 'Only the hand-embroidery desk can remove a part.' };
+  const r = await handLoadPart(params); if (r.error) return { success: false, error: r.error };
+  const part = r.part;
+  if (part.status !== 'assigned') return { success: false, error: 'Only a part that has not started can be removed.' };
+  await sbFetch('DELETE', `hand_emb_parts?id=eq.${part.id}`, undefined, { Prefer: 'return=minimal' });
+  const left = await getHandParts(part.order_id);
+  if (!left.length) await sbUpdate('orders', part.order_id, { hand_emb_person: null });
+  else await syncHandOrder(part.order_id, left);
+  logOrderEvent({ orderId: part.order_id, orderNo: part.order_no, sku: part.sku }, 'embroidery', `Hand embroidery part "${part.label}" (${part.person}) removed`, (params.authenticatedName || params.role || '').toString());
+  return { success: true };
+}
+async function doHandPartAct(action, params) {
+  const r = await handLoadPart(params); if (r.error) return { success: false, error: r.error };
+  const part = r.part;
+  if (await handCallerIsWorker(params)) {
+    if (part.person !== (params.authenticatedName || '').toString()) return { success: false, error: 'This part is assigned to ' + part.person + ', not you.' };
+  }
+  const order = await handLoadOrder(Number(part.order_id) + 2);
+  if (!order || order.is_done) return { success: false, error: 'This order is not in hand embroidery any more.' };
+  if (['RCVD', 'WORK', 'PAUSE'].indexOf(parseEmbValue(order.hand_emb).code) === -1) return { success: false, error: 'This order is not in hand embroidery right now.' };
+  const nowIso = new Date().toISOString(), now = Date.now();
+  let patch;
+  if (action === 'handPartStart') {
+    if (part.status !== 'assigned') return { success: false, error: 'This part has already started.' };
+    patch = { status: 'working', started_at: nowIso, run_since: now, accum_ms: 0, pause_reason: null };
+  } else if (action === 'handPartPause') {
+    const reason = (params.reason || '').toString().trim();
+    if (EMB_PAUSE_REASONS.hand.indexOf(reason) === -1) return { success: false, error: 'Please choose a reason to pause.' };
+    if (part.status !== 'working') return { success: false, error: 'Nothing is running to pause.' };
+    patch = { status: 'paused', accum_ms: handPartMs(part), run_since: null, pause_reason: reason };
+  } else if (action === 'handPartResume') {
+    if (part.status !== 'paused') return { success: false, error: 'This part is not paused.' };
+    patch = { status: 'working', run_since: now, pause_reason: null };
+  } else {
+    if (part.status !== 'working' && part.status !== 'paused') return { success: false, error: 'Start this part before finishing it.' };
+    patch = { status: 'done', accum_ms: handPartMs(part), run_since: null, finished_at: nowIso, pause_reason: null };
+  }
+  await sbUpdate('hand_emb_parts', part.id, patch);
+  const sync = await syncHandOrder(part.order_id);
+  const who = (params.authenticatedName || params.role || '').toString();
+  if (action === 'handPartFinish') {
+    logOrderEvent({ orderId: part.order_id, orderNo: part.order_no, sku: part.sku }, 'embroidery', `Hand embroidery part "${part.label}" finished by ${part.person} (${fmtWorkedMs(patch.accum_ms)})${sync.done ? ' — all parts done' : ''}`, who);
+    if (sync.done) pushShopifyUpdate(part.order_no, 'hand embroidery — done ✅');
+  }
+  return { success: true, orderDone: sync.done };
+}
+function fmtWorkedMs(ms) { const m = Math.round(ms / 60000); return m >= 60 ? Math.floor(m / 60) + 'h ' + (m % 60) + 'm' : m + 'm'; }
 
 async function doUpdateHandEmb(params) {
   const row = parseRow(params);
@@ -3039,7 +3238,7 @@ async function doAtelierSendToEmbroidery(params) {
   const stamp = embStampNow();
   const patch = { rework_note: `${QC_EMB_MARK} (${kind === 'hand' ? 'hand' : 'machine'} · ${person}) — sent by ${approver}, ${stamp}. Comes back to QC when done.` };
   if (kind === 'mach') { patch.machine_emb = (person === 'Asif' ? 'SENT|' : 'NEED|') + stamp; patch.mach_emb_person = person; }
-  else { patch.hand_emb = 'READY|' + stamp; patch.hand_emb_person = null; }
+  else { patch.hand_emb = 'READY|' + stamp; patch.hand_emb_person = null; await deleteHandParts(rec.id); }
   await sbUpdate('orders', rec.id, patch);
   logLineEvent(job.order_no, job.sku, 'embroidery', `QC sent to ${kind === 'hand' ? 'HAND' : 'MACHINE'} embroidery (${person}) by ${approver} — returns to QC when done`, approver);
   pushShopifyUpdate(job.order_no, `${kind === 'hand' ? 'Hand' : 'Machine'} embroidery — with ${person} (from QC)`);
@@ -3226,6 +3425,7 @@ async function doAtelierRejectJob(params) {
           await sbUpdate('orders', orderRec.id, Object.assign(patch, reopen));
         } else {
           // Akil receives it again, assigns a person; afterwards the master receives it and assigns the tailor.
+          await deleteHandParts(orderRec.id);
           await sbUpdate('orders', orderRec.id, Object.assign({
             hand_emb: 'READY|' + embStampNow(), hand_emb_person: null, tailor: null, tailor_assigned_at: null,
             rework_note: `⚠️ Rejected — Hand embroidery issue — back to hand embroidery (Akil). By ${approver}, ${stamp}.`
@@ -3238,6 +3438,7 @@ async function doAtelierRejectJob(params) {
         // Fabric issue = the whole garment has to be remade. Back to the very
         // start: fabric check, then cutting, then tailoring (and embroidery,
         // which was done on the faulty piece) all happen again from scratch.
+        await deleteHandParts(orderRec.id);
         await sbUpdate('orders', orderRec.id, Object.assign({
           fabric_status: null, fabric_source: null, fabric_purchase_status: null,
           master: null, master_assigned_at: null, master_work: null, tailor: null, tailor_assigned_at: null,
