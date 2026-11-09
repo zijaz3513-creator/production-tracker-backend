@@ -311,7 +311,7 @@ const ROLE_PERMISSIONS = {
   // Order embroidery desks: scan to receive, scan to start the timer, then
   // pause / finish / return. Each role is locked to its own kind server-side.
   handemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'getSamples', 'receiveSampleEmb', 'embReceive', 'embAssignWorker', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn', 'handPartsList', 'handPartStart', 'handPartPause', 'handPartResume', 'handPartFinish', 'handSplit', 'handPartAdd', 'handPartReassign', 'handPartRemove'],
-  driver: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'driverList', 'driverPickup'],
+  driver: ['getOrder', 'getOrderByOrderNo', 'driverList', 'driverPickup'],
   machemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'getSamples', 'receiveSampleEmb', 'embReceive', 'embReceiveBatch', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn'],
   designer: ['getSamples', 'addSample'],
   patternmaster: ['getSamples', 'assignSampleTailor', 'startSamplePattern'],
@@ -890,6 +890,7 @@ async function routeActionInner(action, params) {
     case 'embReceiveBatch': return doEmbReceiveBatch(params);
     case 'driverList': return doDriverList(params);
     case 'driverPickup': return doDriverPickup(params);
+    case 'driverAssign': return doDriverAssign(params);
     case 'handPartsList': return doHandPartsList(params);
     case 'handSplit': return doHandSplit(params);
     case 'handPartAdd': return doHandPartAdd(params);
@@ -1183,6 +1184,7 @@ async function doGetOrder(params) {
   const recs = await sbFetch('GET', `orders?id=eq.${row - 2}&select=*&limit=1`);
   const rec = recs && recs[0];
   if (!rec || isBlankOrder_(rec)) return { success: false, error: 'Order not found.' };
+  if (!driverMayView(params, rec)) return { success: false, error: 'This piece is not assigned to you.' };
   const info = await getOrderLineInfo(rec.order_no, rec.sku);
   return { success: true, row, data: buildOrderRowArray(rec, info.qc, info.ms, info.paused) };
 }
@@ -1198,6 +1200,7 @@ async function doGetOrderByOrderNo(params) {
   const recs = await sbFetch('GET', `orders?id=eq.${res.rec.id}&select=*&limit=1`);
   const rec = recs && recs[0];
   if (!rec) return { success: false, error: 'Order "' + orderNo + '" not found.' };
+  if (!driverMayView(params, rec)) return { success: false, error: 'This piece is not assigned to you.' };
   const info = await getOrderLineInfo(rec.order_no, rec.sku);
   return { success: true, row: rec.id + 2, data: buildOrderRowArray(rec, info.qc, info.ms, info.paused) };
 }
@@ -1702,14 +1705,17 @@ const embKindWord = kind => (kind === 'mach' ? 'machine' : 'hand');
 // (on the way) → RCVD (Abdullah received) → WORK/PAUSE → DONE → BACK|stamp|driver (on the way back) → AREC (admin received).
 // Pieces can be handled one by one (scan the label) or in a batch (rows in the list QR).
 // ============================================================
+function driverMayView(params, rec) { return (params.role || '').toString() !== 'driver' || (rec.mach_emb_person === 'Abdullah' && (rec.driver_name || '') === (params.authenticatedName || '').toString()); }
 function driverCallerOk(params) { return ['driver', 'admin', 'fulfillment'].indexOf((params.role || '').toString()) !== -1; }
 async function doDriverList(params) {
   if (!driverCallerOk(params)) return { success: false, error: 'Not allowed.' };
-  const rows = (await sbFetch('GET', `orders?mach_emb_person=eq.Abdullah&is_done=eq.false&select=id,order_no,sku,garment_type,machine_emb,urgent,urgent_due_date,master&order=id.asc`)) || [];
+  const rows = (await sbFetch('GET', `orders?mach_emb_person=eq.Abdullah&is_done=eq.false&select=id,order_no,sku,garment_type,machine_emb,urgent,urgent_due_date,master,driver_name&order=id.asc`)) || [];
+  const isDrv = (params.role || '').toString() === 'driver', me = (params.authenticatedName || '').toString();
   const out = { ready: [], toAbdullah: [], atAbdullah: [], waitingPickup: [], backToFactory: [] };
   rows.forEach(r => {
+    if (isDrv && (r.driver_name || '') !== me) return; // a driver only ever sees the pieces assigned to him
     const p = parseEmbValue(r.machine_emb);
-    const it = { row: r.id + 2, orderNo: r.order_no, sku: r.sku, garmentType: r.garment_type || '', urgent: !!r.urgent, stamp: p.stamp, driver: p.driver || '', code: p.code };
+    const it = { assigned: r.driver_name || '', row: r.id + 2, orderNo: r.order_no, sku: r.sku, garmentType: r.garment_type || '', urgent: !!r.urgent, stamp: p.stamp, driver: p.driver || '', code: p.code };
     if (['NEED', 'RED'].indexOf(p.code) !== -1 && !r.master) out.ready.push(it);
     else if (p.code === 'TRANSIT') out.toAbdullah.push(it);
     else if (['RCVD', 'WORK', 'PAUSE'].indexOf(p.code) !== -1) { it.working = p.code; out.atAbdullah.push(it); }
@@ -1717,6 +1723,21 @@ async function doDriverList(params) {
     else if (p.code === 'BACK') out.backToFactory.push(it);
   });
   return { success: true, lists: out };
+}
+// Admin picks which driver takes (and later brings back) these pieces. '' = unassign.
+async function doDriverAssign(params) {
+  if (['admin', 'fulfillment'].indexOf((params.role || '').toString()) === -1) return { success: false, error: 'Only the admin can assign a driver.' };
+  const rowsIn = (Array.isArray(params.rows) ? params.rows : [params.row]).map(x => parseInt(x, 10)).filter(x => x > 1);
+  const driver = (params.driver || '').toString().trim();
+  if (!rowsIn.length) return { success: false, error: 'Nothing selected.' };
+  if (driver && (await getActiveStaffNames('driver')).indexOf(driver) === -1) return { success: false, error: 'Unknown driver.' };
+  for (const row of rowsIn) {
+    const rec = await loadEmbRec(row);
+    if (!rec || rec.mach_emb_person !== 'Abdullah') continue;
+    await sbUpdate('orders', rec.id, { driver_name: driver || null });
+    logOrderEvent({ orderId: rec.id, orderNo: rec.order_no, sku: rec.sku }, 'embroidery', driver ? `Assigned to driver ${driver} (machine embroidery)` : 'Driver assignment removed', 'admin');
+  }
+  return { success: true };
 }
 async function doDriverPickup(params) {
   if (!driverCallerOk(params)) return { success: false, error: 'Not allowed.' };
@@ -1730,6 +1751,7 @@ async function doDriverPickup(params) {
     const p = parseEmbValue(rec.machine_emb);
     const base = { row, orderNo: rec.order_no, sku: rec.sku };
     if (rec.mach_emb_person !== 'Abdullah') { skipped.push(Object.assign(base, { error: 'This piece is not for Abdullah.' })); continue; }
+    if ((params.role || '').toString() === 'driver' && (rec.driver_name || '') !== driver) { skipped.push(Object.assign(base, { error: 'Not assigned to you.' })); continue; }
     let value = null, dir = '';
     if (['NEED', 'RED'].indexOf(p.code) !== -1) { value = `TRANSIT|${embStampNow()}|${driver}`; dir = 'to'; }
     else if (['DONE', 'GREEN'].indexOf(p.code) !== -1) { value = `BACK|${embStampNow()}|${driver}`; dir = 'back'; }
