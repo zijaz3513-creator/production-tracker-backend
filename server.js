@@ -47,7 +47,7 @@ const ROLE_PASSWORDS = {
 // Roles managed as individual people in the "staff" table instead of a
 // single shared password. Tailors are capped (MAX_TAILOR_SLOTS) because
 // of the order row layout; the others aren't.
-const STAFF_ROLES = ['master', 'tailor', 'designer', 'patternmaster', 'machemb', 'handemb', 'handembworker'];
+const STAFF_ROLES = ['master', 'tailor', 'designer', 'patternmaster', 'machemb', 'handemb', 'handembworker', 'driver'];
 
 Object.keys(ROLE_PASSWORDS).forEach(role => {
   if (!ROLE_PASSWORDS[role]) {
@@ -311,7 +311,8 @@ const ROLE_PERMISSIONS = {
   // Order embroidery desks: scan to receive, scan to start the timer, then
   // pause / finish / return. Each role is locked to its own kind server-side.
   handemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'getSamples', 'receiveSampleEmb', 'embReceive', 'embAssignWorker', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn', 'handPartsList', 'handPartStart', 'handPartPause', 'handPartResume', 'handPartFinish', 'handSplit', 'handPartAdd', 'handPartReassign', 'handPartRemove'],
-  machemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'getSamples', 'receiveSampleEmb', 'embReceive', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn'],
+  driver: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'driverList', 'driverPickup'],
+  machemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'getSamples', 'receiveSampleEmb', 'embReceive', 'embReceiveBatch', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn'],
   designer: ['getSamples', 'addSample'],
   patternmaster: ['getSamples', 'assignSampleTailor', 'startSamplePattern'],
   samplemachemb: ['getSamples', 'receiveSampleEmb'],
@@ -442,7 +443,8 @@ async function doGetRoster() {
     getActiveStaffNames('handembworker')
   ]);
   const dn = await getDisplayNames();
-  return { success: true, masters, tailors, designers, patternmasters, sampleMachEmb, sampleHandEmb, handEmbWorkers, machEmbStaff: sampleMachEmb, handEmbStaff: sampleHandEmb, handEmbDesk: await getActiveStaffNames('handemb'), displayNames: dn.byName };
+  const drivers = await getActiveStaffNames('driver');
+  return { success: true, drivers, masters, tailors, designers, patternmasters, sampleMachEmb, sampleHandEmb, handEmbWorkers, machEmbStaff: sampleMachEmb, handEmbStaff: sampleHandEmb, handEmbDesk: await getActiveStaffNames('handemb'), displayNames: dn.byName };
 }
 
 async function doListStaff(params) {
@@ -885,6 +887,9 @@ async function routeActionInner(action, params) {
     case 'embAssignWorker': return doEmbAssignWorker(params);
     case 'embAdminReceive': return doEmbAdminReceive(params);
     case 'embMasterReceive': return doEmbMasterReceive(params);
+    case 'embReceiveBatch': return doEmbReceiveBatch(params);
+    case 'driverList': return doDriverList(params);
+    case 'driverPickup': return doDriverPickup(params);
     case 'handPartsList': return doHandPartsList(params);
     case 'handSplit': return doHandSplit(params);
     case 'handPartAdd': return doHandPartAdd(params);
@@ -1591,7 +1596,8 @@ async function doEmbAdminReceive(params) {
   if (!rec) return { success: false, error: 'Order not found.' };
   const cur = parseEmbValue(rec.machine_emb).code;
   if (cur === 'AREC') return { success: true, already: true, kind: 'mach' };
-  if (['DONE', 'GREEN'].indexOf(cur) === -1) return { success: false, error: 'Machine embroidery is not finished yet.' };
+  if (['DONE', 'GREEN'].indexOf(cur) !== -1 && rec.mach_emb_person === 'Abdullah' && !params.skipDriver) return { success: false, error: 'Waiting for the driver to pick this up from Abdullah first (admin can use “Receive without driver”).', needsDriver: true };
+  if (['DONE', 'GREEN', 'BACK'].indexOf(cur) === -1) return { success: false, error: 'Machine embroidery is not finished yet.' };
   const value = 'AREC|' + embStampNow();
   await sbUpdate('orders', row - 2, { machine_emb: value });
   pushShopifyUpdate(rec.order_no, 'Machine embroidery — received by admin');
@@ -1636,7 +1642,7 @@ async function doEmbMasterReceive(params) {
 // ============================================================
 const EMB_PAUSE_REASONS = {
   hand: ['No Material', 'Break', 'Need Fabric'],
-  mach: ['Break', 'Fabric quantity less', 'Threads not available']
+  mach: ['Break', 'Fabric quantity less', 'Threads not available', 'Maintenance']
 };
 function embStampNow() {
   return new Date().toLocaleString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
@@ -1647,6 +1653,7 @@ function parseEmbValue(val) {
   if (code === 'WORK')  return { code, stamp: p[1] || '', accumMs: Number(p[2]) || 0, runSince: Number(p[3]) || 0 };
   if (code === 'PAUSE') return { code, stamp: p[1] || '', accumMs: Number(p[2]) || 0, reason: p[3] || '' };
   if (code === 'DONE')  return { code, stamp: p[1] || '', totalMs: Number(p[2]) || 0 };
+  if (code === 'TRANSIT' || code === 'BACK') return { code, stamp: p[1] || '', driver: p[2] || '' };
   return { code, stamp: p[1] || '' };
 }
 // Server-side guard: an embroidery desk may only touch its own kind.
@@ -1688,15 +1695,76 @@ const embKindWord = kind => (kind === 'mach' ? 'machine' : 'hand');
 //   READY|<stamp>  hand: master finished cutting, ready for Akil
 //   AREC|<stamp>   machine: admin received Abdullah's finished piece
 //   MREC|<stamp>   hand: master received the finished piece
+
+// ============================================================
+// DRIVER — takes pieces to Abdullah (machine embroidery, before cutting) and brings them back.
+// States in orders.machine_emb:  NEED (admin chose Abdullah = ready for the driver) → TRANSIT|stamp|driver
+// (on the way) → RCVD (Abdullah received) → WORK/PAUSE → DONE → BACK|stamp|driver (on the way back) → AREC (admin received).
+// Pieces can be handled one by one (scan the label) or in a batch (rows in the list QR).
+// ============================================================
+function driverCallerOk(params) { return ['driver', 'admin', 'fulfillment'].indexOf((params.role || '').toString()) !== -1; }
+async function doDriverList(params) {
+  if (!driverCallerOk(params)) return { success: false, error: 'Not allowed.' };
+  const rows = (await sbFetch('GET', `orders?mach_emb_person=eq.Abdullah&is_done=eq.false&select=id,order_no,sku,garment_type,machine_emb,urgent,urgent_due_date,master&order=id.asc`)) || [];
+  const out = { ready: [], toAbdullah: [], atAbdullah: [], waitingPickup: [], backToFactory: [] };
+  rows.forEach(r => {
+    const p = parseEmbValue(r.machine_emb);
+    const it = { row: r.id + 2, orderNo: r.order_no, sku: r.sku, garmentType: r.garment_type || '', urgent: !!r.urgent, stamp: p.stamp, driver: p.driver || '', code: p.code };
+    if (['NEED', 'RED'].indexOf(p.code) !== -1 && !r.master) out.ready.push(it);
+    else if (p.code === 'TRANSIT') out.toAbdullah.push(it);
+    else if (['RCVD', 'WORK', 'PAUSE'].indexOf(p.code) !== -1) { it.working = p.code; out.atAbdullah.push(it); }
+    else if (['DONE', 'GREEN'].indexOf(p.code) !== -1 && !r.master) out.waitingPickup.push(it);
+    else if (p.code === 'BACK') out.backToFactory.push(it);
+  });
+  return { success: true, lists: out };
+}
+async function doDriverPickup(params) {
+  if (!driverCallerOk(params)) return { success: false, error: 'Not allowed.' };
+  const rowsIn = (Array.isArray(params.rows) ? params.rows : [params.row]).map(x => parseInt(x, 10)).filter(x => x > 1);
+  if (!rowsIn.length) return { success: false, error: 'Nothing to pick up.' };
+  const driver = (params.authenticatedName || params.role || '').toString();
+  const ok = [], skipped = [];
+  for (const row of rowsIn) {
+    const rec = await loadEmbRec(row);
+    if (!rec) { skipped.push({ row, error: 'Order not found.' }); continue; }
+    const p = parseEmbValue(rec.machine_emb);
+    const base = { row, orderNo: rec.order_no, sku: rec.sku };
+    if (rec.mach_emb_person !== 'Abdullah') { skipped.push(Object.assign(base, { error: 'This piece is not for Abdullah.' })); continue; }
+    let value = null, dir = '';
+    if (['NEED', 'RED'].indexOf(p.code) !== -1) { value = `TRANSIT|${embStampNow()}|${driver}`; dir = 'to'; }
+    else if (['DONE', 'GREEN'].indexOf(p.code) !== -1) { value = `BACK|${embStampNow()}|${driver}`; dir = 'back'; }
+    else if (p.code === 'TRANSIT' || p.code === 'BACK') { skipped.push(Object.assign(base, { error: 'Already on the road' + (p.driver ? ' with ' + p.driver : '') + '.' })); continue; }
+    else { skipped.push(Object.assign(base, { error: ['RCVD', 'WORK', 'PAUSE'].indexOf(p.code) !== -1 ? 'Abdullah is still working on this one.' : 'Not ready for the driver.' })); continue; }
+    await sbUpdate('orders', rec.id, { machine_emb: value });
+    logOrderEvent({ orderId: rec.id, orderNo: rec.order_no, sku: rec.sku }, 'embroidery', dir === 'to' ? `Driver ${driver} took it to Abdullah (machine embroidery)` : `Driver ${driver} picked it up from Abdullah`, driver);
+    pushShopifyUpdate(rec.order_no, dir === 'to' ? 'Machine embroidery — on the way to Abdullah' : 'Machine embroidery — on the way back from Abdullah');
+    ok.push(Object.assign(base, { dir, value }));
+  }
+  return { success: true, ok, skipped };
+}
+// Abdullah (or admin) receives several pieces at once from the driver's list.
+async function doEmbReceiveBatch(params) {
+  const rowsIn = (Array.isArray(params.rows) ? params.rows : []).map(x => parseInt(x, 10)).filter(x => x > 1);
+  if (!rowsIn.length) return { success: false, error: 'Nothing to receive.' };
+  const ok = [], failed = [];
+  for (const row of rowsIn) {
+    const r = await doEmbReceive(Object.assign({}, params, { row, kind: 'mach' }));
+    if (r && r.success) ok.push({ row, value: r.value }); else failed.push({ row, error: (r && r.error) || 'Failed' });
+  }
+  return { success: true, ok, failed };
+}
+
 async function doEmbReceive(params) {
   const ctx = await loadEmbOrder(params);
   if (ctx.error) return { success: false, error: ctx.error };
   if (ctx.cur.code === 'RCVD') return { success: true, already: true };
   if (ctx.kind === 'mach') {
     if (!ctx.person) return { success: false, error: 'The admin has not chosen Abdullah or Asif for this order yet.' };
-    const okFrom = ctx.person === 'Abdullah' ? ['NEED', 'RED'] : ['SENT'];
+    const isAdminCaller = ['admin', 'fulfillment'].indexOf((params.role || '').toString()) !== -1;
+    // Abdullah receives what the driver brought (TRANSIT). Admin may receive on his behalf (pieces already at his desk before the driver flow).
+    const okFrom = ctx.person === 'Abdullah' ? (isAdminCaller ? ['TRANSIT', 'NEED', 'RED'] : ['TRANSIT']) : ['SENT'];
     if (okFrom.indexOf(ctx.cur.code) === -1) {
-      return { success: false, error: ctx.person === 'Asif' && ['NEED', 'RED'].indexOf(ctx.cur.code) !== -1 ? 'Waiting for the master or tailor to hand this to Asif first.' : 'This order is not waiting to be received.' };
+      return { success: false, error: ctx.person === 'Asif' && ['NEED', 'RED'].indexOf(ctx.cur.code) !== -1 ? 'Waiting for the master or tailor to hand this to Asif first.' : ctx.person === 'Abdullah' && ['NEED', 'RED'].indexOf(ctx.cur.code) !== -1 ? 'The driver has not brought this to you yet — the driver scans it first.' : 'This order is not waiting to be received.' };
     }
     const mv = 'RCVD|' + embStampNow();
     await saveEmb(ctx, mv);
