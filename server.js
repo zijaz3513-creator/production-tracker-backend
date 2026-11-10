@@ -323,7 +323,7 @@ const ROLE_PERMISSIONS = {
     'getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'addOrder', 'updateOrderDetails', 'updateFabric', 'updateFabricDetails',
     'updateMachEmb', 'updateHandEmb', 'updateMaster', 'updateTailor',
     'masterStart', 'masterPause', 'masterResume', 'masterFinish', 'masterReturn',
-    'setEmbPerson', 'embAdminReceive', 'embReady', 'embMasterReceive', 'embAssignWorker',
+    'setEmbPerson', 'driverList', 'driverPickup', 'driverAssign', 'embAdminReceive', 'embReady', 'embMasterReceive', 'embAssignWorker',
     'markDone', 'undoMarkDone', 'updateUrgent', 'atelierJobsForLine',
     'getSamples', 'addSample', 'assignSampleTailor', 'assignSampleMaster',
     'markSampleDone', 'undoSampleDone', 'sendSampleEmb', 'receiveSampleEmb',
@@ -662,128 +662,6 @@ async function doGetSkuImage(params) {
   return { success: true, dataUrl };
 }
 
-// ============================================================
-// USAGE TRACKING (Release 44) — feeds the Command Center.
-// Tables + functions: usage_tracking.sql. Everything here is best-effort:
-// if the SQL hasn't been run yet, logging silently switches itself off
-// (one warning in the log) and the app works exactly as before.
-// ============================================================
-let usageOff = false, usageWarnAt = 0;
-function usageWarn(e) {
-  const msg = (e && e.message) || String(e);
-  if (/usage_|PGRST20|does not exist|schema cache/i.test(msg)) usageOff = true;
-  if (Date.now() - usageWarnAt > 600000) { usageWarnAt = Date.now(); console.warn('Usage tracking: ' + msg.slice(0, 200) + (usageOff ? ' — run usage_tracking.sql in Supabase to switch it on.' : '')); }
-}
-setInterval(() => { usageOff = false; }, 15 * 60 * 1000); // re-check after the SQL is run
-const USAGE_ROLE_LABELS = { admin: 'Admin', inventory: 'Inventory', fulfillment: 'Fulfillment', atelier_supervisor: 'Supervisor' };
-function usageWho(role, name) {
-  const n = (name || '').toString().trim();
-  if (n && n !== role) return n.slice(0, 80);
-  return USAGE_ROLE_LABELS[role] || role || 'unknown';
-}
-function usageDev(params) { return (params && params.dev ? String(params.dev) : '').replace(/[^\w.:-]/g, '').slice(0, 40); }
-function usageLabel(req, params) {
-  const ua = String((req && req.headers && req.headers['user-agent']) || '');
-  const os = /Android/i.test(ua) ? 'Android' : /iPhone|iPad|iOS/i.test(ua) ? 'iPhone/iPad' : /Windows/i.test(ua) ? 'Windows' : /Mac OS/i.test(ua) ? 'Mac' : /Linux/i.test(ua) ? 'Linux' : 'Device';
-  const br = /Edg\//.test(ua) ? 'Edge' : /SamsungBrowser/i.test(ua) ? 'Samsung' : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : /Firefox\//.test(ua) ? 'Firefox' : '';
-  const app = params && params.app === 'ws' ? ' · Workstation' : '';
-  return (os + (br ? ' ' + br : '') + app).slice(0, 60);
-}
-function usageEvent(ev) {
-  if (usageOff) return;
-  sbFetch('POST', 'usage_events', {
-    who: ev.who || null, role: ev.role || null, device: ev.device || null, kind: ev.kind,
-    action: ev.action ? String(ev.action).slice(0, 60) : null, detail: ev.detail ? String(ev.detail).slice(0, 400) : null
-  }, { Prefer: 'return=minimal' }).catch(usageWarn);
-}
-function usageTick(o) {
-  if (usageOff) return Promise.resolve();
-  return sbFetch('POST', 'rpc/usage_tick', {
-    p_who: o.who, p_role: o.role || '', p_device: o.device || '', p_label: o.label || '',
-    p_page: (o.page || '').toString().slice(0, 60), p_idle: !!o.idle,
-    p_active: Math.max(0, Math.min(120, parseInt(o.active, 10) || 0)), p_reason: o.reason || 'ping'
-  }).catch(usageWarn);
-}
-// Read-only actions are not written to the activity log (they're only counted as "time online").
-function usageIsRead(action) {
-  return /^(get|list)/.test(action) || /(List|Report|Today|LiveJobs|History|Earnings|Config|Lines|Pins|Roster|Ping)$/.test(action) ||
-    ['atelierMyOrders', 'atelierFindPendingByCode', 'readyMadeFindByCode', 'atelierJobsForLine', 'dousidehOrderEvents', 'driverList', 'handPartsList', 'usagePing'].indexOf(action) !== -1;
-}
-// A short "what was it" for the activity log — never passwords / PINs / tokens.
-function usageDetail(params) {
-  const p = params || {}, bits = [];
-  if (p.orderNo) bits.push('order ' + p.orderNo);
-  else if (p.row) bits.push('row ' + p.row);
-  if (p.sku) bits.push('SKU ' + p.sku);
-  if (p.code) bits.push('code ' + String(p.code).slice(0, 40));
-  if (p.jobId) bits.push('job ' + p.jobId);
-  return bits.join(' · ').slice(0, 200);
-}
-
-// Admin / API key only (used by the Command Center through the ERP's connect bridge).
-async function doUsageReport(params) {
-  const now = Date.now();
-  let from = Date.parse(params.from || ''), to = Date.parse(params.to || '');
-  if (!from) from = now - 86400000;
-  if (!to || to <= from) to = now + 60000;
-  if (to - from > 93 * 86400000) from = to - 93 * 86400000;
-  const F = new Date(from).toISOString(), T = new Date(to).toISOString();
-  const enc = encodeURIComponent;
-  const safe = p => p.catch(e => { usageWarn(e); return null; });
-  const staffRoles = ['master', 'tailor', 'designer', 'patternmaster', 'machemb', 'handemb', 'handembworker', 'driver', 'samplemachemb', 'samplehandemb'];
-  const [staff, dn, sessions, events, counts, output, tailorOut, live, masters, emb, parts, lastSeen] = await Promise.all([
-    safe(sbFetch('GET', 'staff?select=id,name,role&active=eq.true&order=role.asc,sort_order.asc')),
-    safe(getDisplayNames()),
-    safe(sbFetch('GET', `usage_sessions?or=(ended_at.is.null,ended_at.gte.${enc(F)})&started_at=lt.${enc(T)}&last_seen=gte.${enc(F)}&select=*&order=started_at.desc&limit=5000`)),
-    safe(sbFetch('GET', `usage_events?at=gte.${enc(F)}&at=lt.${enc(T)}&kind=in.(login,login_failed,logout,error)&select=at,who,role,device,kind,action,detail&order=at.desc&limit=3000`)),
-    safe(sbFetch('POST', 'rpc/usage_action_counts', { p_from: F, p_to: T })),
-    safe(sbFetch('POST', 'rpc/usage_output', { p_from: F, p_to: T })),
-    safe(sbFetch('POST', 'rpc/usage_tailor_output', { p_from: F, p_to: T })),
-    safe(doAtelierLiveJobs()),
-    safe(sbFetch('GET', `orders?is_done=eq.false&master=not.is.null&master_work=not.is.null&select=id,order_no,sku,garment_type,master,master_work&limit=1000`)),
-    safe(sbFetch('GET', `orders?is_done=eq.false&or=(machine_emb.like.WORK*,machine_emb.like.PAUSE*,hand_emb.like.WORK*,hand_emb.like.PAUSE*)&select=id,order_no,sku,garment_type,machine_emb,hand_emb,mach_emb_person,hand_emb_person&limit=1000`)),
-    safe(sbFetch('GET', `hand_emb_parts?status=in.(working,paused)&select=*&limit=1000`)),
-    safe(sbFetch('POST', 'rpc/usage_last_seen', {}))
-  ]);
-  // what each person is doing on the floor right now
-  const working = [];
-  ((live && live.jobs) || []).forEach(j => working.push({ who: j.tailor, kind: 'Tailoring', orderNo: j.orderNo, sku: j.sku, garment: j.garmentType,
-    state: j.machineStopped ? 'machine stopped' : (j.runSince ? 'working' : 'paused'), reason: j.pauseReason || '', since: j.startAt,
-    ms: j.accumMs + (j.runSince ? Math.max(0, now - Date.parse(j.runSince)) : 0) }));
-  (masters || []).forEach(o => {
-    const w = parseMasterWork(o.master_work);
-    if (w.st !== 'WORK' && w.st !== 'PAUSE') return;
-    working.push({ who: o.master, kind: 'Cutting', orderNo: o.order_no, sku: o.sku, garment: o.garment_type,
-      state: w.st === 'WORK' ? 'working' : 'paused', reason: w.reason || '', since: w.start || null, ms: mwTotal(w) });
-  });
-  const splitIds = new Set((parts || []).map(p => p.order_id));
-  (emb || []).forEach(o => {
-    [['mach', o.machine_emb, o.mach_emb_person, 'Machine embroidery'], ['hand', o.hand_emb, o.hand_emb_person, 'Hand embroidery']].forEach(([k, v, person, label]) => {
-      if (k === 'hand' && splitIds.has(o.id)) return;
-      const e = parseEmbValue(v);
-      if (e.code !== 'WORK' && e.code !== 'PAUSE') return;
-      working.push({ who: person || '(not set)', kind: label, orderNo: o.order_no, sku: o.sku, garment: o.garment_type,
-        state: e.code === 'WORK' ? 'working' : 'paused', reason: e.reason || '', since: null,
-        ms: e.accumMs + (e.code === 'WORK' && e.runSince ? Math.max(0, now - e.runSince) : 0) });
-    });
-  });
-  (parts || []).forEach(p => {
-    const run = p.status === 'working' && p.run_since ? Math.max(0, now - Date.parse(p.run_since)) : 0;
-    working.push({ who: p.person, kind: 'Hand embroidery (' + (p.label || 'part') + ')', orderNo: p.order_no || '', sku: p.sku || '', garment: '',
-      state: p.status === 'working' ? 'working' : 'paused', reason: p.pause_reason || '', since: null, ms: Number(p.accum_ms || 0) + run });
-  });
-  // occasional housekeeping
-  if (Math.random() < 0.02) sbFetch('POST', 'rpc/usage_cleanup', {}).catch(() => {});
-  const roster = [];
-  Object.keys(USAGE_ROLE_LABELS).forEach(r => { if (ROLE_PASSWORDS[r]) roster.push({ name: USAGE_ROLE_LABELS[r], role: r, shared: true }); });
-  (staff || []).filter(s => staffRoles.indexOf(s.role) !== -1).forEach(s => roster.push({ name: s.name, role: s.role, display: (dn && dn.byId && dn.byId[s.id]) || '' }));
-  return {
-    success: true, now, from: F, to: T, trackingOn: sessions !== null,
-    roster, sessions: sessions || [], events: events || [], counts: counts || [],
-    output: output || [], tailorOutput: tailorOut || [], working, lastSeen: lastSeen || []
-  };
-}
-
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 // Accept both GET (query string) and POST (JSON body) — merged the same
@@ -792,27 +670,12 @@ app.get('/health', (req, res) => res.json({ ok: true }));
 app.all('/api', async (req, res) => {
   const params = Object.assign({}, req.query, req.body || {});
   const action = params.action;
-  let uCtx = { who: null, role: null, device: usageDev(params) };
 
   try {
     if (action === 'login') {
-      const r = await doLoginAction(params);
-      const role0 = (params.role || '').toString(), who0 = usageWho(role0, params.name), dev0 = usageDev(params);
-      if (r && r.success) {
-        usageEvent({ who: who0, role: role0, device: dev0, kind: 'login', detail: usageLabel(req, params) });
-        usageTick({ who: who0, role: role0, device: dev0, label: usageLabel(req, params), page: params.page || '', reason: 'login' });
-      } else {
-        usageEvent({ who: who0, role: role0, device: dev0, kind: 'login_failed', detail: (r && r.error) || 'Login failed' });
-      }
-      return res.json(r);
+      return res.json(await doLoginAction(params));
     }
     if (action === 'logout') {
-      const s0 = getSession(params.token);
-      if (s0) {
-        const who0 = usageWho(s0.role, s0.name), dev0 = usageDev(params);
-        usageEvent({ who: who0, role: s0.role, device: dev0, kind: 'logout' });
-        usageTick({ who: who0, role: s0.role, device: dev0, page: params.page || '', active: params.active, reason: 'logout' });
-      }
       if (params.token) revokedTokens.add(params.token);
       return res.json({ success: true });
     }
@@ -826,15 +689,7 @@ app.all('/api', async (req, res) => {
       return res.json(await doAtelierListTailors());
     }
     if (action === 'atelierTailorLogin') {
-      const r = await doAtelierTailorLogin(params);
-      const who0 = usageWho('tailor', params.name), dev0 = usageDev(params), p0 = Object.assign({}, params, { app: 'ws' });
-      if (r && r.success) {
-        usageEvent({ who: who0, role: 'tailor', device: dev0, kind: 'login', detail: usageLabel(req, p0) });
-        usageTick({ who: who0, role: 'tailor', device: dev0, label: usageLabel(req, p0), page: 'ws:work', reason: 'login' });
-      } else {
-        usageEvent({ who: who0, role: 'tailor', device: dev0, kind: 'login_failed', detail: ((r && r.error) || 'Login failed') + ' (Workstation)' });
-      }
-      return res.json(r);
+      return res.json(await doAtelierTailorLogin(params));
     }
 
     // API key auth — for external tools/integrations (Claude, scripts,
@@ -860,32 +715,11 @@ app.all('/api', async (req, res) => {
       authenticatedName = session.name || '';
     }
 
-    const viaKey = !!(API_KEY && apiKey && apiKey === API_KEY);
-    const uWho = viaKey ? 'API key' : usageWho(role, authenticatedName), uDev = usageDev(params);
-    uCtx = { who: uWho, role, device: uDev };
-
-    // Heartbeat from an open app (every minute): who is online, on which page, idle or not.
-    if (action === 'usagePing') {
-      if (!viaKey) await usageTick({ who: uWho, role, device: uDev, label: usageLabel(req, params), page: params.page, idle: params.idle === true || params.idle === 'true' || params.idle === '1', active: params.active, reason: params.closing ? 'closed' : 'ping' });
-      return res.json({ success: true });
-    }
-    // Errors the browser ran into (script errors, failed screens) — so admins can help.
-    if (action === 'usageError') {
-      if (!viaKey) usageEvent({ who: uWho, role, device: uDev, kind: 'error', action: (params.where || 'screen').toString(), detail: (params.message || '').toString() });
-      return res.json({ success: true });
-    }
-
     const permissionError = checkPermission(action, role);
     const result = permissionError || (await routeAction(action, Object.assign({}, params, { role, authenticatedName })));
-    if (result && result.success === false) {
-      if (!(viaKey && action === 'usageReport')) usageEvent({ who: uWho, role, device: uDev, kind: 'error', action, detail: (result.error || 'Failed') + (usageDetail(params) ? ' — ' + usageDetail(params) : '') });
-    } else if (!usageIsRead(action) && !(viaKey && /^dousideh/.test(action))) {
-      usageEvent({ who: uWho, role, device: uDev, kind: 'action', action, detail: usageDetail(params) });
-    }
     res.json(result);
   } catch (err) {
     console.error(err);
-    usageEvent({ who: uCtx.who, role: uCtx.role, device: uCtx.device, kind: 'error', action: action || '', detail: 'Server error: ' + err.toString() });
     res.status(200).json({ success: false, error: err.toString() });
   }
 });
@@ -1128,7 +962,6 @@ async function routeActionInner(action, params) {
     case 'atelierRevertJob': return doAtelierRevertJob(params);
     case 'atelierTeamToday': return doAtelierTeamToday();
     case 'atelierLiveJobs': return doAtelierLiveJobs();
-    case 'usageReport': return doUsageReport(params); // admin / API key only (not in any ROLE_PERMISSIONS list)
     case 'atelierRecentApproved': return doAtelierRecentApproved(params);
     case 'atelierTimeReport': return doAtelierTimeReport(params);
     case 'atelierStandardsList': return doAtelierStandardsList();
@@ -1910,7 +1743,10 @@ async function doDriverPickup(params) {
   if (!driverCallerOk(params)) return { success: false, error: 'Not allowed.' };
   const rowsIn = (Array.isArray(params.rows) ? params.rows : [params.row]).map(x => parseInt(x, 10)).filter(x => x > 1);
   if (!rowsIn.length) return { success: false, error: 'Nothing to pick up.' };
-  const driver = (params.authenticatedName || params.role || '').toString();
+  const isDrvCaller = (params.role || '').toString() === 'driver';
+  // Driver: his own name. Admin/Fulfillment collecting it themselves: their role name shows in the timeline.
+  const driver = isDrvCaller ? (params.authenticatedName || 'Driver').toString() : ((params.role || '').toString() === 'fulfillment' ? 'Fulfillment' : 'Admin');
+  const who = isDrvCaller ? 'Driver ' + driver : driver;
   const ok = [], skipped = [];
   for (const row of rowsIn) {
     const rec = await loadEmbRec(row);
@@ -1925,7 +1761,7 @@ async function doDriverPickup(params) {
     else if (p.code === 'TRANSIT' || p.code === 'BACK') { skipped.push(Object.assign(base, { error: 'Already on the road' + (p.driver ? ' with ' + p.driver : '') + '.' })); continue; }
     else { skipped.push(Object.assign(base, { error: ['RCVD', 'WORK', 'PAUSE'].indexOf(p.code) !== -1 ? 'Abdullah is still working on this one.' : 'Not ready for the driver.' })); continue; }
     await sbUpdate('orders', rec.id, { machine_emb: value });
-    logOrderEvent({ orderId: rec.id, orderNo: rec.order_no, sku: rec.sku }, 'embroidery', dir === 'to' ? `Driver ${driver} took it to Abdullah (machine embroidery)` : `Driver ${driver} picked it up from Abdullah`, driver);
+    logOrderEvent({ orderId: rec.id, orderNo: rec.order_no, sku: rec.sku }, 'embroidery', dir === 'to' ? `${who} took it to Abdullah (machine embroidery)` : `${who} picked it up from Abdullah`, driver);
     pushShopifyUpdate(rec.order_no, dir === 'to' ? 'Machine embroidery — on the way to Abdullah' : 'Machine embroidery — on the way back from Abdullah');
     ok.push(Object.assign(base, { dir, value }));
   }
@@ -1960,13 +1796,21 @@ async function doEmbReceive(params) {
     pushShopifyUpdate(ctx.rec.order_no, 'machine embroidery — received by ' + ctx.person);
     return { success: true, value: mv, person: ctx.person };
   }
-  if (ctx.cur.code !== 'READY') {
-    return { success: false, error: ['NEED', 'RED'].indexOf(ctx.cur.code) !== -1
-      ? 'Not ready yet — the master must scan it first once cutting is done.'
-      : 'This order is not waiting to be received for hand embroidery.' };
-  }
+  // Hand embroidery: Akil can receive as soon as the admin marked it needed (no waiting for the master to press a button).
+  if (['NEED', 'RED', 'READY'].indexOf(ctx.cur.code) === -1) return { success: false, error: 'This order is not waiting to be received for hand embroidery.' };
   const value = 'RCVD|' + embStampNow();
   await saveEmb(ctx, value);
+  if (ctx.cur.code !== 'READY') {
+    // Handing over ends the master's cutting time, same as the master's own Ready button.
+    try {
+      const full = await loadEmbRec(parseRow(params));
+      const mw = parseMasterWork(full && full.master_work);
+      if (mw && (mw.st === 'WORK' || mw.st === 'PAUSE')) {
+        const acc = (Number(mw.acc) || 0) + (mw.st === 'WORK' ? Math.max(0, Date.now() - Number(mw.run || Date.now())) : 0);
+        await sbUpdate('orders', parseRow(params) - 2, { master_work: JSON.stringify(Object.assign({}, mw, { st: 'DONE', fin: new Date().toISOString(), acc, run: 0, reason: '' })) });
+      }
+    } catch (e) {}
+  }
   pushShopifyUpdate(ctx.rec.order_no, 'hand embroidery — received');
   return { success: true, value };
 }
