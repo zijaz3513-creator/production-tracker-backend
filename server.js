@@ -1503,7 +1503,7 @@ async function doUpdateMachEmb(params) {
 // Abdullah (before cutting) or Asif (after the tailor has stitched) does it.
 const MACH_PEOPLE = ['Abdullah', 'Asif'];
 async function loadEmbRec(row) {
-  const rows = await sbFetch('GET', `orders?id=eq.${row - 2}&select=id,order_no,sku,master,tailor,is_done,machine_emb,hand_emb,mach_emb_person,hand_emb_person,master_work&limit=1`);
+  const rows = await sbFetch('GET', `orders?id=eq.${row - 2}&select=id,order_no,sku,master,tailor,is_done,machine_emb,hand_emb,mach_emb_person,hand_emb_person,master_work,driver_name&limit=1`);
   return rows && rows[0];
 }
 async function doSetEmbPerson(params) {
