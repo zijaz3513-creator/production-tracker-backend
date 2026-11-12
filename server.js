@@ -392,6 +392,23 @@ async function sbUpdate(table, id, patch) {
   await sbFetch('PATCH', table + '?id=eq.' + id, patch, { Prefer: 'return=minimal' });
 }
 
+
+// --- Reversible copy of staff passwords so the admin can VIEW them in Settings (AES-256-GCM, key from env) ---
+const PW_VIEW_KEY = crypto.createHash('sha256').update(String(process.env.PASSWORD_VIEW_KEY || process.env.SUPABASE_SECRET_KEY || 'aeon')).digest();
+function encPw(pw) {
+  const iv = crypto.randomBytes(12), c = crypto.createCipheriv('aes-256-gcm', PW_VIEW_KEY, iv);
+  const ct = Buffer.concat([c.update(String(pw), 'utf8'), c.final()]);
+  return Buffer.concat([iv, c.getAuthTag(), ct]).toString('base64');
+}
+function decPw(b64) {
+  try {
+    const b = Buffer.from(String(b64 || ''), 'base64');
+    const d = crypto.createDecipheriv('aes-256-gcm', PW_VIEW_KEY, b.subarray(0, 12));
+    d.setAuthTag(b.subarray(12, 28));
+    return Buffer.concat([d.update(b.subarray(28)), d.final()]).toString('utf8');
+  } catch (e) { return null; }
+}
+
 async function sbGetMaxId(table) {
   const rows = await sbFetch('GET', table + '?select=id&order=id.desc&limit=1');
   return (rows && rows.length) ? rows[0].id : 0;
@@ -447,6 +464,147 @@ async function doGetRoster() {
   return { success: true, drivers, masters, tailors, designers, patternmasters, sampleMachEmb, sampleHandEmb, handEmbWorkers, machEmbStaff: sampleMachEmb, handEmbStaff: sampleHandEmb, handEmbDesk: await getActiveStaffNames('handemb'), displayNames: dn.byName };
 }
 
+
+// ============================================================
+// SETTINGS (everyone in one place) + DEVICE NOTIFICATIONS (Web Push, no extra npm package)
+// Needs settings_notifications.sql (staff.password_enc, staff.notify_on, push_subs, app_config).
+// ============================================================
+const SETTINGS_ROLES = ['master', 'tailor', 'designer', 'patternmaster', 'driver', 'machemb', 'handemb', 'handembworker'];
+const devRoleOf = r => (r === 'handembworker' ? 'handemb' : r);
+async function doListAllStaff() {
+  let rows, setup = false;
+  try { rows = await sbFetch('GET', `staff?select=id,name,role,sort_order,notify_on,password_enc&active=eq.true&order=sort_order.asc,created_at.asc`); }
+  catch (e) { setup = true; rows = await sbFetch('GET', `staff?select=id,name,role,sort_order&active=eq.true&order=sort_order.asc,created_at.asc`); }
+  let subs = [];
+  try { subs = (await sbFetch('GET', 'push_subs?select=staff_role,staff_name')) || []; } catch (e) { setup = true; }
+  const dn = await getDisplayNames();
+  const staff = (rows || []).filter(r => SETTINGS_ROLES.indexOf(r.role) !== -1).map(r => ({
+    id: r.id, name: r.name, role: r.role, display_name: dn.byId[r.id] || '',
+    notify: !!r.notify_on, hasPw: !!r.password_enc,
+    devices: subs.filter(s => s.staff_role === devRoleOf(r.role) && s.staff_name === r.name).length
+  }));
+  const adminDevices = subs.filter(s => ['admin', 'fulfillment', 'inventory'].indexOf(s.staff_role) !== -1).length;
+  return { success: true, staff, setup, adminDevices };
+}
+async function doStaffReveal(params) {
+  const id = parseInt(params.id, 10);
+  if (!id) return { success: false, error: 'Invalid id.' };
+  let rows;
+  try { rows = await sbFetch('GET', `staff?select=name,password_enc&id=eq.${id}&limit=1`); }
+  catch (e) { return { success: false, error: 'Run settings_notifications.sql in Supabase first.' }; }
+  const r = rows && rows[0];
+  if (!r) return { success: false, error: 'Not found.' };
+  const pw = r.password_enc ? decPw(r.password_enc) : null;
+  if (!pw) return { success: true, name: r.name, password: null };
+  return { success: true, name: r.name, password: pw };
+}
+async function doSetNotifyAll(params) {
+  const on = params.on !== false && params.on !== 'false';
+  try { await sbFetch('PATCH', `staff?active=eq.true`, { notify_on: on }, { Prefer: 'return=minimal' }); }
+  catch (e) { return { success: false, error: 'Run settings_notifications.sql in Supabase first.' }; }
+  return { success: true, on };
+}
+async function doSetNotifyOne(params) {
+  const id = parseInt(params.id, 10), on = params.on !== false && params.on !== 'false';
+  if (!id) return { success: false, error: 'Invalid id.' };
+  try { await sbFetch('PATCH', `staff?id=eq.${id}`, { notify_on: on }, { Prefer: 'return=minimal' }); }
+  catch (e) { return { success: false, error: 'Run settings_notifications.sql in Supabase first.' }; }
+  return { success: true, on };
+}
+
+// --- VAPID keys (generated once, kept in app_config) ---
+let _vapid = null;
+async function getVapid() {
+  if (_vapid) return _vapid;
+  let rec = null;
+  try { const r = await sbFetch('GET', `app_config?key=eq.vapid&select=value&limit=1`); if (r && r[0]) rec = JSON.parse(r[0].value); } catch (e) { return null; }
+  if (!rec) {
+    const kp = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const jwk = kp.publicKey.export({ format: 'jwk' });
+    const raw = Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, 'base64url'), Buffer.from(jwk.y, 'base64url')]).toString('base64url');
+    rec = { pub: raw, pem: kp.privateKey.export({ type: 'pkcs8', format: 'pem' }) };
+    try { await sbInsertOne('app_config', { key: 'vapid', value: JSON.stringify(rec) }); } catch (e) { return null; }
+  }
+  _vapid = { pub: rec.pub, key: crypto.createPrivateKey(rec.pem) };
+  return _vapid;
+}
+function vapidJwt(v, endpoint) {
+  const aud = new URL(endpoint).origin;
+  const h = Buffer.from(JSON.stringify({ typ: 'JWT', alg: 'ES256' })).toString('base64url');
+  const p = Buffer.from(JSON.stringify({ aud, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: 'mailto:' + (process.env.VAPID_SUBJECT || 'admin@aeonabaya.com') })).toString('base64url');
+  const sig = crypto.sign('sha256', Buffer.from(h + '.' + p), { key: v.key, dsaEncoding: 'ieee-p1363' }).toString('base64url');
+  return h + '.' + p + '.' + sig;
+}
+const endpointHash = e => crypto.createHash('sha256').update(String(e)).digest('hex');
+async function pushToSub(sub, msg) {
+  const v = await getVapid(); if (!v) return;
+  let pend = []; try { pend = JSON.parse(sub.pending || '[]'); } catch (e) {}
+  pend.push({ t: msg.t, b: msg.b, u: msg.u || '', at: Date.now() }); pend = pend.slice(-10);
+  try { await sbFetch('PATCH', `push_subs?id=eq.${sub.id}`, { pending: JSON.stringify(pend) }, { Prefer: 'return=minimal' }); } catch (e) { return; }
+  try {
+    const r = await fetch(sub.endpoint, { method: 'POST', headers: { Authorization: `vapid t=${vapidJwt(v, sub.endpoint)}, k=${v.pub}`, TTL: '86400', Urgency: 'high' } });
+    if (r.status === 404 || r.status === 410) await sbFetch('DELETE', `push_subs?id=eq.${sub.id}`, undefined, { Prefer: 'return=minimal' });
+  } catch (e) { console.error('push:', e.message); }
+}
+// Tell one person (by staff role + name). Never throws; the action that triggered it must not fail because of a push.
+async function notifyStaff(staffRole, name, title, body) {
+  try {
+    if (!name) return;
+    const subs = await sbFetch('GET', `push_subs?staff_role=eq.${devRoleOf(staffRole)}&staff_name=eq.${encodeURIComponent(name)}&select=*`);
+    if (!subs || !subs.length) return;
+    try { const st = await sbFetch('GET', `staff?select=notify_on&role=eq.${staffRole}&name=eq.${encodeURIComponent(name)}&active=eq.true&limit=1`); if (st && st[0] && st[0].notify_on === false) return; } catch (e) {}
+    for (const s of subs) await pushToSub(s, { t: title, b: body });
+  } catch (e) { console.error('notifyStaff:', e.message); }
+}
+async function notifyRoles(devRoles, title, body) {
+  try {
+    const subs = await sbFetch('GET', `push_subs?staff_role=in.(${devRoles.join(',')})&select=*`);
+    for (const s of (subs || [])) await pushToSub(s, { t: title, b: body });
+  } catch (e) { console.error('notifyRoles:', e.message); }
+}
+async function notifyHandDesk(title, body) {
+  try { for (const n of await getActiveStaffNames('handemb')) await notifyStaff('handemb', n, title, body); } catch (e) {}
+}
+async function doPushInfo(params) {
+  const v = await getVapid();
+  if (!v) return { success: false, error: 'Run settings_notifications.sql in Supabase first.' };
+  const role = (params.role || '').toString(), name = (params.authenticatedName || '').toString();
+  let enabled = true;
+  if (name) {
+    try {
+      const rr = role === 'handemb' ? 'in.(handemb,handembworker)' : `eq.${role}`;
+      const st = await sbFetch('GET', `staff?select=notify_on&role=${rr}&name=eq.${encodeURIComponent(name)}&active=eq.true&limit=1`);
+      enabled = !!(st && st[0] && st[0].notify_on);
+    } catch (e) { enabled = false; }
+  }
+  return { success: true, publicKey: v.pub, enabled };
+}
+async function doPushSubscribe(params) {
+  const sub = params.subscription || {};
+  const endpoint = (sub.endpoint || '').toString();
+  if (!endpoint) return { success: false, error: 'No subscription.' };
+  const role = (params.role || '').toString(), name = (params.authenticatedName || '').toString();
+  const fields = { staff_role: role, staff_name: name, p256dh: (sub.keys && sub.keys.p256dh) || '', auth: (sub.keys && sub.keys.auth) || '', ehash: endpointHash(endpoint) };
+  try {
+    const ex = await sbFetch('GET', `push_subs?endpoint=eq.${encodeURIComponent(endpoint)}&select=id&limit=1`);
+    if (ex && ex[0]) await sbFetch('PATCH', `push_subs?id=eq.${ex[0].id}`, fields, { Prefer: 'return=minimal' });
+    else await sbInsertOne('push_subs', Object.assign({ endpoint, pending: '[]' }, fields));
+  } catch (e) { return { success: false, error: 'Run settings_notifications.sql in Supabase first.' }; }
+  return { success: true };
+}
+async function doPushUnsubscribe(params) {
+  const endpoint = (params.endpoint || '').toString();
+  if (endpoint) { try { await sbFetch('DELETE', `push_subs?endpoint=eq.${encodeURIComponent(endpoint)}`, undefined, { Prefer: 'return=minimal' }); } catch (e) {} }
+  return { success: true };
+}
+async function doPushTest(params) {
+  const id = parseInt(params.id, 10);
+  const rows = await sbFetch('GET', `staff?select=name,role&id=eq.${id}&limit=1`);
+  const r = rows && rows[0]; if (!r) return { success: false, error: 'Not found.' };
+  await notifyStaff(r.role, r.name, 'Aeon Tracker', 'Test notification — it works.');
+  return { success: true };
+}
+
 async function doListStaff(params) {
   const staffRole = (params.staffRole || '').toString();
   if (STAFF_ROLES.indexOf(staffRole) === -1) {
@@ -468,6 +626,7 @@ async function doAddStaff(params) {
   if (!password || password.length < 4) {
     return { success: false, error: 'Password must be at least 4 characters.' };
   }
+  if (staffRole === 'tailor' && !/^\d{4}$/.test(password)) return { success: false, error: 'A tailor\'s password is their 4-digit PIN (numbers only).' };
 
   const current = await getActiveStaff(staffRole);
   // No cap on the number of tailors — the tailor name is stored directly on each order.
@@ -478,20 +637,19 @@ async function doAddStaff(params) {
   );
   const nextOrder = current.reduce((max, s) => Math.max(max, s.sort_order || 0), 0) + 1;
   const { hash, salt } = hashPassword(password);
-  if (existing && existing.length) {
-    if (existing[0].active) return { success: false, error: 'That name is already on the list.' };
-    // Removed earlier (rows are only deactivated, and role+name is unique) — bring it back with the new password.
-    await sbFetch('PATCH', `staff?id=eq.${existing[0].id}`, {
-      password_hash: hash, password_salt: salt, active: true, sort_order: nextOrder
-    }, { Prefer: 'return=minimal' });
+  const extra = staffRole === 'tailor' ? { atelier_pin_hash: hash, atelier_pin_salt: salt } : {}; // one password = the tailor's PIN
+  const withEnc = Object.assign({ password_enc: encPw(password) }, extra);
+  async function tryWrite(fields) {
+    if (existing && existing.length) {
+      if (existing[0].active) return { success: false, error: 'That name is already on the list.' };
+      await sbFetch('PATCH', `staff?id=eq.${existing[0].id}`, Object.assign({ password_hash: hash, password_salt: salt, active: true, sort_order: nextOrder }, fields), { Prefer: 'return=minimal' });
+      return { success: true };
+    }
+    await sbInsertOne('staff', Object.assign({ role: staffRole, name, password_hash: hash, password_salt: salt, active: true, sort_order: nextOrder }, fields));
     return { success: true };
   }
-  await sbInsertOne('staff', {
-    role: staffRole, name,
-    password_hash: hash, password_salt: salt,
-    active: true, sort_order: nextOrder
-  });
-  return { success: true };
+  try { return await tryWrite(withEnc); }
+  catch (e) { return await tryWrite(extra); } // password_enc column not added yet (settings_notifications.sql)
 }
 
 async function doRemoveStaff(params) {
@@ -513,10 +671,14 @@ async function doSetStaffPassword(params) {
   const password = (params.password || '').toString();
   if (!id) return { success: false, error: 'Invalid id.' };
   if (password.length < 4) return { success: false, error: 'Password must be at least 4 characters.' };
-  const rows = await sbFetch('GET', `staff?select=id,name&id=eq.${id}&active=eq.true&limit=1`);
+  const rows = await sbFetch('GET', `staff?select=id,name,role&id=eq.${id}&active=eq.true&limit=1`);
   if (!rows || !rows.length) return { success: false, error: 'Not found.' };
+  if (rows[0].role === 'tailor' && !/^\d{4}$/.test(password)) return { success: false, error: 'A tailor\'s password is their 4-digit PIN (numbers only).' };
   const { hash, salt } = hashPassword(password);
-  await sbFetch('PATCH', `staff?id=eq.${id}`, { password_hash: hash, password_salt: salt }, { Prefer: 'return=minimal' });
+  const base = { password_hash: hash, password_salt: salt };
+  if (rows[0].role === 'tailor') { base.atelier_pin_hash = hash; base.atelier_pin_salt = salt; }
+  try { await sbFetch('PATCH', `staff?id=eq.${id}`, Object.assign({ password_enc: encPw(password) }, base), { Prefer: 'return=minimal' }); }
+  catch (e) { await sbFetch('PATCH', `staff?id=eq.${id}`, base, { Prefer: 'return=minimal' }); }
   return { success: true, name: rows[0].name };
 }
 
@@ -663,6 +825,19 @@ async function doGetSkuImage(params) {
 }
 
 app.get('/health', (req, res) => res.json({ ok: true }));
+// The service worker asks here what to show when a (payload-less) push arrives. Only a device's own hash can read its messages.
+app.get('/push/inbox', async (req, res) => {
+  try {
+    const h = (req.query.h || '').toString();
+    if (!/^[0-9a-f]{64}$/.test(h)) return res.json({ msgs: [] });
+    const rows = await sbFetch('GET', `push_subs?ehash=eq.${h}&select=id,pending&limit=1`);
+    const r = rows && rows[0];
+    if (!r) return res.json({ msgs: [] });
+    let msgs = []; try { msgs = JSON.parse(r.pending || '[]'); } catch (e) {}
+    if (msgs.length) await sbFetch('PATCH', `push_subs?id=eq.${r.id}`, { pending: '[]' }, { Prefer: 'return=minimal' });
+    res.json({ msgs });
+  } catch (e) { res.json({ msgs: [] }); }
+});
 
 // Accept both GET (query string) and POST (JSON body) — merged the same
 // way Apps Script's e.parameter + postData used to be, so you can switch
@@ -725,9 +900,10 @@ app.all('/api', async (req, res) => {
 });
 
 function checkPermission(action, role) {
-  if (action === 'getOrders' || action === 'getFabricInventory' || action === 'getSamples' || action === 'getSkuImages' || action === 'getSkuImage') return null;
   if (!action) return { success: false, error: 'Missing action.' };
   if (!role) return { success: false, error: 'Missing role — please log in again.' };
+  if (action === 'pushInfo' || action === 'pushSubscribe' || action === 'pushUnsubscribe') return null;
+  if (action === 'getOrders' || action === 'getFabricInventory' || action === 'getSamples' || action === 'getSkuImages' || action === 'getSkuImage') return role === 'driver' ? { success: false, error: 'Not allowed.' } : null;
   if (role === 'admin') return null;
 
   const allowed = ROLE_PERMISSIONS[role];
@@ -891,6 +1067,14 @@ async function routeActionInner(action, params) {
     case 'driverList': return doDriverList(params);
     case 'driverPickup': return doDriverPickup(params);
     case 'driverAssign': return doDriverAssign(params);
+    case 'listAllStaff': return doListAllStaff(params);
+    case 'staffReveal': return doStaffReveal(params);
+    case 'setNotifyAll': return doSetNotifyAll(params);
+    case 'setNotifyOne': return doSetNotifyOne(params);
+    case 'pushInfo': return doPushInfo(params);
+    case 'pushSubscribe': return doPushSubscribe(params);
+    case 'pushUnsubscribe': return doPushUnsubscribe(params);
+    case 'pushTest': return doPushTest(params);
     case 'handPartsList': return doHandPartsList(params);
     case 'handSplit': return doHandSplit(params);
     case 'handPartAdd': return doHandPartAdd(params);
@@ -1492,6 +1676,7 @@ async function doUpdateMachEmb(params) {
   }
 
   await sbUpdate('orders', row - 2, patch);
+  if (String(value).startsWith('NEED|')) notifyRoles(['admin'], 'Machine embroidery needed', 'Order ' + (await getOrderNo(row)) + ' — choose Abdullah or Asif.');
   return { success: true, match };
 }
 
@@ -1547,6 +1732,7 @@ async function doSendOrderEmb(params) {
   }
   await sbUpdate('orders', row - 2, patch);
   pushShopifyUpdate(rec.order_no, 'Machine embroidery — with Asif');
+  notifyStaff('machemb', 'Asif', 'Piece for you', 'Order ' + rec.order_no + ' is handed over to you.');
   return { success: true, kind: 'mach', person, tailor: rec.tailor, master: fromMaster ? rec.master : '', fromMaster, value };
 }
 
@@ -1588,6 +1774,7 @@ async function doEmbAssignWorker(params) {
   if (parseEmbValue(rec.hand_emb).code !== 'RCVD') return { success: false, error: 'Receive the order first, then assign a person.' };
   if ((await getHandParts(row - 2)).length) return { success: false, error: 'This order is split between several people already.' };
   await sbUpdate('orders', row - 2, { hand_emb_person: worker });
+  notifyStaff('handembworker', worker, 'Hand embroidery for you', 'Order ' + rec.order_no + ' is assigned to you.');
   return { success: true, kind: 'hand', person: worker };
 }
 
@@ -1731,12 +1918,15 @@ async function doDriverAssign(params) {
   const driver = (params.driver || '').toString().trim();
   if (!rowsIn.length) return { success: false, error: 'Nothing selected.' };
   if (driver && (await getActiveStaffNames('driver')).indexOf(driver) === -1) return { success: false, error: 'Unknown driver.' };
+  let n = 0;
   for (const row of rowsIn) {
     const rec = await loadEmbRec(row);
     if (!rec || rec.mach_emb_person !== 'Abdullah') continue;
     await sbUpdate('orders', rec.id, { driver_name: driver || null });
+    n++;
     logOrderEvent({ orderId: rec.id, orderNo: rec.order_no, sku: rec.sku }, 'embroidery', driver ? `Assigned to driver ${driver} (machine embroidery)` : 'Driver assignment removed', 'admin');
   }
+  if (driver && n) notifyStaff('driver', driver, 'Pieces to take to Abdullah', n + ' piece' + (n === 1 ? '' : 's') + ' assigned to you.');
   return { success: true };
 }
 async function doDriverPickup(params) {
@@ -1764,6 +1954,10 @@ async function doDriverPickup(params) {
     logOrderEvent({ orderId: rec.id, orderNo: rec.order_no, sku: rec.sku }, 'embroidery', dir === 'to' ? `${who} took it to Abdullah (machine embroidery)` : `${who} picked it up from Abdullah`, driver);
     pushShopifyUpdate(rec.order_no, dir === 'to' ? 'Machine embroidery — on the way to Abdullah' : 'Machine embroidery — on the way back from Abdullah');
     ok.push(Object.assign(base, { dir, value }));
+  }
+  if (ok.length) {
+    if (ok[0].dir === 'to') notifyStaff('machemb', 'Abdullah', 'Pieces on the way', ok.length + ' piece' + (ok.length === 1 ? ' is' : 's are') + ' coming to you with ' + who + '.');
+    else notifyRoles(['admin'], 'Pieces coming back', ok.length + ' piece' + (ok.length === 1 ? '' : 's') + ' from Abdullah — ' + who + ' is bringing ' + (ok.length === 1 ? 'it' : 'them') + ' back.');
   }
   return { success: true, ok, skipped };
 }
@@ -1986,6 +2180,7 @@ async function doHandSplit(params) {
   await syncHandOrder(rec.id);
   logOrderEvent({ orderId: rec.id, orderNo: rec.order_no, sku: rec.sku }, 'embroidery', `Hand embroidery split between ${list.map(p => p.person + ' (' + ((p.label || '').toString().trim() || 'part') + ')').join(', ')}`, by);
   pushShopifyUpdate(rec.order_no, `Hand embroidery — split between ${list.map(p => p.person).join(', ')}`);
+  list.forEach(p => notifyStaff('handembworker', p.person, 'Hand embroidery for you', 'Order ' + rec.order_no + ' — your part: ' + ((p.label || '').toString().trim() || 'part') + '.'));
   return { success: true };
 }
 async function doHandPartAdd(params) {
@@ -2005,6 +2200,7 @@ async function doHandPartAdd(params) {
   await sbInsertOne('hand_emb_parts', { order_id: rec.id, order_no: rec.order_no, sku: rec.sku, person, label, status: 'assigned', assigned_by: by });
   await syncHandOrder(rec.id);
   logOrderEvent({ orderId: rec.id, orderNo: rec.order_no, sku: rec.sku }, 'embroidery', `Hand embroidery — ${person} added (${label})`, by);
+  notifyStaff('handembworker', person, 'Hand embroidery for you', 'Order ' + rec.order_no + ' — your part: ' + label + '.');
   return { success: true };
 }
 async function handLoadPart(params) {
@@ -2097,6 +2293,7 @@ async function doUpdateHandEmb(params) {
     return { success: false, error: 'Invalid hand embroidery value format.' };
   }
   await sbUpdate('orders', row - 2, { hand_emb: value, hand_emb_person: value.startsWith('RED|') ? ((params.person || '').toString() || null) : null });
+  if (value.startsWith('NEED|')) notifyHandDesk('Hand embroidery needed', 'Order ' + (await getOrderNo(row)) + ' needs hand embroidery.');
   return { success: true };
 }
 
@@ -2123,6 +2320,7 @@ async function doUpdateMaster(params) {
   }
   await sbUpdate('orders', id, { master, master_assigned_at: new Date().toISOString(), master_work: null });
   pushShopifyUpdate(await getOrderNo(row), `In cutting — assigned to Master: ${master}`);
+  notifyStaff('master', master, 'New order to cut', 'Order ' + (await getOrderNo(row)) + ' is assigned to you.');
   return { success: true };
 }
 
@@ -2272,6 +2470,7 @@ async function doUpdateTailor(params) {
   }
   await sbUpdate('orders', id, { tailor, tailor_assigned_at: new Date().toISOString(), rework_note: null });
   pushShopifyUpdate(await getOrderNo(row), `With Tailor: ${tailor}`);
+  notifyStaff('tailor', tailor, 'New job', 'Order ' + (await getOrderNo(row)) + ' is assigned to you.');
   return { success: true };
 }
 
@@ -2643,6 +2842,7 @@ async function doAssignSampleMaster(params) {
     return { success: false, error: 'Unknown pattern master: ' + master };
   }
   await sbUpdate('design_samples', row - 1, { master });
+  notifyStaff('patternmaster', master, 'New sample pattern', 'A sample is assigned to you.');
   return { success: true };
 }
 
@@ -2669,6 +2869,7 @@ async function doAssignSampleTailor(params) {
   }
   const nowIso = new Date().toISOString();
   await sbUpdate('design_samples', row - 1, { tailor, tailor_started_at: nowIso });
+  notifyStaff('tailor', tailor, 'New sample', 'A sample is assigned to you.');
   try { await sbUpdate('design_samples', row - 1, { pm_ended_at: nowIso }); } catch (e) { /* column not added yet */ }
   return { success: true };
 }
