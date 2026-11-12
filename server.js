@@ -939,11 +939,11 @@ async function doShopOrder(params) {
   const st = shopStore((params.store || '').toString()); if (!st) return { success: false, error: 'Shopify is not configured.' };
   const id = (params.id || '').toString(); if (!id) return { success: false, error: 'Missing order id.' };
   const d = await shopGQL(st, `query($id: ID!) { order(id: $id) { ${SHOP_ORDER_FIELDS}
-    events(first: 100, sortKey: CREATED_AT, reverse: true) { edges { node { id message createdAt ... on CommentEvent { author { name } } ... on BasicEvent { attributeToUser attributeToApp } } } }
+    events(first: 100, sortKey: CREATED_AT, reverse: true) { edges { node { id message createdAt ... on BasicEvent { attributeToUser attributeToApp appTitle } } } }
     fulfillmentOrders(first: 10) { edges { node { id status lineItems(first: 50) { edges { node { id remainingQuantity lineItem { id } } } } } } } } }`, { id });
   if (!d.order) return { success: false, error: 'Order not found on Shopify.' };
   const o = shopSlimOrder(d.order, st);
-  o.events = d.order.events.edges.map(e => e.node).map(ev => ({ at: ev.createdAt, text: String(ev.message || '').replace(/<[^>]+>/g, ''), who: (ev.author && ev.author.name) || '', src: 'Shopify' }));
+  o.events = d.order.events.edges.map(e => e.node).map(ev => ({ at: ev.createdAt, text: String(ev.message || '').replace(/<[^>]+>/g, ''), who: ev.appTitle || '', src: 'Shopify' }));
   o.fulfillmentOrders = d.order.fulfillmentOrders.edges.map(e => e.node).filter(f => ['OPEN', 'IN_PROGRESS', 'SCHEDULED', 'ON_HOLD'].indexOf(f.status) !== -1)
     .map(f => ({ id: f.id, lines: f.lineItems.edges.map(x => x.node).filter(l => l.remainingQuantity > 0).map(l => ({ id: l.id, lineItemId: l.lineItem.id, left: l.remainingQuantity })) }));
   // tracker side: lines + events
