@@ -103,8 +103,9 @@ async function findShopifyOrder(orderNo) {
   const data = await shopifyGraphQL(
     `query($q: String!) {
       orders(first: 1, query: $q) {
-        edges { node { id name
+        edges { node { id name note
           metafield(namespace: "production_tracker", key: "timeline") { value }
+          custNote: metafield(namespace: "production_tracker", key: "customer_note") { value }
         } }
       }
     }`,
@@ -127,6 +128,10 @@ async function pushShopifyUpdate(orderNo, statusLine) {
     const ts = new Date().toLocaleString('en-GB', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' });
     const prevLog = (order.metafield && order.metafield.value) || '';
     const newLog = (prevLog ? prevLog + '\n' : '') + `[${ts}] ${statusLine}`;
+    // The order note is overwritten with the status line, so keep the customer's own note aside the first time.
+    const mfs = [{ namespace: 'production_tracker', key: 'timeline', type: 'multi_line_text_field', value: newLog }];
+    const curNote = (order.note || '').trim();
+    if (curNote && !(order.custNote && order.custNote.value) && !/^\[\d\d\/\d\d\/\d{4}/.test(curNote) && prevLog.indexOf(curNote) === -1) mfs.push({ namespace: 'production_tracker', key: 'customer_note', type: 'multi_line_text_field', value: curNote });
 
     await shopifyGraphQL(
       `mutation($input: OrderInput!) {
@@ -135,7 +140,7 @@ async function pushShopifyUpdate(orderNo, statusLine) {
       { input: {
         id: order.id,
         note: statusLine,
-        metafields: [{ namespace: 'production_tracker', key: 'timeline', type: 'multi_line_text_field', value: newLog }]
+        metafields: mfs
       } }
     );
   } catch (e) {
@@ -323,7 +328,7 @@ const ROLE_PERMISSIONS = {
     'getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'addOrder', 'updateOrderDetails', 'updateFabric', 'updateFabricDetails',
     'updateMachEmb', 'updateHandEmb', 'updateMaster', 'updateTailor',
     'masterStart', 'masterPause', 'masterResume', 'masterFinish', 'masterReturn',
-    'setEmbPerson', 'driverList', 'driverPickup', 'driverAssign', 'embAdminReceive', 'embReady', 'embMasterReceive', 'embAssignWorker',
+    'setEmbPerson', 'driverList', 'driverPickup', 'driverAssign', 'embAdminReceive', 'shopList', 'shopOrder', 'shopFulfil', 'shopComment', 'shopNote', 'shopTags', 'embReady', 'embMasterReceive', 'embAssignWorker',
     'markDone', 'undoMarkDone', 'updateUrgent', 'atelierJobsForLine',
     'getSamples', 'addSample', 'assignSampleTailor', 'assignSampleMaster',
     'markSampleDone', 'undoSampleDone', 'sendSampleEmb', 'receiveSampleEmb',
@@ -735,7 +740,7 @@ async function doReorderStaff(params) {
 // Express app
 // ============================================================
 const app = express();
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '2mb', verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(
   cors({
     origin: ALLOWED_ORIGINS.includes('*') ? true : ALLOWED_ORIGINS,
@@ -824,6 +829,232 @@ async function doGetSkuImage(params) {
   skuImgCache.set(id, dataUrl);
   return { success: true, dataUrl };
 }
+
+
+// ============================================================
+// FULFILLMENT — Shopify orders inside the tracker (list, order page, receipt,
+// fulfil, comments, webhooks). One store from SHOPIFY_STORE_DOMAIN/TOKEN, or
+// several from SHOPIFY_STORES='[{"key":"A","name":"Aeon Abaya","domain":"x.myshopify.com","token":"shpat_..."}]'.
+// ============================================================
+const SHOP_STORES = (() => {
+  try { const j = JSON.parse(process.env.SHOPIFY_STORES || 'null'); if (Array.isArray(j) && j.length) return j.filter(s => s.domain && s.token).map((s, i) => ({ key: s.key || String.fromCharCode(65 + i), name: s.name || s.domain, domain: s.domain, token: s.token })); } catch (e) {}
+  return SHOPIFY_ENABLED ? [{ key: 'A', name: process.env.SHOPIFY_STORE_NAME || 'Aeon Abaya', domain: SHOPIFY_STORE, token: SHOPIFY_TOKEN }] : [];
+})();
+const shopStore = key => SHOP_STORES.find(s => s.key === key) || SHOP_STORES[0];
+async function shopGQL(store, query, variables) {
+  const res = await fetch(`https://${store.domain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': store.token }, body: JSON.stringify({ query, variables }) });
+  const json = await res.json();
+  if (json.errors) throw new Error(json.errors.map(e => e.message).join('; '));
+  return json.data;
+}
+const SHOP_ORDER_FIELDS = `
+  id name createdAt updatedAt closed cancelledAt note tags sourceName paymentGatewayNames
+  displayFinancialStatus displayFulfillmentStatus email phone
+  customer { displayName email phone }
+  shippingAddress { name address1 address2 city province zip country phone }
+  billingAddress { name address1 address2 city province zip country phone }
+  shippingLine { title }
+  customAttributes { key value }
+  custNote: metafield(namespace: "production_tracker", key: "customer_note") { value }
+  trkLog: metafield(namespace: "production_tracker", key: "timeline") { value }
+  subtotalPriceSet { shopMoney { amount currencyCode } }
+  totalShippingPriceSet { shopMoney { amount } }
+  totalTaxSet { shopMoney { amount } }
+  totalDiscountsSet { shopMoney { amount } }
+  totalPriceSet { shopMoney { amount currencyCode } }
+  lineItems(first: 50) { edges { node { id title sku quantity currentQuantity unfulfilledQuantity variantTitle
+    image { url(transform: { maxWidth: 160, maxHeight: 160 }) }
+    originalUnitPriceSet { shopMoney { amount } } discountedTotalSet { shopMoney { amount } }
+    customAttributes { key value } } } }
+  fulfillments(first: 10) { status createdAt trackingInfo { number company url } }`;
+const money = m => (m && m.shopMoney) ? Number(m.shopMoney.amount) : 0;
+function shopSlimOrder(n, store) {
+  const items = (n.lineItems ? n.lineItems.edges : []).map(e => e.node).map(li => ({
+    id: li.id, title: li.title, variant: li.variantTitle || '', sku: li.sku || '', qty: li.currentQuantity != null ? li.currentQuantity : li.quantity, left: li.unfulfilledQuantity || 0,
+    img: li.image ? li.image.url : '', price: money(li.originalUnitPriceSet), total: money(li.discountedTotalSet), attrs: (li.customAttributes || []).filter(a => a.value)
+  })).filter(li => li.qty > 0);
+  const trk = (n.fulfillments || []).flatMap(f => f.trackingInfo || []).filter(t => t.number || t.url);
+  const cust = n.customer || {};
+  const sa = n.shippingAddress || null;
+  return {
+    store: store.key, storeName: store.name, id: n.id, name: n.name, no: String(n.name || '').replace(/^#/, ''),
+    createdAt: n.createdAt, updatedAt: n.updatedAt, closed: !!n.closed, cancelledAt: n.cancelledAt || null,
+    pay: n.displayFinancialStatus || '', ful: n.displayFulfillmentStatus || '', source: n.sourceName || '', gateways: n.paymentGatewayNames || [],
+    customer: cust.displayName || (sa && sa.name) || n.email || 'Guest', email: n.email || cust.email || '', phone: n.phone || cust.phone || (sa && sa.phone) || '',
+    ship: sa, bill: n.billingAddress || null, shipping: n.shippingLine ? n.shippingLine.title : '',
+    note: (n.custNote && n.custNote.value) || n.note || '', shopNote: n.note || '', trackerLog: (n.trkLog && n.trkLog.value) || '',
+    attrs: (n.customAttributes || []).filter(a => a.value), tags: n.tags || [], items, itemCount: items.reduce((s, i) => s + i.qty, 0), tracking: trk,
+    totals: { currency: (n.totalPriceSet && n.totalPriceSet.shopMoney.currencyCode) || '', subtotal: money(n.subtotalPriceSet), shipping: money(n.totalShippingPriceSet), tax: money(n.totalTaxSet), discount: money(n.totalDiscountsSet), total: money(n.totalPriceSet) }
+  };
+}
+// ---- cache: per store, orders from the last 90 days (max 250) ----
+const SHOP_CACHE = {}; // key -> { at, orders }
+const SHOP_TTL = 3 * 60 * 1000;
+async function shopFetchAll(store) {
+  const since = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+  let cursor = null, out = [], pages = 0;
+  do {
+    const d = await shopGQL(store, `query($c: String, $q: String) { orders(first: 50, after: $c, query: $q, sortKey: CREATED_AT, reverse: true) { pageInfo { hasNextPage endCursor } edges { node { ${SHOP_ORDER_FIELDS} } } } }`, { c: cursor, q: `created_at:>=${since}` });
+    const conn = d.orders;
+    conn.edges.forEach(e => out.push(shopSlimOrder(e.node, store)));
+    cursor = conn.pageInfo.hasNextPage ? conn.pageInfo.endCursor : null; pages++;
+  } while (cursor && pages < 5);
+  return out;
+}
+async function shopOrders(store, force) {
+  const c = SHOP_CACHE[store.key];
+  if (!force && c && Date.now() - c.at < SHOP_TTL) return c.orders;
+  const orders = await shopFetchAll(store);
+  SHOP_CACHE[store.key] = { at: Date.now(), orders };
+  return orders;
+}
+function shopBust(key) { delete SHOP_CACHE[key]; }
+async function shopFindByNo(orderNo) {
+  const clean = String(orderNo || '').trim().replace(/^#/, '');
+  for (const st of SHOP_STORES) {
+    try {
+      const d = await shopGQL(st, `query($q: String!) { orders(first: 1, query: $q) { edges { node { ${SHOP_ORDER_FIELDS} } } } }`, { q: `name:${clean} OR name:#${clean}` });
+      const e = d.orders.edges[0]; if (e) return { store: st, order: shopSlimOrder(e.node, st), raw: e.node };
+    } catch (e) {}
+  }
+  return null;
+}
+async function doShopList(params) {
+  if (!SHOP_STORES.length) return { success: false, error: 'Shopify is not configured on the server (SHOPIFY_STORE_DOMAIN / SHOPIFY_ADMIN_TOKEN).' };
+  const force = params.force === true || params.force === 'true';
+  const all = [], errors = [];
+  for (const st of SHOP_STORES) { try { all.push(...await shopOrders(st, force)); } catch (e) { errors.push(st.name + ': ' + e.message); } }
+  all.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  // tracker lines for the production column (order_no + sku -> row)
+  const nos = [...new Set(all.map(o => o.no))];
+  let trk = [];
+  for (let i = 0; i < nos.length; i += 100) {
+    try { trk.push(...((await sbFetch('GET', `orders?order_no=in.(${nos.slice(i, i + 100).map(n => '"' + n.replace(/"/g, '') + '"').join(',')})&select=id,order_no,sku,is_done,cleanup_at`)) || [])); } catch (e) {}
+  }
+  const rowsByNo = {}; trk.forEach(r => { (rowsByNo[r.order_no] = rowsByNo[r.order_no] || []).push({ row: r.id + 2, sku: r.sku, done: !!r.is_done }); });
+  all.forEach(o => { o.trk = rowsByNo[o.no] || []; });
+  return { success: true, stores: SHOP_STORES.map(s => ({ key: s.key, name: s.name })), orders: all.map(o => Object.assign({}, o, { totals: undefined, bill: undefined })), errors, at: Date.now() };
+}
+async function doShopOrder(params) {
+  const st = shopStore((params.store || '').toString()); if (!st) return { success: false, error: 'Shopify is not configured.' };
+  const id = (params.id || '').toString(); if (!id) return { success: false, error: 'Missing order id.' };
+  const d = await shopGQL(st, `query($id: ID!) { order(id: $id) { ${SHOP_ORDER_FIELDS}
+    events(first: 100, sortKey: CREATED_AT, reverse: true) { edges { node { id message createdAt ... on CommentEvent { author { name } } ... on BasicEvent { attributeToUser attributeToApp } } } }
+    fulfillmentOrders(first: 10) { edges { node { id status lineItems(first: 50) { edges { node { id remainingQuantity lineItem { id } } } } } } } } }`, { id });
+  if (!d.order) return { success: false, error: 'Order not found on Shopify.' };
+  const o = shopSlimOrder(d.order, st);
+  o.events = d.order.events.edges.map(e => e.node).map(ev => ({ at: ev.createdAt, text: String(ev.message || '').replace(/<[^>]+>/g, ''), who: (ev.author && ev.author.name) || '', src: 'Shopify' }));
+  o.fulfillmentOrders = d.order.fulfillmentOrders.edges.map(e => e.node).filter(f => ['OPEN', 'IN_PROGRESS', 'SCHEDULED', 'ON_HOLD'].indexOf(f.status) !== -1)
+    .map(f => ({ id: f.id, lines: f.lineItems.edges.map(x => x.node).filter(l => l.remainingQuantity > 0).map(l => ({ id: l.id, lineItemId: l.lineItem.id, left: l.remainingQuantity })) }));
+  // tracker side: lines + events
+  let trkRows = [], trkEvents = [];
+  try { trkRows = (await sbFetch('GET', `orders?order_no=eq.${encodeURIComponent(o.no)}&select=id,sku,is_done,master,tailor,fabric_status,machine_emb,hand_emb,mach_emb_person,hand_emb_person,remarks,cleanup_at`)) || []; } catch (e) {}
+  try { trkEvents = (await sbFetch('GET', `order_events?order_no=eq.${encodeURIComponent(o.no)}&select=at,kind,text,actor,sku&order=at.desc&limit=300`)) || []; } catch (e) {}
+  o.trk = trkRows.map(r => ({ row: r.id + 2, sku: r.sku, done: !!r.is_done }));
+  o.trkEvents = trkEvents.map(e => ({ at: e.at, text: e.text + (e.sku ? ' · ' + e.sku : ''), who: e.actor || '', src: 'Tracker', kind: e.kind }));
+  return { success: true, order: o };
+}
+// Fulfil on Shopify (all remaining items, or only the given line item ids) + mark the tracker lines done.
+async function shopFulfil(st, orderId, lineItemIds, tracking, notify) {
+  const d = await shopGQL(st, `query($id: ID!) { order(id: $id) { name fulfillmentOrders(first: 10) { edges { node { id status lineItems(first: 50) { edges { node { id remainingQuantity lineItem { id } } } } } } } } }`, { id: orderId });
+  if (!d.order) throw new Error('Order not found on Shopify.');
+  const want = lineItemIds && lineItemIds.length ? new Set(lineItemIds) : null;
+  const groups = d.order.fulfillmentOrders.edges.map(e => e.node).filter(f => ['OPEN', 'IN_PROGRESS', 'SCHEDULED'].indexOf(f.status) !== -1).map(f => ({
+    fulfillmentOrderId: f.id,
+    fulfillmentOrderLineItems: f.lineItems.edges.map(x => x.node).filter(l => l.remainingQuantity > 0 && (!want || want.has(l.lineItem.id))).map(l => ({ id: l.id, quantity: l.remainingQuantity }))
+  })).filter(g => g.fulfillmentOrderLineItems.length);
+  if (!groups.length) return { already: true, name: d.order.name };
+  const f = { lineItemsByFulfillmentOrder: groups, notifyCustomer: notify !== false };
+  if (tracking && (tracking.number || tracking.url)) f.trackingInfo = { number: tracking.number || undefined, company: tracking.company || undefined, url: tracking.url || undefined };
+  const r = await shopGQL(st, `mutation($f: FulfillmentV2Input!) { fulfillmentCreateV2(fulfillment: $f) { fulfillment { id status } userErrors { field message } } }`, { f });
+  const ue = r.fulfillmentCreateV2.userErrors;
+  if (ue && ue.length) throw new Error(ue.map(u => u.message).join('; '));
+  shopBust(st.key);
+  return { fulfilled: true, name: d.order.name };
+}
+async function doShopFulfil(params) {
+  const st = shopStore((params.store || '').toString()); if (!st) return { success: false, error: 'Shopify is not configured.' };
+  const id = (params.id || '').toString(); if (!id) return { success: false, error: 'Missing order id.' };
+  const who = (params.authenticatedName || params.role || 'fulfillment').toString();
+  let r;
+  try { r = await shopFulfil(st, id, Array.isArray(params.lineItemIds) ? params.lineItemIds : null, params.tracking || null, params.notify !== false && params.notify !== 'false'); }
+  catch (e) { return { success: false, error: 'Shopify refused: ' + e.message }; }
+  const no = String(r.name || '').replace(/^#/, '');
+  // tracker lines of this order -> Done (all of them, or the SKUs that were fulfilled)
+  try {
+    const skus = Array.isArray(params.skus) ? params.skus.filter(Boolean) : [];
+    let q = `orders?order_no=eq.${encodeURIComponent(no)}&is_done=eq.false&select=id,sku`;
+    if (skus.length) q += `&sku=in.(${skus.map(s => '"' + String(s).replace(/"/g, '') + '"').join(',')})`;
+    const rows = (await sbFetch('GET', q)) || [];
+    for (const row of rows) {
+      await sbUpdate('orders', row.id, { is_done: true, done_at: new Date().toISOString() });
+      logOrderEvent({ orderId: row.id, orderNo: no, sku: row.sku }, 'done', 'Fulfilled on Shopify by ' + who + ' — marked Done', who);
+    }
+  } catch (e) {}
+  logOrderEvent({ orderNo: no }, 'done', r.already ? 'Already fulfilled on Shopify' : 'Order fulfilled on Shopify (' + st.name + ') by ' + who, who);
+  return { success: true, already: !!r.already };
+}
+// Tracker side finished the whole order -> fulfil it on Shopify (best effort, never blocks).
+async function shopifyMaybeFulfill(orderNo, who) {
+  try {
+    if (!SHOP_STORES.length || !orderNo) return;
+    const open = await sbFetch('GET', `orders?order_no=eq.${encodeURIComponent(orderNo)}&is_done=eq.false&select=id&limit=1`);
+    if (open && open.length) return; // other lines still in production
+    const f = await shopFindByNo(orderNo);
+    if (!f || f.order.cancelledAt || f.order.ful === 'FULFILLED') return;
+    const r = await shopFulfil(f.store, f.order.id, null, null, true);
+    if (r.fulfilled) logOrderEvent({ orderNo: String(orderNo) }, 'done', 'All lines done in the tracker → fulfilled on Shopify (' + f.store.name + ')', who || 'tracker');
+  } catch (e) { console.error('shopifyMaybeFulfill:', e.message); }
+}
+// Comment: kept in the tracker timeline and appended to the order's tracker log on Shopify (Shopify has no API to add timeline comments).
+async function doShopComment(params) {
+  const no = (params.no || '').toString().replace(/^#/, ''), text = (params.text || '').toString().trim().slice(0, 500);
+  if (!no || !text) return { success: false, error: 'Nothing to post.' };
+  const who = (params.authenticatedName || params.role || '').toString();
+  logOrderEvent({ orderNo: no }, 'comment', text, who);
+  pushShopifyUpdate(no, `Comment (${who}): ${text}`);
+  return { success: true };
+}
+async function doShopNote(params) {
+  const st = shopStore((params.store || '').toString()); if (!st) return { success: false, error: 'Shopify is not configured.' };
+  const id = (params.id || '').toString(), note = (params.note || '').toString().slice(0, 2000);
+  const r = await shopGQL(st, `mutation($input: OrderInput!) { orderUpdate(input: $input) { userErrors { message } } }`, { input: { id, metafields: [{ namespace: 'production_tracker', key: 'customer_note', type: 'multi_line_text_field', value: note || ' ' }] } });
+  const ue = r.orderUpdate.userErrors; if (ue && ue.length) return { success: false, error: ue.map(u => u.message).join('; ') };
+  shopBust(st.key);
+  return { success: true };
+}
+async function doShopTags(params) {
+  const st = shopStore((params.store || '').toString()); if (!st) return { success: false, error: 'Shopify is not configured.' };
+  const id = (params.id || '').toString(), tags = (Array.isArray(params.tags) ? params.tags : String(params.tags || '').split(',')).map(t => t.trim()).filter(Boolean);
+  const r = await shopGQL(st, `mutation($input: OrderInput!) { orderUpdate(input: $input) { userErrors { message } } }`, { input: { id, tags } });
+  const ue = r.orderUpdate.userErrors; if (ue && ue.length) return { success: false, error: ue.map(u => u.message).join('; ') };
+  shopBust(st.key);
+  return { success: true };
+}
+// ---- Webhooks (orders/create, orders/updated, orders/cancelled, fulfillments/*) ----
+const SHOP_WH_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || '';
+app.post('/shopify/webhook', async (req, res) => {
+  try {
+    const hmac = req.get('X-Shopify-Hmac-Sha256') || '', topic = req.get('X-Shopify-Topic') || '', dom = req.get('X-Shopify-Shop-Domain') || '';
+    if (!SHOP_WH_SECRET) { console.warn('Shopify webhook received but SHOPIFY_WEBHOOK_SECRET is not set — ignored.'); return res.status(401).end(); }
+    const digest = crypto.createHmac('sha256', SHOP_WH_SECRET).update(req.rawBody || Buffer.alloc(0)).digest('base64');
+    if (digest.length !== hmac.length || !crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac))) return res.status(401).end();
+    res.status(200).end();
+    const st = SHOP_STORES.find(s => s.domain === dom) || SHOP_STORES[0]; if (!st) return;
+    const body = req.body || {};
+    const no = String(body.name || body.order_number || (body.order_id ? '' : '')).replace(/^#/, '');
+    const prev = (SHOP_CACHE[st.key] && SHOP_CACHE[st.key].orders.find(o => o.no === no)) || null;
+    shopBust(st.key);
+    if (!no) return;
+    if (topic === 'orders/cancelled') { logOrderEvent({ orderNo: no }, 'shopify', 'Order cancelled on Shopify' + (body.cancel_reason ? ' — ' + body.cancel_reason : ''), 'Shopify'); notifyRoles(['admin', 'fulfillment'], 'Order cancelled', 'Shopify order #' + no + ' was cancelled.'); }
+    else if (topic === 'orders/create') { logOrderEvent({ orderNo: no }, 'shopify', 'New order on Shopify (' + st.name + ') — ' + (body.line_items || []).length + ' line(s)', 'Shopify'); }
+    else if (topic === 'orders/updated') {
+      if (prev && (body.note || '') !== (prev.shopNote || '')) logOrderEvent({ orderNo: no }, 'shopify', 'Note changed on Shopify: ' + (body.note || '(cleared)'), 'Shopify');
+      if (prev && String(body.tags || '') !== prev.tags.join(', ')) logOrderEvent({ orderNo: no }, 'shopify', 'Tags changed on Shopify: ' + (body.tags || '(none)'), 'Shopify');
+      if (prev && body.fulfillment_status === 'fulfilled' && prev.ful !== 'FULFILLED') logOrderEvent({ orderNo: no }, 'shopify', 'Marked fulfilled on Shopify', 'Shopify');
+    }
+  } catch (e) { console.error('shopify webhook:', e.message); try { res.status(200).end(); } catch (_) {} }
+});
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 // The service worker asks here what to show when a (payload-less) push arrives. Only a device's own hash can read its messages.
@@ -1069,6 +1300,12 @@ async function routeActionInner(action, params) {
     case 'driverPickup': return doDriverPickup(params);
     case 'driverAssign': return doDriverAssign(params);
     case 'listAllStaff': return doListAllStaff(params);
+    case 'shopList': return doShopList(params);
+    case 'shopOrder': return doShopOrder(params);
+    case 'shopFulfil': return doShopFulfil(params);
+    case 'shopComment': return doShopComment(params);
+    case 'shopNote': return doShopNote(params);
+    case 'shopTags': return doShopTags(params);
     case 'staffReveal': return doStaffReveal(params);
     case 'setNotifyAll': return doSetNotifyAll(params);
     case 'setNotifyOne': return doSetNotifyOne(params);
@@ -2518,6 +2755,7 @@ async function doMarkDone(params) {
   }
   await sbUpdate('orders', id, { is_done: true, done_at: new Date().toISOString() });
   pushShopifyUpdate(s.order_no, 'Production complete — Done ✅');
+  shopifyMaybeFulfill(s.order_no, (params.authenticatedName || params.role || '').toString());
   return { success: true };
 }
 
@@ -2594,6 +2832,7 @@ async function doReadyMadeApprove(params) {
   if (chk.error) return { success: false, error: chk.error };
   await sbUpdate('orders', chk.rec.id, { is_done: true, done_at: new Date().toISOString(), rework_note: null });
   pushShopifyUpdate(chk.rec.order_no, 'Production complete — Done ✅');
+  shopifyMaybeFulfill(chk.rec.order_no, (params.authenticatedName || 'supervisor').toString());
   return { success: true };
 }
 async function doReadyMadeReject(params) {
@@ -3681,6 +3920,7 @@ async function doAtelierApproveJob(params) {
       if (!orderRec.is_done) {
         pushShopifyUpdate(job.order_no, 'Production complete — Done ✅');
         logOrderEvent({ orderId: orderRec.id, orderNo: job.order_no, sku: job.sku }, 'done', 'Production complete — order marked Done', approver);
+        setTimeout(() => shopifyMaybeFulfill(job.order_no, approver), 1500);
       }
     }
   }
