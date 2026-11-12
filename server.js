@@ -2869,6 +2869,15 @@ async function doAssignSampleTailor(params) {
     return { success: false, error: 'Unknown tailor: ' + tailor };
   }
   const nowIso = new Date().toISOString();
+  // Reassigning: drop any unfinished Workstation job the previous tailor had on this sample.
+  try {
+    const prev = await sbFetch('GET', `design_samples?id=eq.${row - 1}&select=code,tailor&limit=1`);
+    const p = prev && prev[0];
+    if (p && p.tailor && p.tailor !== tailor && p.code) {
+      const jobs = (await sbFetch('GET', `atelier_jobs?order_no=eq.${encodeURIComponent(SAMPLE_PREFIX + p.code)}&status=eq.active&select=id`)) || [];
+      for (const j of jobs) await sbFetch('DELETE', `atelier_jobs?id=eq.${j.id}`, undefined, { Prefer: 'return=minimal' });
+    }
+  } catch (e) {}
   await sbUpdate('design_samples', row - 1, { tailor, tailor_started_at: nowIso });
   notifyStaff('tailor', tailor, 'New sample', 'A sample is assigned to you.');
   try { await sbUpdate('design_samples', row - 1, { pm_ended_at: nowIso }); } catch (e) { /* column not added yet */ }
