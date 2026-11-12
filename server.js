@@ -569,13 +569,14 @@ async function doPushInfo(params) {
   const v = await getVapid();
   if (!v) return { success: false, error: 'Run settings_notifications.sql in Supabase first.' };
   const role = (params.role || '').toString(), name = (params.authenticatedName || '').toString();
+  // Everyone is asked on their own device; the admin can switch a person off later in Settings.
   let enabled = true;
   if (name) {
     try {
       const rr = role === 'handemb' ? 'in.(handemb,handembworker)' : `eq.${role}`;
       const st = await sbFetch('GET', `staff?select=notify_on&role=${rr}&name=eq.${encodeURIComponent(name)}&active=eq.true&limit=1`);
-      enabled = !!(st && st[0] && st[0].notify_on);
-    } catch (e) { enabled = false; }
+      if (st && st[0] && st[0].notify_on === false) enabled = false;
+    } catch (e) {}
   }
   return { success: true, publicKey: v.pub, enabled };
 }
@@ -2892,6 +2893,7 @@ async function doSendSampleEmb(params) {
 
   const statusCol = kind === 'mach' ? 'mach_emb_status' : 'hand_emb_status';
   await sbUpdate('design_samples', id, { [statusCol]: 'RED|' + new Date().toLocaleString('en-GB', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' }) });
+  notifyStaff(kind === 'mach' ? 'machemb' : 'handemb', person, 'Sample for you', 'A sample was sent to you for ' + (kind === 'mach' ? 'machine' : 'hand') + ' embroidery.');
   return { success: true };
 }
 
@@ -3318,6 +3320,7 @@ async function doAtelierFinishJob(params) {
     for (const d of dups) await sbFetch('DELETE', `atelier_jobs?id=eq.${d.id}`, undefined, { Prefer: 'return=minimal' });
   } catch (e) { /* non-fatal */ }
   logLineEvent(job.order_no, job.sku, 'qc', `Tailoring finished by ${tailor} — waiting for QC approval — stitching time ${fmtDurationMs(accum)}`, tailor);
+  notifyRoles(['atelier_supervisor'], 'Ready for QC', 'Order ' + job.order_no + ' finished by ' + tailor + ' — waiting for your approval.');
   return { success: true };
 }
 
@@ -3686,6 +3689,13 @@ async function doAtelierRejectJob(params) {
   };
   if (wasApproved) { jobPatch.approved_at = null; jobPatch.approved_by = null; }
   await sbUpdate('atelier_jobs', id, jobPatch);
+  {
+    const rw = reason === "Master's issue" ? 'the master' : reason === 'Fabric issue' ? 'fabric check' : reason === 'Machine embroidery issue' ? 'machine embroidery' : reason === 'Hand embroidery issue' ? 'hand embroidery' : 'you';
+    notifyStaff('tailor', job.tailor, 'Sent back by QC', 'Order ' + job.order_no + ' — ' + reason + ' — goes back to ' + rw + '.');
+    if (reason === "Master's issue" && job.master) notifyStaff('master', job.master, 'Rework from QC', 'Order ' + job.order_no + ' — master\'s issue — comes back to you.');
+    if (reason === 'Hand embroidery issue') notifyHandDesk('Rework from QC', 'Order ' + job.order_no + ' — hand embroidery issue.');
+    if (reason === 'Machine embroidery issue') notifyRoles(['admin'], 'Rework from QC', 'Order ' + job.order_no + ' — machine embroidery issue.');
+  }
   {
     const routed = reason === 'Machine embroidery issue' ? 'sent back to MACHINE EMBROIDERY' : reason === 'Hand embroidery issue' ? 'sent back to HAND EMBROIDERY (Akil)' : reason === "Master's issue" ? `sent back to Master (${job.master || 'cutting master'}) for re-cut`
       : reason === 'Fabric issue' ? 'sent back to the fabric check — WHOLE GARMENT to be redone (fabric, cutting, tailoring)' : `sent back to Tailor ${job.tailor} to redo`;
