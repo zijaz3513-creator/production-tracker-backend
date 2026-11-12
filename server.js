@@ -3102,7 +3102,7 @@ async function doAtelierMyOrders(params) {
   if (!tailor) return { success: false, error: 'Not signed in.' };
 
   const orders = (await sbFetch('GET', `orders?tailor=eq.${encodeURIComponent(tailor)}&is_done=eq.false&select=order_no,sku,garment_type,order_type,master,urgent,urgent_due_date,notes,created_at`)) || [];
-  if (!orders.length) return { success: true, lines: [] };
+  // (a tailor with no orders can still have samples, so no early return here)
 
   // Rule: a line is hidden only while a job for it is in progress or awaiting QC.
   // Approved jobs never hide a line: approving marks the order Done, and this
@@ -3128,9 +3128,23 @@ async function doAtelierMyOrders(params) {
       notes: o.notes || '', createdAt: o.created_at, standardMinutes: standardMin
     });
   }
+  // Design samples assigned to this tailor are stitched on the same timer. They show as SAMPLE-<code>.
+  try {
+    const samples = (await sbFetch('GET', `design_samples?tailor=eq.${encodeURIComponent(tailor)}&is_done=eq.false&select=id,code,name,type,fabric_color,master,created_at`)) || [];
+    for (const sm of samples) {
+      const oNo = SAMPLE_PREFIX + sm.code, sku = sm.code || '';
+      if (blockKey.has(oNo + '|' + sku)) continue;
+      const gt = sm.type || 'Abaya';
+      lines.push({ orderNo: oNo, sku, model: sm.code, productTitle: '🧵 Sample · ' + (sm.name || sm.code), productType: 'Sample', tags: [],
+        garmentType: gt, qty: 1, master: sm.master || null, urgent: false, urgentDueDate: null, isSample: true,
+        notes: 'Design sample' + (sm.fabric_color ? ' · ' + sm.fabric_color : ''), createdAt: sm.created_at, standardMinutes: await getStandardMinutes(sm.code, gt) });
+    }
+  } catch (e) { /* samples table unavailable — orders still listed */ }
   lines.sort((a, b) => (b.urgent - a.urgent) || (new Date(a.createdAt) - new Date(b.createdAt)));
   return { success: true, lines };
 }
+const SAMPLE_PREFIX = 'SAMPLE-';
+const isSampleJob = j => String((j && j.order_no) || '').startsWith(SAMPLE_PREFIX);
 
 // ---- Job lifecycle ----
 // A tailor can have several jobs "in progress" (status 'active') at once —
@@ -3180,7 +3194,16 @@ async function doAtelierStartJob(params) {
   let notes = (params.notes || '').toString();
   let urgent = false;
 
-  if (!manual) {
+  if (!manual && orderNo.startsWith(SAMPLE_PREFIX)) {
+    const code = orderNo.slice(SAMPLE_PREFIX.length);
+    const rows = await sbFetch('GET', `design_samples?code=eq.${encodeURIComponent(code)}&tailor=eq.${encodeURIComponent(tailor)}&is_done=eq.false&limit=1&select=id,type,master,fabric_color,tailor_started_at`);
+    const rec = rows && rows[0];
+    if (!rec) return { success: false, error: 'This sample is not assigned to you.' };
+    garmentType = rec.type || 'Abaya'; master = rec.master || null; notes = 'Design sample' + (rec.fabric_color ? ' · ' + rec.fabric_color : ''); urgent = false;
+    if (!rec.tailor_started_at) { try { await sbUpdate('design_samples', rec.id, { tailor_started_at: new Date().toISOString() }); } catch (e) {} }
+    const blocked = await sbFetch('GET', `atelier_jobs?order_no=eq.${encodeURIComponent(orderNo)}&tailor=eq.${encodeURIComponent(tailor)}&status=eq.active&select=id`);
+    if (blocked && blocked.length) return { success: false, error: 'This sample already has a job in progress.' };
+  } else if (!manual) {
     // Re-verify against the assignment itself — never trust the client here.
     const rows = await sbFetch('GET', `orders?order_no=eq.${encodeURIComponent(orderNo)}&sku=eq.${encodeURIComponent(sku)}&tailor=eq.${encodeURIComponent(tailor)}&limit=1&select=*`);
     const rec = rows && rows[0];
@@ -3314,6 +3337,17 @@ async function doAtelierFinishJob(params) {
   if ((job.pause_reason || '') === ADMIN_STOP_REASON) return { success: false, error: 'The admin stopped this job — ask the admin to resume it.' };
   const accum = Number(job.accum_ms || 0) + (job.run_since ? (Date.now() - new Date(job.run_since).getTime()) : 0);
   const now = new Date().toISOString();
+  if (isSampleJob(job)) {
+    // Samples skip QC: finishing marks the sample done (once its embroidery is back) and the time is kept on the job.
+    const code = job.order_no.slice(SAMPLE_PREFIX.length);
+    const sr = await sbFetch('GET', `design_samples?code=eq.${encodeURIComponent(code)}&is_done=eq.false&select=id,mach_emb_person,mach_emb_status,hand_emb_person,hand_emb_status&limit=1`);
+    const sm = sr && sr[0];
+    if (sm && sm.mach_emb_person && !(sm.mach_emb_status || '').startsWith('GREEN')) return { success: false, error: 'Still waiting on machine embroidery (' + sm.mach_emb_person + ') — pause instead, finish when it is back.' };
+    if (sm && sm.hand_emb_person && !(sm.hand_emb_status || '').startsWith('GREEN')) return { success: false, error: 'Still waiting on hand embroidery (' + sm.hand_emb_person + ') — pause instead, finish when it is back.' };
+    await atelierUpdateJobWithReason(job.id, { accum_ms: accum, run_since: null, status: 'approved', end_at: now, duration_ms: accum, pause_reason: null, approved_at: now, approved_by: 'sample', pay_amount: null });
+    if (sm) { try { await sbUpdate('design_samples', sm.id, { tailor_ended_at: now, is_done: true }); } catch (e) {} }
+    return { success: true, sample: true };
+  }
   await atelierUpdateJobWithReason(job.id, { accum_ms: accum, run_since: null, status: 'pending', end_at: now, duration_ms: accum, pause_reason: null });
   try { // drop any other stale in-progress job for the same line
     const dups = (await sbFetch('GET', `atelier_jobs?order_no=eq.${encodeURIComponent(job.order_no)}&sku=eq.${encodeURIComponent(job.sku)}&status=eq.active&id=neq.${job.id}&select=id`)) || [];
