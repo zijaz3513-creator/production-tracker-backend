@@ -2755,7 +2755,6 @@ async function doMarkDone(params) {
   }
   await sbUpdate('orders', id, { is_done: true, done_at: new Date().toISOString() });
   pushShopifyUpdate(s.order_no, 'Production complete — Done ✅');
-  shopifyMaybeFulfill(s.order_no, (params.authenticatedName || params.role || '').toString());
   return { success: true };
 }
 
@@ -2832,7 +2831,6 @@ async function doReadyMadeApprove(params) {
   if (chk.error) return { success: false, error: chk.error };
   await sbUpdate('orders', chk.rec.id, { is_done: true, done_at: new Date().toISOString(), rework_note: null });
   pushShopifyUpdate(chk.rec.order_no, 'Production complete — Done ✅');
-  shopifyMaybeFulfill(chk.rec.order_no, (params.authenticatedName || 'supervisor').toString());
   return { success: true };
 }
 async function doReadyMadeReject(params) {
@@ -3920,7 +3918,6 @@ async function doAtelierApproveJob(params) {
       if (!orderRec.is_done) {
         pushShopifyUpdate(job.order_no, 'Production complete — Done ✅');
         logOrderEvent({ orderId: orderRec.id, orderNo: job.order_no, sku: job.sku }, 'done', 'Production complete — order marked Done', approver);
-        setTimeout(() => shopifyMaybeFulfill(job.order_no, approver), 1500);
       }
     }
   }
