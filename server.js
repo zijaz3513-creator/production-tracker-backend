@@ -319,7 +319,7 @@ const ROLE_PERMISSIONS = {
   driver: ['getOrder', 'getOrderByOrderNo', 'driverList', 'driverPickup'],
   machemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'getSamples', 'receiveSampleEmb', 'embReceive', 'embReceiveBatch', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn'],
   designer: ['getSamples', 'addSample'],
-  patternmaster: ['getSamples', 'assignSampleTailor', 'startSamplePattern'],
+  patternmaster: ['getSamples', 'assignSampleTailor', 'startSamplePattern', 'samplePmPause', 'samplePmResume', 'samplePmFinish'],
   samplemachemb: ['getSamples', 'receiveSampleEmb'],
   samplehandemb: ['getSamples', 'receiveSampleEmb'],
   // Same access as Admin, except it cannot delete orders/samples or remove
@@ -1361,6 +1361,9 @@ async function routeActionInner(action, params) {
     case 'dataCleanup': return doDataCleanup(params);
     case 'undoCleanup': return doUndoCleanup(params);
     case 'startSamplePattern': return doStartSamplePattern(params);
+    case 'samplePmPause': return doSamplePmPause(params);
+    case 'samplePmResume': return doSamplePmResume(params);
+    case 'samplePmFinish': return doSamplePmFinish(params);
     case 'getSkuImages': return doGetSkuImages(params);
     case 'getSkuImage': return doGetSkuImage(params);
     case 'atelierMyOrders': return doAtelierMyOrders(params);
@@ -2934,7 +2937,7 @@ async function doUpdateUrgent(params) {
 // DESIGN SAMPLES
 // ============================================================
 function buildSampleRowArray(rec, fabricsBySampleId) {
-  const row = new Array(40).fill('');
+  const row = new Array(41).fill('');
   if (!rec) return row;
 
   row[0] = rec.sr_no || '';
@@ -2969,6 +2972,7 @@ function buildSampleRowArray(rec, fabricsBySampleId) {
   row[37] = rec.pleats || '';
   row[38] = rec.pm_started_at || '';
   row[39] = rec.pm_ended_at || '';
+  row[40] = rec.pm_work || '';
   return row;
 }
 
@@ -3092,9 +3096,59 @@ async function doStartSamplePattern(params) {
   if (!r) return { success: false, error: 'Sample not found.' };
   if (params.role === 'patternmaster' && params.authenticatedName && r.master !== params.authenticatedName) return { success: false, error: 'This sample is assigned to ' + r.master + '.' };
   if (r.pm_started_at) return { success: true, already: true };
-  try { await sbUpdate('design_samples', row - 1, { pm_started_at: new Date().toISOString() }); }
-  catch (e) { return { success: false, error: 'Run the SQL to add the pattern timer columns first (sku/pleats SQL file).' }; }
+  const nowIso = new Date().toISOString();
+  try { await sbUpdate('design_samples', row - 1, { pm_started_at: nowIso, pm_work: JSON.stringify({ st: 'WORK', acc: 0, run: Date.now(), reason: '' }) }); }
+  catch (e) {
+    try { await sbUpdate('design_samples', row - 1, { pm_started_at: nowIso }); }
+    catch (e2) { return { success: false, error: 'Run the SQL to add the pattern timer columns first (sku/pleats SQL file).' }; }
+  }
   return { success: true };
+}
+// ── Pattern master timer: start / pause / resume / finish, the same way as the cutting masters ──
+function pmParse(r) {
+  try { const w = JSON.parse(r.pm_work || 'null'); if (w && w.st) return w; } catch (e) {}
+  if (!r.pm_started_at) return { st: '' };
+  const st = Date.parse(r.pm_started_at);
+  if (r.pm_ended_at) return { st: 'DONE', acc: Math.max(0, Date.parse(r.pm_ended_at) - st), run: 0 };
+  return { st: 'WORK', acc: 0, run: st }; // started before pause/finish existed
+}
+async function pmLoad(params) {
+  const row = parseRow(params);
+  if (!row) return { error: 'Invalid row.' };
+  const rec = await sbFetch('GET', `design_samples?id=eq.${row - 1}&select=*&limit=1`);
+  const r = rec && rec[0];
+  if (!r) return { error: 'Sample not found.' };
+  if (params.role === 'patternmaster' && params.authenticatedName && r.master !== params.authenticatedName) return { error: 'This sample is assigned to ' + r.master + '.' };
+  return { row, r, w: pmParse(r) };
+}
+async function pmSave(row, w, extra) {
+  try { await sbUpdate('design_samples', row - 1, Object.assign({ pm_work: JSON.stringify(w) }, extra || {})); return null; }
+  catch (e) { return { success: false, error: 'Run pattern_timer.sql in Supabase first (adds design_samples.pm_work).' }; }
+}
+async function doSamplePmPause(params) {
+  const c = await pmLoad(params); if (c.error) return { success: false, error: c.error };
+  const reason = (params.reason || '').toString().trim();
+  if (MASTER_PAUSE_REASONS.indexOf(reason) === -1 && reason !== 'Paused by admin' && reason !== 'Stopped by admin') return { success: false, error: 'Please choose a reason to pause.' };
+  if (c.w.st !== 'WORK') return { success: false, error: 'The pattern is not running.' };
+  const w = { st: 'PAUSE', acc: (+c.w.acc || 0) + Math.max(0, Date.now() - (+c.w.run || Date.now())), run: 0, reason };
+  return (await pmSave(c.row, w)) || { success: true, w };
+}
+async function doSamplePmResume(params) {
+  const c = await pmLoad(params); if (c.error) return { success: false, error: c.error };
+  if (c.w.st === 'WORK') return { success: true, already: true };
+  if (c.w.st !== 'PAUSE') return { success: false, error: 'The pattern is not paused.' };
+  if (c.w.reason === 'Stopped by admin' && params.role === 'patternmaster') return { success: false, error: 'The admin stopped this pattern — ask the admin to resume it.' };
+  const w = { st: 'WORK', acc: +c.w.acc || 0, run: Date.now(), reason: '' };
+  return (await pmSave(c.row, w)) || { success: true, w };
+}
+async function doSamplePmFinish(params) {
+  const c = await pmLoad(params); if (c.error) return { success: false, error: c.error };
+  if (c.w.st === 'DONE') return { success: true, already: true };
+  if (c.w.st !== 'WORK' && c.w.st !== 'PAUSE') return { success: false, error: 'Scan to start the pattern first.' };
+  if (c.w.reason === 'Stopped by admin' && params.role === 'patternmaster') return { success: false, error: 'The admin stopped this pattern — ask the admin to resume it.' };
+  const acc = (+c.w.acc || 0) + (c.w.st === 'WORK' ? Math.max(0, Date.now() - (+c.w.run || Date.now())) : 0);
+  const w = { st: 'DONE', acc, run: 0, reason: '' };
+  return (await pmSave(c.row, w, { pm_ended_at: new Date().toISOString() })) || { success: true, w, totalMs: acc };
 }
 
 async function doAssignSampleTailor(params) {
@@ -3118,6 +3172,12 @@ async function doAssignSampleTailor(params) {
   if (sampleTailors.indexOf(tailor) === -1) {
     return { success: false, error: 'Unknown tailor: ' + tailor };
   }
+  if (params.role === 'patternmaster') {
+    const pr = await sbFetch('GET', `design_samples?id=eq.${row - 1}&select=*&limit=1`);
+    const w = pr && pr[0] ? pmParse(pr[0]) : { st: '' };
+    if (w.st === 'WORK' || w.st === 'PAUSE') return { success: false, error: 'Finish your pattern first (scan the label again or tap Finish), then assign the tailor.' };
+    if (!w.st && pr && pr[0] && !pr[0].tailor) return { success: false, error: 'Scan the label to start the pattern, then finish it before assigning the tailor.' };
+  }
   const nowIso = new Date().toISOString();
   // Reassigning: drop any unfinished Workstation job the previous tailor had on this sample.
   try {
@@ -3130,7 +3190,16 @@ async function doAssignSampleTailor(params) {
   } catch (e) {}
   await sbUpdate('design_samples', row - 1, { tailor, tailor_started_at: nowIso });
   notifyStaff('tailor', tailor, 'New sample', 'A sample is assigned to you.');
-  try { await sbUpdate('design_samples', row - 1, { pm_ended_at: nowIso }); } catch (e) { /* column not added yet */ }
+  try {
+    const pe = await sbFetch('GET', `design_samples?id=eq.${row - 1}&select=pm_started_at,pm_ended_at,pm_work&limit=1`);
+    const p0 = pe && pe[0];
+    if (p0 && p0.pm_started_at && !p0.pm_ended_at) { // admin assigned while the pattern was still running: close it here
+      const w = pmParse(p0), acc = (+w.acc || 0) + (w.st === 'WORK' ? Math.max(0, Date.now() - (+w.run || Date.now())) : 0);
+      await sbUpdate('design_samples', row - 1, { pm_ended_at: nowIso, pm_work: JSON.stringify({ st: 'DONE', acc, run: 0, reason: '' }) });
+    }
+  } catch (e) {
+    try { await sbUpdate('design_samples', row - 1, { pm_ended_at: nowIso }); } catch (e2) { /* column not added yet */ }
+  }
   return { success: true };
 }
 
