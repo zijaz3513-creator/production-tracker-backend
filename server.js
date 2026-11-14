@@ -3101,6 +3101,19 @@ async function doAssignSampleTailor(params) {
   const row = parseRow(params);
   if (!row) return { success: false, error: 'Invalid row.' };
   const tailor = (params.tailor || '').toString();
+  if (!tailor) {
+    // Unassign: clear the tailor and drop any unfinished Workstation job on this sample.
+    try {
+      const prev = await sbFetch('GET', `design_samples?id=eq.${row - 1}&select=code&limit=1`);
+      const code = prev && prev[0] && prev[0].code;
+      if (code) {
+        const jobs = (await sbFetch('GET', `atelier_jobs?order_no=eq.${encodeURIComponent(SAMPLE_PREFIX + code)}&status=eq.active&select=id`)) || [];
+        for (const j of jobs) await sbFetch('DELETE', `atelier_jobs?id=eq.${j.id}`, undefined, { Prefer: 'return=minimal' });
+      }
+    } catch (e) {}
+    await sbUpdate('design_samples', row - 1, { tailor: null, tailor_started_at: null });
+    return { success: true, unassigned: true };
+  }
   const sampleTailors = await getActiveStaffNames('tailor');
   if (sampleTailors.indexOf(tailor) === -1) {
     return { success: false, error: 'Unknown tailor: ' + tailor };
