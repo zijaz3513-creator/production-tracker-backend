@@ -3079,11 +3079,23 @@ async function doAssignSampleMaster(params) {
   const row = parseRow(params);
   if (!row) return { success: false, error: 'Invalid row.' };
   const master = (params.master || '').toString();
+  // Assigning, re-assigning (even the same person) or unassigning always resets the pattern timer,
+  // so the pattern master starts fresh by scanning.
+  const resetPm = async () => {
+    try { await sbUpdate('design_samples', row - 1, { pm_started_at: null, pm_ended_at: null, pm_work: null }); }
+    catch (e) { try { await sbUpdate('design_samples', row - 1, { pm_started_at: null, pm_ended_at: null }); } catch (e2) {} }
+  };
+  if (!master) {
+    await sbUpdate('design_samples', row - 1, { master: null });
+    await resetPm();
+    return { success: true, unassigned: true };
+  }
   const patternMasters = await getActiveStaffNames('patternmaster');
   if (patternMasters.indexOf(master) === -1) {
     return { success: false, error: 'Unknown pattern master: ' + master };
   }
   await sbUpdate('design_samples', row - 1, { master });
+  await resetPm();
   notifyStaff('patternmaster', master, 'New sample pattern', 'A sample is assigned to you.');
   return { success: true };
 }
