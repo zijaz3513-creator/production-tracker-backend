@@ -2400,9 +2400,12 @@ async function doHandSplit(params) {
   if (await handCallerIsWorker(params)) return { success: false, error: 'Only the hand-embroidery desk can split an order.' };
   const rec = await handLoadOrder(row);
   if (!rec) return { success: false, error: 'Order not found.' };
-  const code = parseEmbValue(rec.hand_emb).code;
-  if (code !== 'RCVD') return { success: false, error: 'Receive the order first (and split it before work starts).' };
-  if ((await getHandParts(rec.id)).length) return { success: false, error: 'This order is already split.' };
+  const cur = parseEmbValue(rec.hand_emb), code = cur.code;
+  if (['RCVD', 'WORK', 'PAUSE'].indexOf(code) === -1) return { success: false, error: 'Receive the order first.' };
+  if ((await getHandParts(rec.id)).length) return { success: false, error: 'This order is already split — use "+ Add person".' };
+  // Splitting work that already started: the person on it keeps their own running time, to the millisecond.
+  const inProgress = code === 'WORK' || code === 'PAUSE';
+  const curPerson = (rec.hand_emb_person || '').toString().trim();
   const workers = await getActiveStaffNames('handembworker');
   const list = Array.isArray(params.parts) ? params.parts : [];
   const seen = {};
@@ -2413,16 +2416,34 @@ async function doHandSplit(params) {
     seen[person] = true;
   }
   if (list.length < 2) return { success: false, error: 'Pick at least two people to split between.' };
+  if (inProgress && curPerson && !seen[curPerson]) return { success: false, error: curPerson + ' is already working on this piece — keep ' + curPerson + ' in the split (tap the parts they keep), then add the others.' };
   const by = (params.authenticatedName || params.role || '').toString();
+  let carry = null;
+  if (inProgress && curPerson) {
+    const now = Date.now(), workedMs = cur.accumMs + (code === 'WORK' && cur.runSince ? Math.max(0, now - cur.runSince) : 0);
+    // When did this person start? The order timeline has the "work started" moment; otherwise count back from now.
+    let startedAt = null;
+    try {
+      const ev = await sbFetch('GET', `order_events?order_id=eq.${rec.id}&kind=eq.embroidery&text=like.${encodeURIComponent('Hand embroidery*work started*')}&select=at&order=at.desc&limit=1`);
+      if (ev && ev[0] && ev[0].at) startedAt = ev[0].at;
+    } catch (e) {}
+    if (!startedAt || Date.parse(startedAt) > now - workedMs) startedAt = new Date(now - workedMs).toISOString();
+    carry = code === 'WORK'
+      ? { status: 'working', accum_ms: cur.accumMs, run_since: cur.runSince || now, started_at: startedAt, pause_reason: null }
+      : { status: 'paused', accum_ms: cur.accumMs, run_since: null, started_at: startedAt, pause_reason: cur.reason || null };
+  }
   try {
-    await sbInsertMany('hand_emb_parts', list.map((p, i) => ({ order_id: rec.id, order_no: rec.order_no, sku: rec.sku, person: p.person.toString().trim(),
-      label: (p.label || '').toString().trim().slice(0, 60) || ('Part ' + (i + 1)), status: 'assigned', assigned_by: by })));
+    await sbInsertMany('hand_emb_parts', list.map((p, i) => Object.assign({ order_id: rec.id, order_no: rec.order_no, sku: rec.sku, person: p.person.toString().trim(),
+      label: (p.label || '').toString().trim().slice(0, 60) || ('Part ' + (i + 1)), status: 'assigned', assigned_by: by,
+      accum_ms: 0, run_since: null, started_at: null, pause_reason: null },   // same keys on every row (bulk insert needs that)
+      carry && p.person.toString().trim() === curPerson ? carry : {})));
   } catch (e) { return { success: false, error: 'Split needs the hand_emb_parts table — run hand_emb_parts.sql in Supabase first.' }; }
   await syncHandOrder(rec.id);
   logOrderEvent({ orderId: rec.id, orderNo: rec.order_no, sku: rec.sku }, 'embroidery', `Hand embroidery split between ${list.map(p => p.person + ' (' + ((p.label || '').toString().trim() || 'part') + ')').join(', ')}`, by);
   pushShopifyUpdate(rec.order_no, `Hand embroidery — split between ${list.map(p => p.person).join(', ')}`);
-  list.forEach(p => notifyStaff('handembworker', p.person, 'Hand embroidery for you', 'Order ' + rec.order_no + ' — your part: ' + ((p.label || '').toString().trim() || 'part') + '.'));
-  return { success: true };
+  list.forEach(p => { if (!(carry && p.person.toString().trim() === curPerson)) notifyStaff('handembworker', p.person, 'Hand embroidery for you', 'Order ' + rec.order_no + ' — your part: ' + ((p.label || '').toString().trim() || 'part') + '.'); });
+  if (carry) logOrderEvent({ orderId: rec.id, orderNo: rec.order_no, sku: rec.sku }, 'embroidery', `Split while in progress — ${curPerson} keeps their time (${fmtWorkedMs(carry.accum_ms + (carry.run_since ? Date.now() - carry.run_since : 0))} so far)`, by);
+  return { success: true, carried: !!carry };
 }
 async function doHandPartAdd(params) {
   const row = parseRow(params);
