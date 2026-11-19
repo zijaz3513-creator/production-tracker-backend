@@ -294,8 +294,8 @@ const MAX_FABRIC_SLOTS = 6;
 
 // Which actions each role may call. Admin bypasses this check entirely.
 const ROLE_PERMISSIONS = {
-  inventory: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'updateOrderDetails', 'updateFabric', 'updateFabricDetails', 'updateMachEmb', 'updateHandEmb', 'markDone'],
-  master: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'updateTailor', 'sendOrderEmb', 'embReady', 'embMasterReceive', 'masterStart', 'masterPause', 'masterResume', 'masterFinish'], // masters can no longer return / reject — only QC rejects
+  inventory: ['getOrders', 'handPartsList', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'updateOrderDetails', 'updateFabric', 'updateFabricDetails', 'updateMachEmb', 'updateHandEmb', 'markDone'],
+  master: ['getOrders', 'handPartsList', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'updateTailor', 'sendOrderEmb', 'embReady', 'embMasterReceive', 'masterStart', 'masterPause', 'masterResume', 'masterFinish'], // masters can no longer return / reject — only QC rejects
   tailor: [
     'getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'markDone', 'sendOrderEmb', 'getSamples', 'markSampleDone', 'sendSampleEmb',
     // Aeon Workstation — tailor floor
@@ -325,7 +325,7 @@ const ROLE_PERMISSIONS = {
   // Same access as Admin, except it cannot delete orders/samples or remove
   // staff — those three stay Admin-only.
   fulfillment: [
-    'getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'addOrder', 'updateOrderDetails', 'updateFabric', 'updateFabricDetails',
+    'getOrders', 'handPartsList', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'addOrder', 'updateOrderDetails', 'updateFabric', 'updateFabricDetails',
     'updateMachEmb', 'updateHandEmb', 'updateMaster', 'updateTailor',
     'masterStart', 'masterPause', 'masterResume', 'masterFinish', 'masterReturn',
     'setEmbPerson', 'driverList', 'driverPickup', 'driverAssign', 'embAdminReceive', 'shopList', 'shopOrder', 'shopFulfil', 'shopComment', 'shopNote', 'shopTags', 'embReady', 'embMasterReceive', 'embAssignWorker',
@@ -4699,6 +4699,352 @@ function buildMcpServer() {
 
   return server;
 }
+
+
+// ============================================================
+// OWNER DEV MCP — full access for the owner's Claude chat:
+//   HostGator files (cPanel API), GitHub repo (server code → Render), Supabase (SQL), Render deploy status.
+// Every file change is STAGED first (syntax-checked), the tracker page also gets a PREVIEW copy,
+// and nothing goes live until the owner says "publish". Every publish keeps a backup → rollback.
+// SQL: dry-run inside a transaction first; destructive SQL snapshots the table before running.
+// Env: DEV_MCP_KEY
+//   CPANEL_HOST, CPANEL_USER, CPANEL_TOKEN, CPANEL_TRACKER_DIR, [CPANEL_ROOT], [CPANEL_PREVIEW_DIR], [PREVIEW_URL], [LIVE_URL]
+//   GITHUB_TOKEN, GITHUB_REPO, [GITHUB_BRANCH=main], [GITHUB_SERVER_PATH=server.js]
+//   SUPABASE_ACCESS_TOKEN (sbp_...), [SUPABASE_PROJECT_REF — read from SUPABASE_URL if missing]
+//   [RENDER_API_KEY, RENDER_SERVICE_ID], [BACKEND_URL]
+// ============================================================
+const vm = require('vm');
+const DEV = {
+  key: process.env.DEV_MCP_KEY || '',
+  cpHost: (process.env.CPANEL_HOST || '').replace(/^https?:\/\//, '').replace(/[:/].*$/, ''),
+  cpUser: process.env.CPANEL_USER || '', cpToken: process.env.CPANEL_TOKEN || '',
+  liveDir: (process.env.CPANEL_TRACKER_DIR || '').replace(/\/$/, ''),
+  root: (process.env.CPANEL_ROOT || '').replace(/\/$/, ''),
+  previewDir: (process.env.CPANEL_PREVIEW_DIR || '').replace(/\/$/, ''),
+  previewUrl: process.env.PREVIEW_URL || 'https://hakayah.com/tracker-preview/',
+  liveUrl: process.env.LIVE_URL || 'https://hakayah.com/tracker/',
+  ghToken: process.env.GITHUB_TOKEN || '', ghRepo: process.env.GITHUB_REPO || '',
+  ghBranch: process.env.GITHUB_BRANCH || 'main', ghServer: process.env.GITHUB_SERVER_PATH || 'server.js',
+  sbToken: process.env.SUPABASE_ACCESS_TOKEN || '',
+  sbRef: process.env.SUPABASE_PROJECT_REF || (/^https:\/\/([a-z0-9]+)\.supabase\.co/.exec(process.env.SUPABASE_URL || '') || [])[1] || '',
+  rdKey: process.env.RENDER_API_KEY || '', rdService: process.env.RENDER_SERVICE_ID || '',
+  backend: process.env.BACKEND_URL || 'https://production-tracker-backend-1j2s.onrender.com'
+};
+if (!DEV.root && DEV.cpUser) DEV.root = '/home/' + DEV.cpUser + '/public_html';
+if (!DEV.previewDir && DEV.liveDir) DEV.previewDir = DEV.liveDir.replace(/[^/]+$/, 'tracker-preview');
+const DEV_BAK_ROOT = () => DEV.root + '/_tracker_backups';
+const devSha = t => crypto.createHash('sha256').update(String(t)).digest('hex');
+const devStamp = () => new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+// ---- paths ----
+function hostAbs(p) {
+  p = String(p || '').trim();
+  if (p === 'page' || p === 'tracker' || p === 'index.html') return DEV.liveDir + '/index.html';
+  if (p.indexOf('..') !== -1) throw new Error('Path may not contain ..');
+  const abs = p.startsWith('/') ? p : DEV.root + '/' + p.replace(/^\.?\//, '');
+  if (!abs.startsWith('/home/' + DEV.cpUser + '/')) throw new Error('Path must be inside your HostGator home folder.');
+  if (/\/(\.ssh|etc|mail|\.cpanel)(\/|$)/.test(abs)) throw new Error('That folder is off-limits.');
+  return abs;
+}
+const splitAbs = abs => ({ dir: abs.replace(/\/[^/]+$/, ''), file: abs.split('/').pop() });
+function repoPath(p) { p = String(p || '').trim().replace(/^\/+/, ''); if (p === 'server') p = DEV.ghServer; if (!p || p.indexOf('..') !== -1) throw new Error('Bad repo path.'); return p; }
+// ---- cPanel ----
+const cpAuth = () => ({ Authorization: `cpanel ${DEV.cpUser}:${DEV.cpToken}` });
+async function cpGet(fn, qs) {
+  const r = await fetch(`https://${DEV.cpHost}:2083/execute/${fn}?` + new URLSearchParams(qs), { headers: cpAuth() });
+  const j = await r.json().catch(() => ({}));
+  if (!j || j.status !== 1) throw new Error('cPanel ' + fn + ': ' + ((j && j.errors && j.errors.join('; ')) || ('HTTP ' + r.status)));
+  return j.data;
+}
+async function cpApi2(fn, qs) {
+  const r = await fetch(`https://${DEV.cpHost}:2083/json-api/cpanel?` + new URLSearchParams(Object.assign({ cpanel_jsonapi_user: DEV.cpUser, cpanel_jsonapi_apiversion: '2', cpanel_jsonapi_module: 'Fileman', cpanel_jsonapi_func: fn }, qs)), { headers: cpAuth() });
+  const j = await r.json().catch(() => ({}));
+  const res = j && j.cpanelresult;
+  if (!r.ok || !res || res.error) throw new Error('cPanel ' + fn + ': ' + ((res && res.error) || ('HTTP ' + r.status)));
+  return res.data;
+}
+async function cpRead(abs) { const { dir, file } = splitAbs(abs); const d = await cpGet('Fileman/get_file_content', { dir, file, to_charset: 'UTF-8' }); return d.content; }
+async function cpTryRead(abs) { try { return await cpRead(abs); } catch (e) { return null; } }
+async function cpEnsureDir(full) {
+  try { await cpGet('Fileman/list_files', { dir: full }); return; } catch (e) {}
+  const parent = full.replace(/\/[^/]+$/, '');
+  if (parent && parent !== full && parent.length > ('/home/' + DEV.cpUser).length) await cpEnsureDir(parent);
+  await cpApi2('mkdir', { path: parent, name: full.split('/').pop() });
+}
+async function cpWrite(abs, content) {
+  const { dir, file } = splitAbs(abs);
+  await cpEnsureDir(dir);
+  const fd = new FormData();
+  fd.append('dir', dir); fd.append('overwrite', '1');
+  fd.append('file-1', new Blob([content]), file);
+  const r = await fetch(`https://${DEV.cpHost}:2083/execute/Fileman/upload_files`, { method: 'POST', headers: cpAuth(), body: fd });
+  const j = await r.json().catch(() => ({}));
+  if (!j || j.status !== 1 || (j.data && j.data.failed)) throw new Error('cPanel upload ' + file + ': ' + ((j && j.errors && j.errors.join('; ')) || (j && j.data && JSON.stringify(j.data.uploads)) || ('HTTP ' + r.status)));
+}
+async function cpDelete(abs) { await cpApi2('fileop', { op: 'trash', sourcefiles: abs, doubledecode: '0' }); }
+// ---- GitHub ----
+async function gh(method, path, body) {
+  const r = await fetch('https://api.github.com/repos/' + DEV.ghRepo + path, { method, headers: { Authorization: 'Bearer ' + DEV.ghToken, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json', 'User-Agent': 'aeon-tracker-dev' }, body: body ? JSON.stringify(body) : undefined });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error('GitHub ' + r.status + ': ' + (j.message || ''));
+  return j;
+}
+async function ghRead(path, ref) {
+  try {
+    const j = await gh('GET', `/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${encodeURIComponent(ref || DEV.ghBranch)}`);
+    if (Array.isArray(j)) throw new Error('That is a folder.');
+    if (j.content == null || (j.encoding !== 'base64')) { const b = await gh('GET', `/git/blobs/${j.sha}`); return { content: Buffer.from(b.content, 'base64').toString('utf8'), sha: j.sha }; }
+    return { content: Buffer.from(j.content, 'base64').toString('utf8'), sha: j.sha };
+  } catch (e) { if (/GitHub 404/.test(e.message)) return null; throw e; }
+}
+// One commit with every staged repo file (add / change / delete).
+async function ghCommit(changes, message) {
+  const ref = await gh('GET', `/git/ref/heads/${encodeURIComponent(DEV.ghBranch)}`);
+  const head = ref.object.sha, hc = await gh('GET', `/git/commits/${head}`);
+  const tree = [];
+  for (const c of changes) {
+    if (c.content == null) tree.push({ path: c.path, mode: '100644', type: 'blob', sha: null });
+    else { const b = await gh('POST', '/git/blobs', { content: Buffer.from(c.content, 'utf8').toString('base64'), encoding: 'base64' }); tree.push({ path: c.path, mode: '100644', type: 'blob', sha: b.sha }); }
+  }
+  const t = await gh('POST', '/git/trees', { base_tree: hc.tree.sha, tree });
+  const cm = await gh('POST', '/git/commits', { message, tree: t.sha, parents: [head] });
+  await gh('PATCH', `/git/refs/heads/${encodeURIComponent(DEV.ghBranch)}`, { sha: cm.sha });
+  return { commit: cm.sha, previous: head };
+}
+// ---- Supabase SQL (Management API) ----
+async function sbSql(query) {
+  const r = await fetch(`https://api.supabase.com/v1/projects/${DEV.sbRef}/database/query`, { method: 'POST', headers: { Authorization: 'Bearer ' + DEV.sbToken, 'Content-Type': 'application/json' }, body: JSON.stringify({ query }) });
+  const t = await r.text(); let j; try { j = JSON.parse(t); } catch (e) { j = t; }
+  if (!r.ok) throw new Error((j && j.message) || (typeof j === 'string' ? j.slice(0, 500) : 'HTTP ' + r.status));
+  return j;
+}
+// ---- staging + log (app_config) ----
+async function cfgGet(key) { const r = await sbFetch('GET', `app_config?key=eq.${encodeURIComponent(key)}&select=value&limit=1`); if (!r || !r[0]) return null; try { return JSON.parse(r[0].value); } catch (e) { return null; } }
+async function cfgSet(key, val) { await sbFetch('POST', 'app_config', { key, value: JSON.stringify(val) }, { Prefer: 'resolution=merge-duplicates,return=minimal' }); }
+async function devLog(entry) { const l = (await cfgGet('dev_log')) || []; l.unshift(Object.assign({ at: new Date().toISOString() }, entry)); await cfgSet('dev_log', l.slice(0, 80)); }
+async function stageGet() { return (await cfgGet('dev_stage')) || { files: {} }; }
+async function stageSet(s) { await cfgSet('dev_stage', s); }
+const stKey = (target, path) => target + ':' + path;
+// ---- checks (nothing is staged unless it passes) ----
+function devCheck(path, text, original) {
+  const ext = (path.split('.').pop() || '').toLowerCase(), errs = [], warn = [];
+  if (ext === 'html' || ext === 'htm') {
+    const re = /<script(?![^>]*\bsrc=)([^>]*)>([\s\S]*?)<\/script>/gi; let m, i = 0;
+    while ((m = re.exec(text))) { i++; if (/type=["'](?!text\/javascript)/i.test(m[1])) continue; try { new vm.Script(m[2], { filename: 'inline-script-' + i }); } catch (e) { errs.push('inline script #' + i + ': ' + e.message); } }
+    if (original && /<\/html>\s*$/i.test(original.trim()) && !/<\/html>\s*$/i.test(text.trim())) errs.push('the file no longer ends with </html>');
+  } else if (ext === 'js' || ext === 'cjs') {
+    if (/^\s*(import|export)\s/m.test(text)) warn.push('ES module — not syntax-checked');
+    else { try { new vm.Script('(function(require,module,exports,__dirname,__filename){' + text + '\n})', { filename: path }); } catch (e) { errs.push(e.message); } }
+    if (path === DEV.ghServer) ["app.all('/api'", 'app.listen', 'function routeAction', 'function checkPermission', "app.post('/devmcp/"].forEach(x => { if (text.indexOf(x) === -1) errs.push('server.js would lose ' + x + ' — that would break the server or this connector'); });
+  } else if (ext === 'json' || ext === 'webmanifest') {
+    try { const o = JSON.parse(text); if (/(^|\/)package\.json$/.test(path) && (!o.dependencies || !o.dependencies.express)) errs.push('package.json must keep its dependencies (express is missing)'); } catch (e) { errs.push('JSON: ' + e.message); }
+  } else if (ext === 'css') {
+    if ((text.match(/{/g) || []).length !== (text.match(/}/g) || []).length) errs.push('CSS braces do not balance');
+  } else if (ext === 'php') {
+    if (!/^\s*<\?php/.test(text) && original && /^\s*<\?php/.test(original)) errs.push('PHP file lost its opening <?php');
+    warn.push('PHP is not fully syntax-checked — test the page after publishing');
+  }
+  return { errs, warn };
+}
+const DEV_BANNER = '<div id="dev-preview-banner" style="position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#B42318;color:#fff;font:600 13px system-ui;padding:6px 12px;text-align:center">PREVIEW — not live yet. Actions here still change real orders.</div>';
+const isTrackerPage = abs => abs === DEV.liveDir + '/index.html';
+function devConfigured(target) {
+  if (target === 'host' && !(DEV.cpHost && DEV.cpUser && DEV.cpToken && DEV.liveDir)) return 'HostGator is not configured (CPANEL_HOST, CPANEL_USER, CPANEL_TOKEN, CPANEL_TRACKER_DIR).';
+  if (target === 'repo' && !(DEV.ghToken && DEV.ghRepo)) return 'GitHub is not configured (GITHUB_TOKEN, GITHUB_REPO).';
+  if (target === 'db' && !(DEV.sbToken && DEV.sbRef)) return 'Supabase SQL is not configured (SUPABASE_ACCESS_TOKEN).';
+  return null;
+}
+async function devLive(target, p) { return target === 'host' ? await cpTryRead(p) : ((await ghRead(p)) || {}).content || null; }
+async function devCurrent(target, p, source) {
+  const st = await stageGet(), s = st.files[stKey(target, p)];
+  if (source !== 'live' && s) { if (s.content == null) throw new Error('This file is staged for deletion.'); return { content: s.content, from: 'staged' }; }
+  const c = await devLive(target, p); if (c == null) throw new Error('File not found: ' + p);
+  return { content: c, from: 'live' };
+}
+async function devStage(target, p, content, summary) {
+  const st = await stageGet(), k = stKey(target, p);
+  if (!st.files[k]) { const live = await devLive(target, p); st.files[k] = { target, path: p, base: live == null ? null : devSha(live), notes: [] }; }
+  st.files[k].content = content; st.files[k].notes.push(summary); st.files[k].at = new Date().toISOString();
+  await stageSet(st);
+  if (target === 'host' && isTrackerPage(p) && content != null) await cpWrite(DEV.previewDir + '/index.html', content.replace(/<body([^>]*)>/i, m => m + DEV_BANNER));
+  await devLog({ action: content == null ? 'stage-delete' : 'stage', target, path: p, summary });
+}
+
+function buildDevMcpServer() {
+  const server = new McpServer({ name: 'aeon-tracker-dev', version: '2.0.0' }, { instructions:
+    'You can change everything behind the Aeon Production Tracker: HostGator files (target "host"; "page" = the live tracker index.html), the GitHub backend repo (target "repo"; Render deploys it), and the Supabase database (SQL). ' +
+    'Rules: 1) Look before you change: list/search/read. 2) Make small exact edits (edit_file) instead of rewriting files. 3) Changes are STAGED: tell the owner what changed and give the preview link for the tracker page. ' +
+    '4) Call publish ONLY after the owner clearly says publish / go live. 5) After publishing repo changes, call render_status until the deploy is live; if it failed, say so and offer rollback. ' +
+    '6) SQL: use db_query for reading; db_execute always does a dry run first and only runs for real with the owner\'s confirmation. Prefer additive changes (add column / table). ' +
+    '7) If the server and the page must change together, stage both and publish both. 8) Never put secrets or tokens into files.' });
+  const T = z.enum(['host', 'repo']).describe('"host" = HostGator file (path relative to public_html, or "page" for the tracker index.html); "repo" = GitHub backend repo file ("server" = server.js)');
+
+  server.registerTool('dev_status', { title: 'Status', description: 'What is staged (not live yet), preview link, what is configured, and the recent change log.', inputSchema: {} }, async () => {
+    const [st, log] = await Promise.all([stageGet(), cfgGet('dev_log')]);
+    return mcpJson({ previewUrl: DEV.previewUrl, liveUrl: DEV.liveUrl, hostRoot: DEV.root, trackerDir: DEV.liveDir, repo: DEV.ghRepo + '@' + DEV.ghBranch,
+      staged: Object.values(st.files).map(f => ({ target: f.target, path: f.path, change: f.content == null ? 'delete' : (f.base ? 'edit' : 'new file'), notes: f.notes })),
+      configured: { host: devConfigured('host') || 'ok', repo: devConfigured('repo') || 'ok', db: devConfigured('db') || 'ok', render: DEV.rdKey && DEV.rdService ? 'ok' : 'health check only' },
+      recent: (log || []).slice(0, 15) });
+  });
+  server.registerTool('list_files', { title: 'List folder', description: 'List a folder on HostGator (path relative to public_html) or in the GitHub repo.', inputSchema: { target: T, path: z.string().optional() } }, async ({ target, path }) => {
+    const nc = devConfigured(target); if (nc) return mcpJson({ error: nc }, true);
+    if (target === 'host') { const abs = path ? hostAbs(path) : DEV.root; const l = await cpGet('Fileman/list_files', { dir: abs }); return mcpJson({ dir: abs, items: (l || []).map(x => ({ name: x.file, type: x.type, size: x.size, modified: x.mtime ? new Date(x.mtime * 1000).toISOString() : '' })) }); }
+    const j = await gh('GET', `/contents/${(path || '').split('/').filter(Boolean).map(encodeURIComponent).join('/')}?ref=${encodeURIComponent(DEV.ghBranch)}`);
+    return mcpJson({ path: path || '/', items: (Array.isArray(j) ? j : [j]).map(x => ({ name: x.name, type: x.type, size: x.size })) });
+  });
+  server.registerTool('search_file', { title: 'Search in a file', description: 'Find text or /regex/ in one file; returns line numbers. Uses the staged copy if there is one.', inputSchema: { target: T, path: z.string(), pattern: z.string(), max: z.number().min(1).max(100).optional() } }, async ({ target, path, pattern, max }) => {
+    const nc = devConfigured(target); if (nc) return mcpJson({ error: nc }, true);
+    const p = target === 'host' ? hostAbs(path) : repoPath(path), cur = await devCurrent(target, p), lines = cur.content.split('\n'), out = [];
+    let re = null; const m = /^\/(.+)\/([a-z]*)$/.exec(pattern); if (m) { try { re = new RegExp(m[1], m[2]); } catch (e) { return mcpJson({ error: 'Bad regex: ' + e.message }, true); } }
+    for (let i = 0; i < lines.length && out.length < (max || 40); i++) if (re ? re.test(lines[i]) : lines[i].indexOf(pattern) !== -1) out.push({ line: i + 1, text: lines[i].length > 300 ? lines[i].slice(0, 300) + ' …' : lines[i] });
+    return mcpJson({ path: p, from: cur.from, totalLines: lines.length, matches: out });
+  });
+  server.registerTool('read_file', { title: 'Read a file', description: 'Read lines (max 400 per call) with line numbers. Uses the staged copy unless source=live.', inputSchema: { target: T, path: z.string(), from_line: z.number().min(1).optional(), to_line: z.number().min(1).optional(), source: z.enum(['staged', 'live']).optional() } }, async ({ target, path, from_line, to_line, source }) => {
+    const nc = devConfigured(target); if (nc) return mcpJson({ error: nc }, true);
+    const p = target === 'host' ? hostAbs(path) : repoPath(path), cur = await devCurrent(target, p, source), lines = cur.content.split('\n');
+    const a = Math.max(1, from_line || 1), b = Math.min(lines.length, Math.min(to_line || a + 199, a + 399));
+    return { content: [{ type: 'text', text: `${p} (${cur.from}) lines ${a}-${b} of ${lines.length}\n` + lines.slice(a - 1, b).map((l, i) => (a + i) + '\t' + l).join('\n') }] };
+  });
+  server.registerTool('edit_file', { title: 'Edit a file (staged)', description: 'Exact text replacements; each old_text must appear exactly once. Syntax-checked, then STAGED (the tracker page also updates the preview). Not live until publish.',
+    inputSchema: { target: T, path: z.string(), summary: z.string(), edits: z.array(z.object({ old_text: z.string().min(1), new_text: z.string() })).min(1).max(40) } }, async ({ target, path, summary, edits }) => {
+    const nc = devConfigured(target); if (nc) return mcpJson({ error: nc }, true);
+    const p = target === 'host' ? hostAbs(path) : repoPath(path), cur = await devCurrent(target, p); let text = cur.content;
+    for (let i = 0; i < edits.length; i++) { const e = edits[i], n = text.split(e.old_text).length - 1; if (n !== 1) return mcpJson({ error: `Edit ${i + 1}: old_text found ${n} times (must be exactly once). Nothing was saved.`, old_text: e.old_text.slice(0, 200) }, true); text = text.replace(e.old_text, () => e.new_text); }
+    const chk = devCheck(p, text, cur.content); if (chk.errs.length) return mcpJson({ error: 'Check failed — nothing was saved.', problems: chk.errs }, true);
+    await devStage(target, p, text, summary);
+    return mcpJson({ ok: true, staged: p, warnings: chk.warn, previewUrl: target === 'host' && isTrackerPage(p) ? DEV.previewUrl : null, next: 'Tell the owner what changed' + (target === 'host' && isTrackerPage(p) ? ' and to check the preview (Ctrl+F5)' : '') + '. Publish only when they say so.' });
+  });
+  server.registerTool('write_file', { title: 'Create / replace a file (staged)', description: 'Write a whole file (new files, or small files). For big existing files use edit_file. Checked, then staged.', inputSchema: { target: T, path: z.string(), content: z.string(), summary: z.string() } }, async ({ target, path, content, summary }) => {
+    const nc = devConfigured(target); if (nc) return mcpJson({ error: nc }, true);
+    const p = target === 'host' ? hostAbs(path) : repoPath(path);
+    let orig = null; try { orig = (await devCurrent(target, p)).content; } catch (e) {}
+    if (orig && orig.length > 20000 && content.length < orig.length * 0.6) return mcpJson({ error: 'This would replace a large file with something much smaller — use edit_file instead. Nothing was saved.' }, true);
+    const chk = devCheck(p, content, orig); if (chk.errs.length) return mcpJson({ error: 'Check failed — nothing was saved.', problems: chk.errs }, true);
+    await devStage(target, p, content, summary);
+    return mcpJson({ ok: true, staged: p, newFile: !orig, warnings: chk.warn });
+  });
+  server.registerTool('delete_file', { title: 'Delete a file (staged)', description: 'Stage a file for deletion. Publish backs it up first.', inputSchema: { target: T, path: z.string(), summary: z.string() } }, async ({ target, path, summary }) => {
+    const nc = devConfigured(target); if (nc) return mcpJson({ error: nc }, true);
+    const p = target === 'host' ? hostAbs(path) : repoPath(path);
+    if ((target === 'host' && isTrackerPage(p)) || (target === 'repo' && (p === DEV.ghServer || p === 'package.json'))) return mcpJson({ error: 'That file cannot be deleted — the tracker needs it.' }, true);
+    await devStage(target, p, null, summary);
+    return mcpJson({ ok: true, stagedDelete: p });
+  });
+  server.registerTool('discard', { title: 'Discard staged changes', description: 'Throw away staged (unpublished) changes — all, or one file.', inputSchema: { target: T.optional(), path: z.string().optional() } }, async ({ target, path }) => {
+    const st = await stageGet();
+    if (target && path) delete st.files[stKey(target, target === 'host' ? hostAbs(path) : repoPath(path))]; else st.files = {};
+    await stageSet(st);
+    if (!devConfigured('host')) { try { const live = await cpRead(DEV.liveDir + '/index.html'); const pg = st.files[stKey('host', DEV.liveDir + '/index.html')]; await cpWrite(DEV.previewDir + '/index.html', ((pg && pg.content) || live).replace(/<body([^>]*)>/i, m => m + DEV_BANNER)); } catch (e) {} }
+    await devLog({ action: 'discard', target: target || 'all', path: path || '' });
+    return mcpJson({ ok: true, stillStaged: Object.keys(st.files) });
+  });
+  server.registerTool('publish', { title: 'Publish (go live)', description: 'Make ALL staged changes live. ONLY after the owner explicitly says publish / go live. HostGator files are backed up first; repo files go in one GitHub commit (Render redeploys).',
+    inputSchema: { confirmed_by_owner: z.literal(true), note: z.string().optional(), force: z.boolean().optional().describe('Overwrite files that someone else changed after they were staged') } }, async ({ note, force }) => {
+    const st = await stageGet(), files = Object.values(st.files);
+    if (!files.length) return mcpJson({ error: 'Nothing is staged.' }, true);
+    // safety: nobody changed the live files since staging
+    const conflicts = [];
+    for (const f of files) { const live = await devLive(f.target, f.path); const now = live == null ? null : devSha(live); if (now !== f.base && !force) conflicts.push(f.target + ':' + f.path); }
+    if (conflicts.length) return mcpJson({ error: 'These files were changed by someone else after staging (e.g. Zee uploaded a release): ' + conflicts.join(', ') + '. Discard and redo, or publish with force=true to overwrite them.' }, true);
+    const out = { host: [], repo: null }, stamp = devStamp(), host = files.filter(f => f.target === 'host'), repo = files.filter(f => f.target === 'repo');
+    const msg = 'Owner change: ' + (note || files.map(f => f.notes.join('; ')).join(' | ')).slice(0, 300);
+    if (repo.length) {
+      if (devConfigured('repo')) return mcpJson({ error: devConfigured('repo') }, true);
+      out.repo = await ghCommit(repo.map(f => ({ path: f.path, content: f.content })), msg);
+    }
+    if (host.length) {
+      if (devConfigured('host')) return mcpJson({ error: devConfigured('host') }, true);
+      const bak = DEV_BAK_ROOT() + '/' + stamp, manifest = [];
+      for (const f of host) {
+        const live = await cpTryRead(f.path), name = f.path.replace(DEV.root + '/', '').replace(/\//g, '__');
+        if (live != null) await cpWrite(bak + '/' + name, live);
+        manifest.push({ path: f.path, backup: live != null ? name : null });
+        if (f.content == null) await cpDelete(f.path); else await cpWrite(f.path, f.content);
+        out.host.push({ path: f.path, done: f.content == null ? 'deleted' : 'uploaded' });
+      }
+      await cpWrite(bak + '/_manifest.json', JSON.stringify({ at: new Date().toISOString(), note: msg, files: manifest }, null, 2));
+      out.hostBackup = stamp;
+    }
+    await stageSet({ files: {} });
+    await devLog({ action: 'publish', summary: msg, hostBackup: out.hostBackup || null, commit: out.repo && out.repo.commit });
+    return mcpJson(Object.assign(out, { tell: (host.length ? 'Website files are live — everyone presses Ctrl+F5 (phones: close and reopen). ' : '') + (repo.length ? 'Render is redeploying (1-3 min). Call render_status to confirm it is live.' : '') }));
+  });
+  server.registerTool('backups', { title: 'List backups', description: 'Earlier versions to roll back to: HostGator publish backups, or recent GitHub commits.', inputSchema: { target: T } }, async ({ target }) => {
+    const nc = devConfigured(target); if (nc) return mcpJson({ error: nc }, true);
+    if (target === 'host') { let l = []; try { l = await cpGet('Fileman/list_files', { dir: DEV_BAK_ROOT() }); } catch (e) {} return mcpJson({ backups: (l || []).filter(x => x.type === 'dir').map(x => x.file).sort().reverse().slice(0, 30) }); }
+    const c = await gh('GET', `/commits?sha=${encodeURIComponent(DEV.ghBranch)}&per_page=20`);
+    return mcpJson({ commits: c.map(x => ({ sha: x.sha, date: x.commit.author.date, message: x.commit.message.split('\n')[0] })) });
+  });
+  server.registerTool('rollback', { title: 'Roll back', description: 'Restore a HostGator backup (folder name from backups) or put the whole repo back to an earlier commit. Only when the owner asks.', inputSchema: { target: T, to: z.string(), confirmed_by_owner: z.literal(true) } }, async ({ target, to }) => {
+    const nc = devConfigured(target); if (nc) return mcpJson({ error: nc }, true);
+    if (target === 'host') {
+      if (!/^[\w-]+$/.test(to)) return mcpJson({ error: 'Use a backup name from backups.' }, true);
+      const dir = DEV_BAK_ROOT() + '/' + to, man = JSON.parse(await cpRead(dir + '/_manifest.json')), safe = DEV_BAK_ROOT() + '/' + devStamp() + '-before-rollback', done = [];
+      for (const f of man.files) {
+        const cur = await cpTryRead(f.path); if (cur != null) await cpWrite(safe + '/' + f.path.replace(DEV.root + '/', '').replace(/\//g, '__'), cur);
+        if (f.backup) { await cpWrite(f.path, await cpRead(dir + '/' + f.backup)); done.push(f.path + ' restored'); }
+        else if (cur != null) { await cpDelete(f.path); done.push(f.path + ' removed (it was new)'); }
+      }
+      await devLog({ action: 'rollback', target, ref: to });
+      return mcpJson({ ok: true, done, currentSavedAs: safe.split('/').pop(), tell: 'Everyone presses Ctrl+F5.' });
+    }
+    const old = await gh('GET', `/git/commits/${encodeURIComponent(to)}`), ref = await gh('GET', `/git/ref/heads/${encodeURIComponent(DEV.ghBranch)}`);
+    const cm = await gh('POST', '/git/commits', { message: 'Rollback to ' + to.slice(0, 7), tree: old.tree.sha, parents: [ref.object.sha] });
+    await gh('PATCH', `/git/refs/heads/${encodeURIComponent(DEV.ghBranch)}`, { sha: cm.sha });
+    await devLog({ action: 'rollback', target, ref: to });
+    return mcpJson({ ok: true, commit: cm.sha, tell: 'Render is redeploying the earlier version. Call render_status.' });
+  });
+  server.registerTool('render_status', { title: 'Server deploy status', description: 'Is the backend up, and how did the latest Render deploy go.', inputSchema: {} }, async () => {
+    const out = {};
+    try { const r = await fetch(DEV.backend + '/health'); out.health = r.ok ? 'up' : 'HTTP ' + r.status; } catch (e) { out.health = 'down: ' + e.message; }
+    if (DEV.rdKey && DEV.rdService) {
+      try { const r = await fetch(`https://api.render.com/v1/services/${DEV.rdService}/deploys?limit=3`, { headers: { Authorization: 'Bearer ' + DEV.rdKey, Accept: 'application/json' } }); const j = await r.json(); out.deploys = (j || []).map(x => x.deploy || x).map(d => ({ status: d.status, commit: d.commit && d.commit.id && d.commit.id.slice(0, 7), message: d.commit && d.commit.message, started: d.createdAt, finished: d.finishedAt })); } catch (e) { out.deploys = 'Render API error: ' + e.message; }
+    } else out.deploys = 'RENDER_API_KEY / RENDER_SERVICE_ID not set — only the health check is available.';
+    out.note = 'This connector runs on the same server: while Render switches versions it can be unavailable for a minute.';
+    return mcpJson(out);
+  });
+  server.registerTool('db_query', { title: 'Database: read', description: 'Run ONE read-only SQL statement (SELECT / WITH / EXPLAIN / SHOW) on Supabase. Max 200 rows returned — add LIMIT.', inputSchema: { sql: z.string() } }, async ({ sql }) => {
+    const nc = devConfigured('db'); if (nc) return mcpJson({ error: nc }, true);
+    const q = sql.trim().replace(/;\s*$/, '');
+    if (q.indexOf(';') !== -1) return mcpJson({ error: 'One statement only.' }, true);
+    if (!/^(select|with|explain|show)\b/i.test(q) || /\b(insert|update|delete|drop|alter|create|truncate|grant|revoke|comment|vacuum|copy)\b/i.test(q.replace(/'[^']*'/g, ''))) return mcpJson({ error: 'db_query is read-only. Use db_execute for changes.' }, true);
+    const rows = await sbSql(q);
+    return mcpJson({ rows: Array.isArray(rows) ? rows.slice(0, 200) : rows, truncated: Array.isArray(rows) && rows.length > 200 });
+  });
+  server.registerTool('db_execute', { title: 'Database: change', description: 'Change the database (add column, create table, update rows …). ALWAYS first call with run=false (dry run: executed inside a transaction and rolled back — shows errors without changing anything). ' +
+    'Then show the owner the SQL and the dry-run result, and call again with run=true and confirmed_by_owner=true. DROP / TRUNCATE / DELETE / UPDATE first copy the affected table into a _bak_ table.',
+    inputSchema: { sql: z.string(), summary: z.string(), run: z.boolean(), confirmed_by_owner: z.boolean().optional() } }, async ({ sql, summary, run, confirmed_by_owner }) => {
+    const nc = devConfigured('db'); if (nc) return mcpJson({ error: nc }, true);
+    const q = sql.trim().replace(/;\s*$/, ''), bare = q.replace(/'[^']*'/g, '');
+    if (/\b(drop\s+(database|schema)|pg_terminate|alter\s+role|create\s+role|drop\s+role)\b/i.test(bare)) return mcpJson({ error: 'Not allowed from the chat (database / schema / roles).' }, true);
+    if (/\b(begin|commit|rollback)\b\s*;/i.test(bare)) return mcpJson({ error: 'Do not include BEGIN/COMMIT — the tool wraps the SQL in a transaction itself.' }, true);
+    if (/\bdelete\s+from\s+[\w."]+\s*(;|$)/i.test(bare) || /\bupdate\s+[\w."]+\s+set\b(?![\s\S]*\bwhere\b)/i.test(bare)) return mcpJson({ error: 'DELETE/UPDATE without WHERE would hit every row — add a WHERE clause.' }, true);
+    try { await sbSql('begin;\n' + q + ';\nrollback;'); }
+    catch (e) { return mcpJson({ dryRun: 'FAILED — nothing was changed', error: e.message }, true); }
+    if (!run) return mcpJson({ dryRun: 'OK — the SQL runs without errors (nothing was changed).', next: 'Show the owner the SQL and ask to confirm, then call again with run=true and confirmed_by_owner=true.' });
+    if (confirmed_by_owner !== true) return mcpJson({ error: 'confirmed_by_owner must be true for a real run.' }, true);
+    const tables = [...new Set([...bare.matchAll(/\b(?:drop\s+table(?:\s+if\s+exists)?|truncate(?:\s+table)?|delete\s+from|update|alter\s+table(?:\s+if\s+exists)?)\s+("?[\w]+"?(?:\."?[\w]+"?)?)/gi)].map(m => m[1].replace(/"/g, '')))]
+      .filter(t => /\b(drop|truncate|delete|update)\b/i.test(bare) || /drop\s+column/i.test(bare));
+    const snaps = [];
+    for (const t of tables) { const name = '_bak_' + t.replace(/^public\./, '').replace(/\W/g, '_') + '_' + devStamp().replace('-', '_'); try { await sbSql(`create table public.${name} as table ${t.includes('.') ? t : 'public.' + t};`); snaps.push(name); } catch (e) { return mcpJson({ error: 'Could not back up ' + t + ' first (' + e.message + ') — nothing was changed.' }, true); } }
+    let res; try { res = await sbSql('begin;\n' + q + ';\ncommit;'); } catch (e) { return mcpJson({ error: 'Failed — the transaction was rolled back, nothing changed. ' + e.message, backups: snaps }, true); }
+    await devLog({ action: 'sql', summary, sql: q.slice(0, 1000), backups: snaps });
+    return mcpJson({ ok: true, result: Array.isArray(res) ? res.slice(0, 50) : res, backupTables: snaps, note: snaps.length ? 'Copies of the affected tables were saved as ' + snaps.join(', ') + ' — they can be dropped later once everything is fine.' : '' });
+  });
+  return server;
+}
+app.post('/devmcp/:key', async (req, res) => {
+  if (!DEV.key || DEV.key.length < 24 || req.params.key !== DEV.key) return res.status(401).json({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' }, id: null });
+  try {
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+    res.on('close', () => transport.close());
+    const s = buildDevMcpServer();
+    await s.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error('Dev MCP error:', err);
+    if (!res.headersSent) res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal error: ' + err.message }, id: null });
+  }
+});
 
 app.post('/mcp/:apiKey', async (req, res) => {
   if (!API_KEY || req.params.apiKey !== API_KEY) {
