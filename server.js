@@ -764,7 +764,10 @@ function tgParseSku(text) {
   const m = /SKU\s*[:#\-]?\s*([A-Za-z0-9][A-Za-z0-9._\/\-]*)/i.exec(String(text || ''));
   return m ? m[1].toUpperCase() : '';
 }
-async function tgHandleMessage(msg) {
+// A replaced picture must replace, not add:
+//  - editing a photo in Telegram (same message) swaps that image;
+//  - posting a new photo / album for a SKU removes that SKU's older photos.
+async function tgHandleMessage(msg, edited) {
   if (!msg) return;
   let fileId = '', uniq = '';
   if (msg.photo && msg.photo.length) {
@@ -775,16 +778,42 @@ async function tgHandleMessage(msg) {
   if (!fileId) return;
   const caption = msg.caption || '';
   const group = msg.media_group_id ? String(msg.media_group_id) : '';
+  const key = msg.chat && msg.message_id != null ? msg.chat.id + ':' + msg.message_id : '';
   let sku = tgParseSku(caption);
   if (!sku && group) {
     const g = await sbFetch('GET', `sku_images?media_group_id=eq.${encodeURIComponent(group)}&sku=not.is.null&select=sku&limit=1`);
     if (g && g[0]) sku = g[0].sku;
   }
-  await sbFetch('POST', 'sku_images?on_conflict=file_unique_id',
-    { sku: sku || null, file_id: fileId, file_unique_id: uniq, media_group_id: group || null, caption: caption || null },
-    { Prefer: 'resolution=merge-duplicates,return=minimal' });
+  // 1) Edited message: swap the picture on the row that came from this exact message.
+  if (key) {
+    let ex = null;
+    try { ex = await sbFetch('GET', `sku_images?tg_msg=eq.${encodeURIComponent(key)}&select=id,sku&limit=1`); } catch (e) { ex = null; }
+    if (ex && ex[0]) {
+      const patch = { file_id: fileId, file_unique_id: uniq, caption: caption || null };
+      if (sku) patch.sku = sku;
+      try { await sbFetch('PATCH', `sku_images?id=eq.${ex[0].id}`, patch, { Prefer: 'return=minimal' }); }
+      catch (e) { await sbFetch('DELETE', `sku_images?file_unique_id=eq.${encodeURIComponent(uniq)}&id=neq.${ex[0].id}`, undefined, { Prefer: 'return=minimal' }); await sbFetch('PATCH', `sku_images?id=eq.${ex[0].id}`, patch, { Prefer: 'return=minimal' }); }
+      skuImgCache.delete(ex[0].id);
+      return;
+    }
+  }
+  // 2) New picture.
+  const row = { sku: sku || null, file_id: fileId, file_unique_id: uniq, media_group_id: group || null, caption: caption || null };
+  let saved = null;
+  try { saved = await sbFetch('POST', 'sku_images?on_conflict=file_unique_id', Object.assign({ tg_msg: key || null }, row), { Prefer: 'resolution=merge-duplicates,return=representation' }); }
+  catch (e) { saved = await sbFetch('POST', 'sku_images?on_conflict=file_unique_id', row, { Prefer: 'resolution=merge-duplicates,return=representation' }); } // tg_msg column not added yet
+  const newId = saved && saved[0] && saved[0].id;
   if (sku && group) {
     await sbFetch('PATCH', `sku_images?media_group_id=eq.${encodeURIComponent(group)}&sku=is.null`, { sku }, { Prefer: 'return=minimal' });
+  }
+  // 3) This post replaces the SKU's older photos (anything earlier that is not part of this same album).
+  if (sku && newId) {
+    let q = `sku_images?sku=eq.${encodeURIComponent(sku)}&id=lt.${newId}`;
+    if (group) q += `&or=(media_group_id.is.null,media_group_id.neq.${encodeURIComponent(group)})`;
+    try {
+      const old = (await sbFetch('GET', q + '&select=id')) || [];
+      if (old.length) { await sbFetch('DELETE', q, undefined, { Prefer: 'return=minimal' }); old.forEach(o => skuImgCache.delete(o.id)); }
+    } catch (e) { console.error('telegram replace:', e.message); }
   }
 }
 app.post('/telegram/:secret', async (req, res) => {
@@ -792,7 +821,8 @@ app.post('/telegram/:secret', async (req, res) => {
   res.sendStatus(200);
   try {
     const u = req.body || {};
-    await tgHandleMessage(u.channel_post || u.message || u.edited_channel_post || u.edited_message);
+    const edited = !!(u.edited_channel_post || u.edited_message);
+    await tgHandleMessage(u.channel_post || u.message || u.edited_channel_post || u.edited_message, edited);
   } catch (e) { console.error('telegram webhook:', e.message); }
 });
 async function doGetSkuImages(params) {
@@ -805,8 +835,14 @@ async function doGetSkuImages(params) {
   for (let n = parts.length - 1; n >= 1; n--) { const c = parts.slice(0, n).join('-'); if (cands.indexOf(c) === -1) cands.push(c); }
   let rows = [], used = sku;
   for (const c of cands) {
-    rows = (await sbFetch('GET', `sku_images?sku=eq.${encodeURIComponent(c)}&select=id,caption&order=id.asc&limit=30`)) || [];
-    if (rows.length) { used = c; break; }
+    rows = (await sbFetch('GET', `sku_images?sku=eq.${encodeURIComponent(c)}&select=id,caption,media_group_id&order=id.asc&limit=60`)) || [];
+    if (rows.length) {
+      used = c;
+      // Show only the newest post: its whole album, or the single newest photo.
+      const last = rows[rows.length - 1];
+      rows = last.media_group_id ? rows.filter(r => r.media_group_id === last.media_group_id) : [last];
+      break;
+    }
   }
   return { success: true, sku, matched: used, images: rows.map(r => ({ id: r.id, caption: r.caption || '' })), configured: !!TG_TOKEN };
 }
