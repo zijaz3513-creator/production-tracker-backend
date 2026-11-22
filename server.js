@@ -764,10 +764,7 @@ function tgParseSku(text) {
   const m = /SKU\s*[:#\-]?\s*([A-Za-z0-9][A-Za-z0-9._\/\-]*)/i.exec(String(text || ''));
   return m ? m[1].toUpperCase() : '';
 }
-// A replaced picture must replace, not add:
-//  - editing a photo in Telegram (same message) swaps that image;
-//  - posting a new photo / album for a SKU removes that SKU's older photos.
-async function tgHandleMessage(msg, edited) {
+async function tgHandleMessage(msg) {
   if (!msg) return;
   let fileId = '', uniq = '';
   if (msg.photo && msg.photo.length) {
@@ -778,42 +775,16 @@ async function tgHandleMessage(msg, edited) {
   if (!fileId) return;
   const caption = msg.caption || '';
   const group = msg.media_group_id ? String(msg.media_group_id) : '';
-  const key = msg.chat && msg.message_id != null ? msg.chat.id + ':' + msg.message_id : '';
   let sku = tgParseSku(caption);
   if (!sku && group) {
     const g = await sbFetch('GET', `sku_images?media_group_id=eq.${encodeURIComponent(group)}&sku=not.is.null&select=sku&limit=1`);
     if (g && g[0]) sku = g[0].sku;
   }
-  // 1) Edited message: swap the picture on the row that came from this exact message.
-  if (key) {
-    let ex = null;
-    try { ex = await sbFetch('GET', `sku_images?tg_msg=eq.${encodeURIComponent(key)}&select=id,sku&limit=1`); } catch (e) { ex = null; }
-    if (ex && ex[0]) {
-      const patch = { file_id: fileId, file_unique_id: uniq, caption: caption || null };
-      if (sku) patch.sku = sku;
-      try { await sbFetch('PATCH', `sku_images?id=eq.${ex[0].id}`, patch, { Prefer: 'return=minimal' }); }
-      catch (e) { await sbFetch('DELETE', `sku_images?file_unique_id=eq.${encodeURIComponent(uniq)}&id=neq.${ex[0].id}`, undefined, { Prefer: 'return=minimal' }); await sbFetch('PATCH', `sku_images?id=eq.${ex[0].id}`, patch, { Prefer: 'return=minimal' }); }
-      skuImgCache.delete(ex[0].id);
-      return;
-    }
-  }
-  // 2) New picture.
-  const row = { sku: sku || null, file_id: fileId, file_unique_id: uniq, media_group_id: group || null, caption: caption || null };
-  let saved = null;
-  try { saved = await sbFetch('POST', 'sku_images?on_conflict=file_unique_id', Object.assign({ tg_msg: key || null }, row), { Prefer: 'resolution=merge-duplicates,return=representation' }); }
-  catch (e) { saved = await sbFetch('POST', 'sku_images?on_conflict=file_unique_id', row, { Prefer: 'resolution=merge-duplicates,return=representation' }); } // tg_msg column not added yet
-  const newId = saved && saved[0] && saved[0].id;
+  await sbFetch('POST', 'sku_images?on_conflict=file_unique_id',
+    { sku: sku || null, file_id: fileId, file_unique_id: uniq, media_group_id: group || null, caption: caption || null },
+    { Prefer: 'resolution=merge-duplicates,return=minimal' });
   if (sku && group) {
     await sbFetch('PATCH', `sku_images?media_group_id=eq.${encodeURIComponent(group)}&sku=is.null`, { sku }, { Prefer: 'return=minimal' });
-  }
-  // 3) This post replaces the SKU's older photos (anything earlier that is not part of this same album).
-  if (sku && newId) {
-    let q = `sku_images?sku=eq.${encodeURIComponent(sku)}&id=lt.${newId}`;
-    if (group) q += `&or=(media_group_id.is.null,media_group_id.neq.${encodeURIComponent(group)})`;
-    try {
-      const old = (await sbFetch('GET', q + '&select=id')) || [];
-      if (old.length) { await sbFetch('DELETE', q, undefined, { Prefer: 'return=minimal' }); old.forEach(o => skuImgCache.delete(o.id)); }
-    } catch (e) { console.error('telegram replace:', e.message); }
   }
 }
 app.post('/telegram/:secret', async (req, res) => {
@@ -821,8 +792,7 @@ app.post('/telegram/:secret', async (req, res) => {
   res.sendStatus(200);
   try {
     const u = req.body || {};
-    const edited = !!(u.edited_channel_post || u.edited_message);
-    await tgHandleMessage(u.channel_post || u.message || u.edited_channel_post || u.edited_message, edited);
+    await tgHandleMessage(u.channel_post || u.message || u.edited_channel_post || u.edited_message);
   } catch (e) { console.error('telegram webhook:', e.message); }
 });
 async function doGetSkuImages(params) {
@@ -835,14 +805,8 @@ async function doGetSkuImages(params) {
   for (let n = parts.length - 1; n >= 1; n--) { const c = parts.slice(0, n).join('-'); if (cands.indexOf(c) === -1) cands.push(c); }
   let rows = [], used = sku;
   for (const c of cands) {
-    rows = (await sbFetch('GET', `sku_images?sku=eq.${encodeURIComponent(c)}&select=id,caption,media_group_id&order=id.asc&limit=60`)) || [];
-    if (rows.length) {
-      used = c;
-      // Show only the newest post: its whole album, or the single newest photo.
-      const last = rows[rows.length - 1];
-      rows = last.media_group_id ? rows.filter(r => r.media_group_id === last.media_group_id) : [last];
-      break;
-    }
+    rows = (await sbFetch('GET', `sku_images?sku=eq.${encodeURIComponent(c)}&select=id,caption&order=id.asc&limit=30`)) || [];
+    if (rows.length) { used = c; break; }
   }
   return { success: true, sku, matched: used, images: rows.map(r => ({ id: r.id, caption: r.caption || '' })), configured: !!TG_TOKEN };
 }
@@ -4788,6 +4752,8 @@ const DEV = {
   backend: process.env.BACKEND_URL || 'https://production-tracker-backend-1j2s.onrender.com'
 };
 if (!DEV.root && DEV.cpUser) DEV.root = '/home/' + DEV.cpUser + '/public_html';
+// Release 66: HostGator accounts can live in /home2, /home3 … — take the home folder from CPANEL_ROOT when it is set.
+const DEV_HOME = () => ((/^\/home\d*\/[^/]+/.exec(DEV.root || '') || [])[0] || ('/home/' + DEV.cpUser));
 if (!DEV.previewDir && DEV.liveDir) DEV.previewDir = DEV.liveDir.replace(/[^/]+$/, 'tracker-preview');
 const DEV_BAK_ROOT = () => DEV.root + '/_tracker_backups';
 const devSha = t => crypto.createHash('sha256').update(String(t)).digest('hex');
@@ -4798,7 +4764,7 @@ function hostAbs(p) {
   if (p === 'page' || p === 'tracker' || p === 'index.html') return DEV.liveDir + '/index.html';
   if (p.indexOf('..') !== -1) throw new Error('Path may not contain ..');
   const abs = p.startsWith('/') ? p : DEV.root + '/' + p.replace(/^\.?\//, '');
-  if (!abs.startsWith('/home/' + DEV.cpUser + '/')) throw new Error('Path must be inside your HostGator home folder.');
+  if (!abs.startsWith(DEV_HOME() + '/')) throw new Error('Path must be inside your HostGator home folder.');
   if (/\/(\.ssh|etc|mail|\.cpanel)(\/|$)/.test(abs)) throw new Error('That folder is off-limits.');
   return abs;
 }
@@ -4824,7 +4790,7 @@ async function cpTryRead(abs) { try { return await cpRead(abs); } catch (e) { re
 async function cpEnsureDir(full) {
   try { await cpGet('Fileman/list_files', { dir: full }); return; } catch (e) {}
   const parent = full.replace(/\/[^/]+$/, '');
-  if (parent && parent !== full && parent.length > ('/home/' + DEV.cpUser).length) await cpEnsureDir(parent);
+  if (parent && parent !== full && parent.length > DEV_HOME().length) await cpEnsureDir(parent);
   await cpApi2('mkdir', { path: parent, name: full.split('/').pop() });
 }
 async function cpWrite(abs, content) {
