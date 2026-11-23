@@ -2262,7 +2262,7 @@ async function doEmbMasterReceive(params) {
 //   SKIP|<stamp>                         not needed
 // ============================================================
 const EMB_PAUSE_REASONS = {
-  hand: ['No Material', 'Break', 'Need Fabric'],
+  hand: ['No Material', 'Break', 'Need Fabric', 'Doing other urgent order'],
   mach: ['Break', 'Fabric quantity less', 'Threads not available', 'Maintenance']
 };
 function embStampNow() {
