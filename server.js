@@ -167,143 +167,6 @@ if (!DOUSIDEH_ENABLED) {
   console.warn('Dousideh sync disabled — set DOUSIDEH_URL and DOUSIDEH_SECRET to send the timeline to the shop.');
 }
 const DOUSIDEH_RETRY_MS = [5000, 30000, 120000, 600000];
-
-// ------------------------------------------------------------
-// Dousideh shop API (Release 68) — the Tracker can also READ the shop's
-// orders and CHANGE them (status, notes, shipped + tracking, stock, products).
-// This needs its own key, made in Dousideh: Settings → API & webhooks →
-// Create API key, named "Production Tracker", with: Read orders, Update
-// orders, Read stock, Set and adjust stock, Read products, Create and edit
-// products. (DOUSIDEH_SECRET above only lets the Tracker SEND timeline steps.)
-// Set on Render: DOUSIDEH_API_KEY = that key (starts with dsk_).
-//                DOUSIDEH_API_URL = optional; default is the shop of
-//                DOUSIDEH_URL + /api/v1 (e.g. https://hekayeeh.com/api/v1).
-// Everything is recorded twice: Dousideh writes each change on the order's
-// timeline and in its Activity log as "API: Production Tracker", and the
-// Tracker writes who did it in order_events (kind "shop").
-// ------------------------------------------------------------
-const DOUSIDEH_API_KEY = process.env.DOUSIDEH_API_KEY;
-const DOUSIDEH_API_URL = (process.env.DOUSIDEH_API_URL || (() => {
-  try { return DOUSIDEH_URL ? new URL(DOUSIDEH_URL).origin + '/api/v1' : ''; } catch (e) { return ''; }
-})()).replace(/\/+$/, '');
-const DOUSIDEH_API_ENABLED = !!(DOUSIDEH_API_KEY && DOUSIDEH_API_URL);
-if (!DOUSIDEH_API_ENABLED) {
-  console.warn('Dousideh shop API disabled — set DOUSIDEH_API_KEY to read and change the shop\'s orders from the Tracker.');
-}
-async function dousidehApi(method, path, body) {
-  if (!DOUSIDEH_API_ENABLED) throw new Error('The shop connection is not set up: add DOUSIDEH_API_KEY on Render (a key from Dousideh → Settings → API & webhooks).');
-  const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), 20000);
-  let res;
-  try {
-    res = await fetch(DOUSIDEH_API_URL + path, {
-      method,
-      headers: { 'Authorization': 'Bearer ' + DOUSIDEH_API_KEY, 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: ctl.signal
-    });
-  } catch (e) {
-    throw new Error(e.name === 'AbortError' ? 'The shop took too long to answer. Try again.' : 'Could not reach the shop: ' + e.message);
-  } finally { clearTimeout(timer); }
-  let data = null;
-  try { data = await res.json(); } catch (e) { /* no body */ }
-  if (res.status === 401) throw new Error('The shop did not accept DOUSIDEH_API_KEY — make a new key in Dousideh and put it on Render.');
-  if (res.status === 403) throw new Error((data && data.error) || 'This key is not allowed to do that — tick the missing permission on the key in Dousideh.');
-  if (!res.ok) throw new Error((data && data.error) || ('The shop answered ' + res.status));
-  return data || {};
-}
-const shopOrderNo_ = v => (v == null ? '' : String(v)).trim().replace(/^#/, '');
-// the Tracker's own record of a change it made in the shop (not sent back to the shop: the shop already wrote it)
-function logShopChange(orderNo, sku, text, actor) {
-  sbFetch('POST', 'order_events', {
-    order_id: null, order_no: orderNo || null, sku: sku || null,
-    kind: 'shop', text: String(text || '').slice(0, 500), actor: actor || null, at: new Date().toISOString()
-  }, { Prefer: 'return=minimal' }).catch(e => console.error('order_events insert failed:', e.message));
-}
-const SHOP_STATUSES = ['confirmed', 'processing', 'shipped', 'delivered'];
-
-async function doShopPing() {
-  if (!DOUSIDEH_API_ENABLED) return { success: true, connected: false, error: 'DOUSIDEH_API_KEY is not set on Render.' };
-  try {
-    const shop = await dousidehApi('GET', '/shop');
-    return { success: true, connected: true, shop: { name: shop.name, currency: shop.currency, domain: shop.domain } };
-  } catch (e) { return { success: true, connected: false, error: e.message }; }
-}
-async function doShopGetOrder(params) {
-  const no = shopOrderNo_(params.orderNo);
-  if (!no) return { success: false, error: 'Order number is required.' };
-  return { success: true, order: await dousidehApi('GET', '/orders/' + encodeURIComponent(no)) };
-}
-async function doShopListOrders(params) {
-  const q = new URLSearchParams();
-  ['status', 'paymentStatus', 'fulfillmentStatus', 'channel', 'createdSince', 'updatedSince'].forEach(k => { if (params[k]) q.set(k, String(params[k])); });
-  q.set('page', String(Math.max(1, parseInt(params.page, 10) || 1)));
-  q.set('limit', String(Math.max(1, Math.min(100, parseInt(params.limit, 10) || 50))));
-  const r = await dousidehApi('GET', '/orders?' + q.toString());
-  return { success: true, orders: r.data || [], page: r.page || 1, hasMore: !!r.hasMore };
-}
-async function doShopSetOrderStatus(params) {
-  const no = shopOrderNo_(params.orderNo), status = (params.status || '').toString().trim().toLowerCase();
-  if (!no) return { success: false, error: 'Order number is required.' };
-  if (SHOP_STATUSES.indexOf(status) === -1) return { success: false, error: 'Status must be one of: ' + SHOP_STATUSES.join(', ') + '. Cancelling and refunds are done in the shop admin.' };
-  const order = await dousidehApi('PATCH', '/orders/' + encodeURIComponent(no), { status });
-  logShopChange(no, null, 'Shop order status set to ' + status, actorOf(params));
-  return { success: true, order };
-}
-async function doShopAddOrderNote(params) {
-  const no = shopOrderNo_(params.orderNo), note = (params.note || '').toString().trim();
-  if (!no) return { success: false, error: 'Order number is required.' };
-  if (!note) return { success: false, error: 'Write the note first.' };
-  const who = actorOf(params);
-  await dousidehApi('POST', '/orders/' + encodeURIComponent(no) + '/notes', { note: (who ? who + ' (Tracker): ' : 'Tracker: ') + note.slice(0, 1800) });
-  logShopChange(no, null, 'Note added to the shop order: ' + note.slice(0, 300), who);
-  return { success: true };
-}
-async function doShopFulfilOrder(params) {
-  const no = shopOrderNo_(params.orderNo);
-  if (!no) return { success: false, error: 'Order number is required.' };
-  const body = { notifyCustomer: params.notifyCustomer === true || params.notifyCustomer === 'true' };
-  ['carrier', 'trackingNumber', 'trackingUrl'].forEach(k => { if (params[k]) body[k] = String(params[k]).trim(); });
-  let items = params.items;
-  if (typeof items === 'string') { try { items = JSON.parse(items); } catch (e) { return { success: false, error: 'items must be a list like [{"sku":"9027-55","quantity":1}].' }; } }
-  if (Array.isArray(items) && items.length) body.items = items.map(i => ({ itemId: i.itemId || undefined, sku: i.sku || undefined, quantity: parseInt(i.quantity, 10) || 1 }));
-  const order = await dousidehApi('POST', '/orders/' + encodeURIComponent(no) + '/fulfillments', body);
-  logShopChange(no, null, 'Marked shipped in the shop' + (body.carrier ? ' with ' + body.carrier : '') + (body.trackingNumber ? ' · ' + body.trackingNumber : '') + (body.items ? ' (' + body.items.length + ' item line' + (body.items.length === 1 ? '' : 's') + ')' : ' (everything left)'), actorOf(params));
-  return { success: true, order };
-}
-async function doShopGetStock(params) {
-  const sku = (params.sku || '').toString().trim();
-  const r = await dousidehApi('GET', '/inventory?' + new URLSearchParams(sku ? { sku, limit: '100' } : { limit: String(Math.max(1, Math.min(100, parseInt(params.limit, 10) || 50))) }).toString());
-  return { success: true, stock: r.data || [] };
-}
-async function doShopSetStock(params) {
-  const sku = (params.sku || '').toString().trim(), qty = parseInt(params.quantity, 10);
-  if (!sku) return { success: false, error: 'SKU is required.' };
-  if (!Number.isFinite(qty) || qty < 0) return { success: false, error: 'Quantity must be 0 or more.' };
-  const who = actorOf(params);
-  const r = await dousidehApi('POST', '/inventory/set', { items: [{ sku, quantity: qty, ...(params.location ? { location: String(params.location) } : {}) }], reason: ('Production Tracker' + (who ? ' · ' + who : '')).slice(0, 120) });
-  const line = (r.results || r.data || [])[0];
-  if (line && line.ok === false) return { success: false, error: line.error || 'The shop did not change the stock.' };
-  logShopChange(params.orderNo ? shopOrderNo_(params.orderNo) : 'STOCK', sku, 'Shop stock of ' + sku + ' set to ' + qty, who);
-  return { success: true, result: line || r };
-}
-async function doShopGetProduct(params) {
-  const id = (params.id || '').toString().trim(), sku = (params.sku || '').toString().trim();
-  if (id) return { success: true, product: await dousidehApi('GET', '/products/' + encodeURIComponent(id)) };
-  if (!sku) return { success: false, error: 'Give the product id or a SKU.' };
-  const r = await dousidehApi('GET', '/products?' + new URLSearchParams({ sku, limit: '5' }).toString());
-  return { success: true, products: r.data || [] };
-}
-async function doShopUpdateProduct(params) {
-  const id = (params.id || '').toString().trim();
-  let changes = params.changes;
-  if (typeof changes === 'string') { try { changes = JSON.parse(changes); } catch (e) { return { success: false, error: 'changes must be an object like {"price": 35}.' }; } }
-  if (!id) return { success: false, error: 'Product id is required (see shopGetProduct).' };
-  if (!changes || typeof changes !== 'object' || Array.isArray(changes) || !Object.keys(changes).length) return { success: false, error: 'Say what to change.' };
-  const product = await dousidehApi('PATCH', '/products/' + encodeURIComponent(id), changes);
-  logShopChange('PRODUCT', product && product.sku ? product.sku : id, 'Shop product changed: ' + Object.keys(changes).join(', '), actorOf(params));
-  return { success: true, product };
-}
 function pushDousideh(ev, attempt) {
   attempt = attempt || 0;
   if (!DOUSIDEH_ENABLED || !ev || !ev.orderNo) return;
@@ -901,7 +764,10 @@ function tgParseSku(text) {
   const m = /SKU\s*[:#\-]?\s*([A-Za-z0-9][A-Za-z0-9._\/\-]*)/i.exec(String(text || ''));
   return m ? m[1].toUpperCase() : '';
 }
-async function tgHandleMessage(msg) {
+// A replaced picture must replace, not add:
+//  - editing a photo in Telegram (same message) swaps that image;
+//  - posting a new photo / album for a SKU removes that SKU's older photos.
+async function tgHandleMessage(msg, edited) {
   if (!msg) return;
   let fileId = '', uniq = '';
   if (msg.photo && msg.photo.length) {
@@ -912,16 +778,42 @@ async function tgHandleMessage(msg) {
   if (!fileId) return;
   const caption = msg.caption || '';
   const group = msg.media_group_id ? String(msg.media_group_id) : '';
+  const key = msg.chat && msg.message_id != null ? msg.chat.id + ':' + msg.message_id : '';
   let sku = tgParseSku(caption);
   if (!sku && group) {
     const g = await sbFetch('GET', `sku_images?media_group_id=eq.${encodeURIComponent(group)}&sku=not.is.null&select=sku&limit=1`);
     if (g && g[0]) sku = g[0].sku;
   }
-  await sbFetch('POST', 'sku_images?on_conflict=file_unique_id',
-    { sku: sku || null, file_id: fileId, file_unique_id: uniq, media_group_id: group || null, caption: caption || null },
-    { Prefer: 'resolution=merge-duplicates,return=minimal' });
+  // 1) Edited message: swap the picture on the row that came from this exact message.
+  if (key) {
+    let ex = null;
+    try { ex = await sbFetch('GET', `sku_images?tg_msg=eq.${encodeURIComponent(key)}&select=id,sku&limit=1`); } catch (e) { ex = null; }
+    if (ex && ex[0]) {
+      const patch = { file_id: fileId, file_unique_id: uniq, caption: caption || null };
+      if (sku) patch.sku = sku;
+      try { await sbFetch('PATCH', `sku_images?id=eq.${ex[0].id}`, patch, { Prefer: 'return=minimal' }); }
+      catch (e) { await sbFetch('DELETE', `sku_images?file_unique_id=eq.${encodeURIComponent(uniq)}&id=neq.${ex[0].id}`, undefined, { Prefer: 'return=minimal' }); await sbFetch('PATCH', `sku_images?id=eq.${ex[0].id}`, patch, { Prefer: 'return=minimal' }); }
+      skuImgCache.delete(ex[0].id);
+      return;
+    }
+  }
+  // 2) New picture.
+  const row = { sku: sku || null, file_id: fileId, file_unique_id: uniq, media_group_id: group || null, caption: caption || null };
+  let saved = null;
+  try { saved = await sbFetch('POST', 'sku_images?on_conflict=file_unique_id', Object.assign({ tg_msg: key || null }, row), { Prefer: 'resolution=merge-duplicates,return=representation' }); }
+  catch (e) { saved = await sbFetch('POST', 'sku_images?on_conflict=file_unique_id', row, { Prefer: 'resolution=merge-duplicates,return=representation' }); } // tg_msg column not added yet
+  const newId = saved && saved[0] && saved[0].id;
   if (sku && group) {
     await sbFetch('PATCH', `sku_images?media_group_id=eq.${encodeURIComponent(group)}&sku=is.null`, { sku }, { Prefer: 'return=minimal' });
+  }
+  // 3) This post replaces the SKU's older photos (anything earlier that is not part of this same album).
+  if (sku && newId) {
+    let q = `sku_images?sku=eq.${encodeURIComponent(sku)}&id=lt.${newId}`;
+    if (group) q += `&or=(media_group_id.is.null,media_group_id.neq.${encodeURIComponent(group)})`;
+    try {
+      const old = (await sbFetch('GET', q + '&select=id')) || [];
+      if (old.length) { await sbFetch('DELETE', q, undefined, { Prefer: 'return=minimal' }); old.forEach(o => skuImgCache.delete(o.id)); }
+    } catch (e) { console.error('telegram replace:', e.message); }
   }
 }
 app.post('/telegram/:secret', async (req, res) => {
@@ -929,7 +821,8 @@ app.post('/telegram/:secret', async (req, res) => {
   res.sendStatus(200);
   try {
     const u = req.body || {};
-    await tgHandleMessage(u.channel_post || u.message || u.edited_channel_post || u.edited_message);
+    const edited = !!(u.edited_channel_post || u.edited_message);
+    await tgHandleMessage(u.channel_post || u.message || u.edited_channel_post || u.edited_message, edited);
   } catch (e) { console.error('telegram webhook:', e.message); }
 });
 async function doGetSkuImages(params) {
@@ -942,8 +835,14 @@ async function doGetSkuImages(params) {
   for (let n = parts.length - 1; n >= 1; n--) { const c = parts.slice(0, n).join('-'); if (cands.indexOf(c) === -1) cands.push(c); }
   let rows = [], used = sku;
   for (const c of cands) {
-    rows = (await sbFetch('GET', `sku_images?sku=eq.${encodeURIComponent(c)}&select=id,caption&order=id.asc&limit=30`)) || [];
-    if (rows.length) { used = c; break; }
+    rows = (await sbFetch('GET', `sku_images?sku=eq.${encodeURIComponent(c)}&select=id,caption,media_group_id&order=id.asc&limit=60`)) || [];
+    if (rows.length) {
+      used = c;
+      // Show only the newest post: its whole album, or the single newest photo.
+      const last = rows[rows.length - 1];
+      rows = last.media_group_id ? rows.filter(r => r.media_group_id === last.media_group_id) : [last];
+      break;
+    }
   }
   return { success: true, sku, matched: used, images: rows.map(r => ({ id: r.id, caption: r.caption || '' })), configured: !!TG_TOKEN };
 }
@@ -973,10 +872,63 @@ async function doGetSkuImage(params) {
 // fulfil, comments, webhooks). One store from SHOPIFY_STORE_DOMAIN/TOKEN, or
 // several from SHOPIFY_STORES='[{"key":"A","name":"Aeon Abaya","domain":"x.myshopify.com","token":"shpat_..."}]'.
 // ============================================================
-const SHOP_STORES = (() => {
+// Hekayeeh comes from Dousideh (its own shop), not Shopify. Env: DOUSIDEH_API_URL (shop address), DOUSIDEH_API_KEY.
+const DSH = {
+  base: (process.env.DOUSIDEH_API_URL || process.env.DOUSIDEH_BASE_URL || (() => { try { return process.env.DOUSIDEH_URL ? new URL(process.env.DOUSIDEH_URL).origin : ''; } catch (e) { return ''; } })()).replace(/\/+$/, '').replace(/\/api$/, ''),
+  key: process.env.DOUSIDEH_API_KEY || process.env.DOUSIDEH_API_TOKEN || process.env.DOUSIDEH_KEY || process.env.DOUSIDEH_TOKEN || '',
+  name: process.env.DOUSIDEH_STORE_NAME || 'Hekayeeh'
+};
+const DSH_ON = !!(DSH.base && DSH.key);
+if (!DSH_ON) console.warn('Hekayeeh (Dousideh) orders disabled — set DOUSIDEH_API_URL and DOUSIDEH_API_KEY.');
+const SHOP_STORES = ((list) => DSH_ON ? list.filter(s => !/hakay|hekay/i.test(s.name)).concat([{ key: 'H', name: DSH.name, kind: 'dousideh' }]) : list)((() => {
   try { const j = JSON.parse(process.env.SHOPIFY_STORES || 'null'); if (Array.isArray(j) && j.length) return j.filter(s => s.domain && s.token).map((s, i) => ({ key: s.key || String.fromCharCode(65 + i), name: s.name || s.domain, domain: s.domain, token: s.token })); } catch (e) {}
   return SHOPIFY_ENABLED ? [{ key: 'A', name: process.env.SHOPIFY_STORE_NAME || 'Aeon Abaya', domain: SHOPIFY_STORE, token: SHOPIFY_TOKEN }] : [];
-})();
+})());
+const isDsh = st => st && st.kind === 'dousideh';
+async function dshFetch(method, path, body, query) {
+  const url = DSH.base + path + (query ? '?' + new URLSearchParams(query) : '');
+  const r = await fetch(url, { method, headers: { Authorization: 'Bearer ' + DSH.key, 'x-api-key': DSH.key, 'Content-Type': 'application/json', Accept: 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+  const t = await r.text(); let j; try { j = JSON.parse(t); } catch (e) { j = null; }
+  if (r.status === 401 || r.status === 403) throw new Error('Dousideh did not accept DOUSIDEH_API_KEY (HTTP ' + r.status + ')');
+  if (!r.ok) throw new Error('Dousideh HTTP ' + r.status + ((j && (j.error || j.message)) ? ': ' + (j.error || j.message) : ''));
+  if (j == null) throw new Error('Dousideh answered with a web page, not data — check DOUSIDEH_API_URL');
+  return j;
+}
+const DSH_PAY = { paid: 'PAID', pending: 'PENDING', authorized: 'AUTHORIZED', partially_paid: 'PARTIALLY_PAID', refunded: 'REFUNDED', partially_refunded: 'PARTIALLY_REFUNDED', failed: 'FAILED', voided: 'VOIDED' };
+const DSH_FUL = { unfulfilled: 'UNFULFILLED', partial: 'PARTIALLY_FULFILLED', partially_fulfilled: 'PARTIALLY_FULFILLED', fulfilled: 'FULFILLED' };
+function dshAddr(a) { return a ? { name: a.fullName || '', address1: a.street || '', address2: a.street2 || '', city: a.city || '', province: a.state || '', zip: a.zipCode || '', country: a.country || '', phone: a.phone || '' } : null; }
+function dshSlim(o, st) {
+  const items = (o.items || []).map(li => {
+    const qty = Math.max(0, (li.quantity || 0) - (li.refundedQuantity || 0));
+    return { id: li._id, title: li.productName || '', variant: li.variantName || '', sku: li.sku || '', qty, left: Math.max(0, qty - (li.fulfilledQuantity || 0)),
+      img: li.image ? (/^https?:/.test(li.image) ? li.image : DSH.base + li.image) : '', price: Number(li.price) || 0, total: (Number(li.price) || 0) * qty, attrs: [] };
+  }).filter(li => li.qty > 0);
+  const sa = dshAddr(o.shippingAddress), ba = dshAddr(o.billingAddress);
+  const note = o.note || o.notes || o.customerNote || '';
+  return {
+    store: st.key, storeName: st.name, id: o._id, name: '#' + o.orderNumber, no: String(o.orderNumber || ''),
+    createdAt: o.createdAt, updatedAt: o.updatedAt, closed: !!o.archived, cancelledAt: o.status === 'cancelled' ? (o.cancelledAt || o.updatedAt) : null,
+    pay: DSH_PAY[o.paymentStatus] || String(o.paymentStatus || '').toUpperCase(), ful: DSH_FUL[o.fulfillmentStatus] || String(o.fulfillmentStatus || '').toUpperCase(),
+    source: (o.channel && o.channel.label) || o.source || '', gateways: [o.paymentGateway || o.paymentMethod].filter(Boolean),
+    customer: (sa && sa.name) || (ba && ba.name) || o.email || 'Guest', email: o.email || '', phone: o.phone || (sa && sa.phone) || '',
+    ship: sa, bill: ba, shipping: (o.shipping && o.shipping.method) || '',
+    note, shopNote: note, trackerLog: '', attrs: [], tags: o.tags || [], items, itemCount: items.reduce((x, i) => x + i.qty, 0),
+    tracking: (o.fulfillments || []).map(f => ({ number: f.trackingNumber || '', company: f.carrier || '', url: f.trackingUrl || '' })).filter(t => t.number || t.url),
+    totals: { currency: o.currency || 'KWD', subtotal: Number(o.subtotal) || 0, shipping: Number(o.shippingCost) || 0, tax: Number(o.taxAmount) || 0, discount: Number(o.discountAmount) || 0, total: Number(o.total) || 0 },
+    trkRows: ((o.tracker && o.tracker.rows) || []).map(r => ({ itemId: r.itemId, row: r.row, sku: r.sku }))
+  };
+}
+async function dshFetchAll(st) {
+  const since = Date.now() - 90 * 86400000, out = [];
+  for (let page = 1; page <= 6; page++) {
+    const j = await dshFetch('GET', '/api/orders', null, { limit: 100, page });
+    const arr = j.orders || [];
+    let old = false;
+    arr.forEach(o => { if (Date.parse(o.createdAt) < since) old = true; else out.push(dshSlim(o, st)); });
+    if (old || !arr.length || page >= (j.pages || 1)) break;
+  }
+  return out;
+}
 const shopStore = key => SHOP_STORES.find(s => s.key === key) || SHOP_STORES[0];
 async function shopGQL(store, query, variables) {
   const res = await fetch(`https://${store.domain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': store.token }, body: JSON.stringify({ query, variables }) });
@@ -1041,7 +993,7 @@ async function shopFetchAll(store) {
 async function shopOrders(store, force) {
   const c = SHOP_CACHE[store.key];
   if (!force && c && Date.now() - c.at < SHOP_TTL) return c.orders;
-  const orders = await shopFetchAll(store);
+  const orders = isDsh(store) ? await dshFetchAll(store) : await shopFetchAll(store);
   SHOP_CACHE[store.key] = { at: Date.now(), orders };
   return orders;
 }
@@ -1049,6 +1001,7 @@ function shopBust(key) { delete SHOP_CACHE[key]; }
 async function shopFindByNo(orderNo) {
   const clean = String(orderNo || '').trim().replace(/^#/, '');
   for (const st of SHOP_STORES) {
+    if (isDsh(st)) continue;
     try {
       const d = await shopGQL(st, `query($q: String!) { orders(first: 1, query: $q) { edges { node { ${SHOP_ORDER_FIELDS} } } } }`, { q: `name:${clean} OR name:#${clean}` });
       const e = d.orders.edges[0]; if (e) return { store: st, order: shopSlimOrder(e.node, st), raw: e.node };
@@ -1057,7 +1010,7 @@ async function shopFindByNo(orderNo) {
   return null;
 }
 async function doShopList(params) {
-  if (!SHOP_STORES.length) return { success: false, error: 'Shopify is not configured on the server (SHOPIFY_STORE_DOMAIN / SHOPIFY_ADMIN_TOKEN).' };
+  if (!SHOP_STORES.length) return { success: false, error: 'No shop is configured on the server (Shopify or Dousideh).' };
   const force = params.force === true || params.force === 'true';
   const all = [], errors = [];
   for (const st of SHOP_STORES) { try { all.push(...await shopOrders(st, force)); } catch (e) { errors.push(st.name + ': ' + e.message); } }
@@ -1075,6 +1028,19 @@ async function doShopList(params) {
 async function doShopOrder(params) {
   const st = shopStore((params.store || '').toString()); if (!st) return { success: false, error: 'Shopify is not configured.' };
   const id = (params.id || '').toString(); if (!id) return { success: false, error: 'Missing order id.' };
+  if (isDsh(st)) {
+    const raw = await dshFetch('GET', '/api/orders/' + encodeURIComponent(id));
+    const o = dshSlim(raw, st);
+    o.events = (raw.timeline || []).filter(e => e.type !== 'production').map(e => ({ at: e.createdAt, text: String(e.message || '').replace(/<[^>]+>/g, ''), who: e.by || '', src: DSH.name }));
+    o.fulfillmentOrders = [];
+    let trkRows = [], trkEvents = [];
+    const rowIds = o.trkRows.map(r => Number(r.row) - 2).filter(n => n > 0);
+    try { trkRows = (await sbFetch('GET', rowIds.length ? `orders?id=in.(${rowIds.join(',')})&select=id,sku,is_done` : `orders?order_no=eq.${encodeURIComponent(o.no)}&select=id,sku,is_done`)) || []; } catch (e) {}
+    try { trkEvents = (await sbFetch('GET', trkRows.length ? `order_events?order_id=in.(${trkRows.map(r => r.id).join(',')})&select=at,kind,text,actor,sku&order=at.desc&limit=300` : `order_events?order_no=eq.${encodeURIComponent(o.no)}&select=at,kind,text,actor,sku&order=at.desc&limit=300`)) || []; } catch (e) {}
+    o.trk = trkRows.map(r => ({ row: r.id + 2, sku: r.sku, done: !!r.is_done }));
+    o.trkEvents = trkEvents.map(e => ({ at: e.at, text: e.text + (e.sku ? ' · ' + e.sku : ''), who: e.actor || '', src: 'Tracker', kind: e.kind }));
+    return { success: true, order: o };
+  }
   const d = await shopGQL(st, `query($id: ID!) { order(id: $id) { ${SHOP_ORDER_FIELDS}
     events(first: 100, sortKey: CREATED_AT, reverse: true) { edges { node { id message createdAt ... on BasicEvent { attributeToUser attributeToApp appTitle } } } }
     fulfillmentOrders(first: 10) { edges { node { id status lineItems(first: 50) { edges { node { id remainingQuantity lineItem { id } } } } } } } } }`, { id });
@@ -1113,6 +1079,24 @@ async function doShopFulfil(params) {
   const st = shopStore((params.store || '').toString()); if (!st) return { success: false, error: 'Shopify is not configured.' };
   const id = (params.id || '').toString(); if (!id) return { success: false, error: 'Missing order id.' };
   const who = (params.authenticatedName || params.role || 'fulfillment').toString();
+  if (isDsh(st)) {
+    let raw; try { raw = await dshFetch('GET', '/api/orders/' + encodeURIComponent(id)); } catch (e) { return { success: false, error: e.message }; }
+    const o = dshSlim(raw, st), want = Array.isArray(params.lineItemIds) && params.lineItemIds.length ? new Set(params.lineItemIds) : null;
+    const items = o.items.filter(i => i.left > 0 && (!want || want.has(i.id))).map(i => ({ itemId: i.id, quantity: i.left }));
+    if (!items.length) return { success: true, already: true };
+    const t = params.tracking || {};
+    try { await dshFetch('POST', '/api/orders/' + encodeURIComponent(id) + '/fulfillments', { items, carrier: t.company || undefined, trackingNumber: t.number || undefined, trackingUrl: t.url || undefined, notifyCustomer: params.notify !== false && params.notify !== 'false' }); }
+    catch (e) { return { success: false, error: 'Dousideh refused: ' + e.message }; }
+    shopBust(st.key);
+    // the tracker rows Dousideh sent for these items → Done
+    const ids = new Set(items.map(i => i.itemId));
+    const rows = o.trkRows.filter(r => ids.has(r.itemId)).map(r => Number(r.row) - 2).filter(n => n > 0);
+    try {
+      const recs = rows.length ? ((await sbFetch('GET', `orders?id=in.(${rows.join(',')})&is_done=eq.false&select=id,sku,order_no`)) || []) : [];
+      for (const rec of recs) { await sbUpdate('orders', rec.id, { is_done: true, done_at: new Date().toISOString() }); logOrderEvent({ orderId: rec.id, orderNo: rec.order_no, sku: rec.sku }, 'done', 'Fulfilled in ' + st.name + ' by ' + who + ' — marked Done', who); }
+    } catch (e) {}
+    return { success: true };
+  }
   let r;
   try { r = await shopFulfil(st, id, Array.isArray(params.lineItemIds) ? params.lineItemIds : null, params.tracking || null, params.notify !== false && params.notify !== 'false'); }
   catch (e) { return { success: false, error: 'Shopify refused: ' + e.message }; }
@@ -1154,6 +1138,7 @@ async function doShopComment(params) {
 }
 async function doShopNote(params) {
   const st = shopStore((params.store || '').toString()); if (!st) return { success: false, error: 'Shopify is not configured.' };
+  if (isDsh(st)) return { success: false, error: 'Edit the note for ' + st.name + ' orders in Dousideh.' };
   const id = (params.id || '').toString(), note = (params.note || '').toString().slice(0, 2000);
   const r = await shopGQL(st, `mutation($input: OrderInput!) { orderUpdate(input: $input) { userErrors { message } } }`, { input: { id, metafields: [{ namespace: 'production_tracker', key: 'customer_note', type: 'multi_line_text_field', value: note || ' ' }] } });
   const ue = r.orderUpdate.userErrors; if (ue && ue.length) return { success: false, error: ue.map(u => u.message).join('; ') };
@@ -1162,6 +1147,7 @@ async function doShopNote(params) {
 }
 async function doShopTags(params) {
   const st = shopStore((params.store || '').toString()); if (!st) return { success: false, error: 'Shopify is not configured.' };
+  if (isDsh(st)) return { success: false, error: 'Edit tags for ' + st.name + ' orders in Dousideh.' };
   const id = (params.id || '').toString(), tags = (Array.isArray(params.tags) ? params.tags : String(params.tags || '').split(',')).map(t => t.trim()).filter(Boolean);
   const r = await shopGQL(st, `mutation($input: OrderInput!) { orderUpdate(input: $input) { userErrors { message } } }`, { input: { id, tags } });
   const ue = r.orderUpdate.userErrors; if (ue && ue.length) return { success: false, error: ue.map(u => u.message).join('; ') };
@@ -1177,7 +1163,7 @@ app.post('/shopify/webhook', async (req, res) => {
     const digest = crypto.createHmac('sha256', SHOP_WH_SECRET).update(req.rawBody || Buffer.alloc(0)).digest('base64');
     if (digest.length !== hmac.length || !crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac))) return res.status(401).end();
     res.status(200).end();
-    const st = SHOP_STORES.find(s => s.domain === dom) || SHOP_STORES[0]; if (!st) return;
+    const st = SHOP_STORES.find(s => s.domain === dom) || SHOP_STORES.find(s => !isDsh(s)); if (!st) return;
     const body = req.body || {};
     const no = String(body.name || body.order_number || (body.order_id ? '' : '')).replace(/^#/, '');
     const prev = (SHOP_CACHE[st.key] && SHOP_CACHE[st.key].orders.find(o => o.no === no)) || null;
@@ -1421,17 +1407,6 @@ async function routeActionInner(action, params) {
     case 'getOrderTimeline': return doGetOrderTimeline(params);
     case 'dousidehPing': return { success: true, sendsBack: DOUSIDEH_ENABLED };
     case 'dousidehOrderEvents': return doDousidehOrderEvents(params);
-    // Release 68 — the shop's own orders, read and changed from here (admin only; every change is recorded)
-    case 'shopPing': return doShopPing();
-    case 'shopGetOrder': return doShopGetOrder(params);
-    case 'shopListOrders': return doShopListOrders(params);
-    case 'shopSetOrderStatus': return doShopSetOrderStatus(params);
-    case 'shopAddOrderNote': return doShopAddOrderNote(params);
-    case 'shopFulfilOrder': return doShopFulfilOrder(params);
-    case 'shopGetStock': return doShopGetStock(params);
-    case 'shopSetStock': return doShopSetStock(params);
-    case 'shopGetProduct': return doShopGetProduct(params);
-    case 'shopUpdateProduct': return doShopUpdateProduct(params);
     case 'addOrder': return doAddOrder(params);
     case 'updateFabric': return doUpdateFabric(params);
     case 'updateFabricDetails': return doUpdateFabricDetails(params);
@@ -4900,8 +4875,6 @@ const DEV = {
   backend: process.env.BACKEND_URL || 'https://production-tracker-backend-1j2s.onrender.com'
 };
 if (!DEV.root && DEV.cpUser) DEV.root = '/home/' + DEV.cpUser + '/public_html';
-// Release 66: HostGator accounts can live in /home2, /home3 … — take the home folder from CPANEL_ROOT when it is set.
-const DEV_HOME = () => ((/^\/home\d*\/[^/]+/.exec(DEV.root || '') || [])[0] || ('/home/' + DEV.cpUser));
 if (!DEV.previewDir && DEV.liveDir) DEV.previewDir = DEV.liveDir.replace(/[^/]+$/, 'tracker-preview');
 const DEV_BAK_ROOT = () => DEV.root + '/_tracker_backups';
 const devSha = t => crypto.createHash('sha256').update(String(t)).digest('hex');
@@ -4912,7 +4885,7 @@ function hostAbs(p) {
   if (p === 'page' || p === 'tracker' || p === 'index.html') return DEV.liveDir + '/index.html';
   if (p.indexOf('..') !== -1) throw new Error('Path may not contain ..');
   const abs = p.startsWith('/') ? p : DEV.root + '/' + p.replace(/^\.?\//, '');
-  if (!abs.startsWith(DEV_HOME() + '/')) throw new Error('Path must be inside your HostGator home folder.');
+  if (!abs.startsWith('/home/' + DEV.cpUser + '/')) throw new Error('Path must be inside your HostGator home folder.');
   if (/\/(\.ssh|etc|mail|\.cpanel)(\/|$)/.test(abs)) throw new Error('That folder is off-limits.');
   return abs;
 }
@@ -4938,7 +4911,7 @@ async function cpTryRead(abs) { try { return await cpRead(abs); } catch (e) { re
 async function cpEnsureDir(full) {
   try { await cpGet('Fileman/list_files', { dir: full }); return; } catch (e) {}
   const parent = full.replace(/\/[^/]+$/, '');
-  if (parent && parent !== full && parent.length > DEV_HOME().length) await cpEnsureDir(parent);
+  if (parent && parent !== full && parent.length > ('/home/' + DEV.cpUser).length) await cpEnsureDir(parent);
   await cpApi2('mkdir', { path: parent, name: full.split('/').pop() });
 }
 async function cpWrite(abs, content) {
