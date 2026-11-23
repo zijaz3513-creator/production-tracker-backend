@@ -878,8 +878,30 @@ const DSH = {
   key: process.env.DOUSIDEH_API_KEY || process.env.DOUSIDEH_API_TOKEN || process.env.DOUSIDEH_KEY || process.env.DOUSIDEH_TOKEN || '',
   name: process.env.DOUSIDEH_STORE_NAME || 'Hekayeeh'
 };
-const DSH_ON = !!(DSH.base && (DSH.key || process.env.DOUSIDEH_EMAIL));
-if (!DSH_ON) console.warn('Hekayeeh (Dousideh) orders disabled — set DOUSIDEH_API_URL and DOUSIDEH_API_KEY.');
+// Release 71: no staff login and no extra key. The shop's orders are read and changed with the connection the Tracker
+// already has — DOUSIDEH_URL + DOUSIDEH_SECRET (the same two values that send the timeline to the shop). The shop
+// (its update-98 or newer) answers at /api/production-tracker/shop/… and writes every change on the order with the
+// staff member's name. DOUSIDEH_EMAIL / DOUSIDEH_PASSWORD / DOUSIDEH_API_KEY are no longer needed (they are only used
+// if DOUSIDEH_SECRET is missing).
+const DSH_SECRET = process.env.DOUSIDEH_SECRET || '';
+const DSH_ON = !!(DSH.base && (DSH_SECRET || DSH.key || process.env.DOUSIDEH_EMAIL));
+if (!DSH_ON) console.warn('Hekayeeh (Dousideh) orders disabled — set DOUSIDEH_URL and DOUSIDEH_SECRET (the same two as for the timeline).');
+// one call to the shop with the Tracker's secret; `who` = the staff member, for the shop's history
+async function dshSecretFetch(method, path, body, query, who) {
+  const url = DSH.base + path.replace(/^\/api\/orders/, '/api/production-tracker/shop/orders') + (query ? '?' + new URLSearchParams(query) : '');
+  const ctl = new AbortController(); const timer = setTimeout(() => ctl.abort(), 25000);
+  let r;
+  try {
+    r = await fetch(url, { method, signal: ctl.signal, headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'x-tracker-secret': DSH_SECRET }, body: method === 'GET' ? undefined : JSON.stringify(Object.assign({}, body || {}, { who: who || '' })) });
+  } catch (e) { throw new Error(e.name === 'AbortError' ? DSH.name + ' took too long to answer' : 'could not reach ' + DSH.name + ' (' + e.message + ')'); }
+  finally { clearTimeout(timer); }
+  const t = await r.text(); let j; try { j = JSON.parse(t); } catch (e) { j = null; }
+  if (r.status === 401) throw new Error(DSH.name + ' did not accept DOUSIDEH_SECRET — copy it again from Dousideh (Settings → Connections → Production Tracker)');
+  if (r.status === 404 && !(j && j.error)) throw new Error(DSH.name + ' needs its update-98 or newer for this page');
+  if (!r.ok) throw new Error((j && (j.error || j.message)) || (DSH.name + ' answered HTTP ' + r.status));
+  if (j == null) throw new Error(DSH.name + ' answered with a web page, not data — check DOUSIDEH_URL');
+  return j;
+}
 const SHOP_STORES = ((list) => DSH_ON ? list.filter(s => !/hakay|hekay/i.test(s.name)).concat([{ key: 'H', name: DSH.name, kind: 'dousideh' }]) : list)((() => {
   try { const j = JSON.parse(process.env.SHOPIFY_STORES || 'null'); if (Array.isArray(j) && j.length) return j.filter(s => s.domain && s.token).map((s, i) => ({ key: s.key || String.fromCharCode(65 + i), name: s.name || s.domain, domain: s.domain, token: s.token })); } catch (e) {}
   return SHOPIFY_ENABLED ? [{ key: 'A', name: process.env.SHOPIFY_STORE_NAME || 'Aeon Abaya', domain: SHOPIFY_STORE, token: SHOPIFY_TOKEN }] : [];
@@ -908,7 +930,8 @@ async function dshLogin() {
   }
   throw new Error('Dousideh staff login failed' + (why ? ' (' + why + ')' : '') + ' — check DOUSIDEH_EMAIL / DOUSIDEH_PASSWORD');
 }
-async function dshFetch(method, path, body, query, retried) {
+async function dshFetch(method, path, body, query, retried, who) {
+  if (DSH_SECRET) return dshSecretFetch(method, path, body, query, who);
   const url = DSH.base + path + (query ? '?' + new URLSearchParams(query) : '');
   if (!dshSess && DSH_LOGIN.email) await dshLogin();
   const h = { 'Content-Type': 'application/json', Accept: 'application/json' };
@@ -1116,7 +1139,7 @@ async function doShopFulfil(params) {
     const items = o.items.filter(i => i.left > 0 && (!want || want.has(i.id))).map(i => ({ itemId: i.id, quantity: i.left }));
     if (!items.length) return { success: true, already: true };
     const t = params.tracking || {};
-    try { await dshFetch('POST', '/api/orders/' + encodeURIComponent(id) + '/fulfillments', { items, carrier: t.company || undefined, trackingNumber: t.number || undefined, trackingUrl: t.url || undefined, notifyCustomer: params.notify !== false && params.notify !== 'false' }); }
+    try { await dshFetch('POST', '/api/orders/' + encodeURIComponent(id) + '/fulfillments', { items, carrier: t.company || undefined, trackingNumber: t.number || undefined, trackingUrl: t.url || undefined, notifyCustomer: params.notify !== false && params.notify !== 'false' }, null, false, who); }
     catch (e) { return { success: false, error: 'Dousideh refused: ' + e.message }; }
     shopBust(st.key);
     // the tracker rows Dousideh sent for these items → Done
@@ -1169,8 +1192,14 @@ async function doShopComment(params) {
 }
 async function doShopNote(params) {
   const st = shopStore((params.store || '').toString()); if (!st) return { success: false, error: 'Shopify is not configured.' };
-  if (isDsh(st)) return { success: false, error: 'Edit the note for ' + st.name + ' orders in Dousideh.' };
   const id = (params.id || '').toString(), note = (params.note || '').toString().slice(0, 2000);
+  if (isDsh(st)) {
+    if (!DSH_SECRET) return { success: false, error: 'Edit the note for ' + st.name + ' orders in Dousideh.' };
+    try { await dshFetch('POST', '/api/orders/' + encodeURIComponent(id) + '/note', { note }, null, false, (params.authenticatedName || params.role || '').toString()); }
+    catch (e) { return { success: false, error: st.name + ' refused: ' + e.message }; }
+    shopBust(st.key);
+    return { success: true };
+  }
   const r = await shopGQL(st, `mutation($input: OrderInput!) { orderUpdate(input: $input) { userErrors { message } } }`, { input: { id, metafields: [{ namespace: 'production_tracker', key: 'customer_note', type: 'multi_line_text_field', value: note || ' ' }] } });
   const ue = r.orderUpdate.userErrors; if (ue && ue.length) return { success: false, error: ue.map(u => u.message).join('; ') };
   shopBust(st.key);
@@ -1178,8 +1207,14 @@ async function doShopNote(params) {
 }
 async function doShopTags(params) {
   const st = shopStore((params.store || '').toString()); if (!st) return { success: false, error: 'Shopify is not configured.' };
-  if (isDsh(st)) return { success: false, error: 'Edit tags for ' + st.name + ' orders in Dousideh.' };
   const id = (params.id || '').toString(), tags = (Array.isArray(params.tags) ? params.tags : String(params.tags || '').split(',')).map(t => t.trim()).filter(Boolean);
+  if (isDsh(st)) {
+    if (!DSH_SECRET) return { success: false, error: 'Edit tags for ' + st.name + ' orders in Dousideh.' };
+    try { await dshFetch('POST', '/api/orders/' + encodeURIComponent(id) + '/tags', { tags }, null, false, (params.authenticatedName || params.role || '').toString()); }
+    catch (e) { return { success: false, error: st.name + ' refused: ' + e.message }; }
+    shopBust(st.key);
+    return { success: true };
+  }
   const r = await shopGQL(st, `mutation($input: OrderInput!) { orderUpdate(input: $input) { userErrors { message } } }`, { input: { id, tags } });
   const ue = r.orderUpdate.userErrors; if (ue && ue.length) return { success: false, error: ue.map(u => u.message).join('; ') };
   shopBust(st.key);
