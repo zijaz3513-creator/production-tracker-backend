@@ -887,12 +887,17 @@ const SHOP_STORES = ((list) => DSH_ON ? list.filter(s => !/hakay|hekay/i.test(s.
 const isDsh = st => st && st.kind === 'dousideh';
 async function dshFetch(method, path, body, query) {
   const url = DSH.base + path + (query ? '?' + new URLSearchParams(query) : '');
-  const r = await fetch(url, { method, headers: { Authorization: 'Bearer ' + DSH.key, 'x-api-key': DSH.key, 'Content-Type': 'application/json', Accept: 'application/json' }, body: body ? JSON.stringify(body) : undefined });
-  const t = await r.text(); let j; try { j = JSON.parse(t); } catch (e) { j = null; }
-  if (r.status === 401 || r.status === 403) throw new Error('Dousideh did not accept DOUSIDEH_API_KEY (HTTP ' + r.status + ')');
-  if (!r.ok) throw new Error('Dousideh HTTP ' + r.status + ((j && (j.error || j.message)) ? ': ' + (j.error || j.message) : ''));
-  if (j == null) throw new Error('Dousideh answered with a web page, not data — check DOUSIDEH_API_URL');
-  return j;
+  const keys = [...new Set([DSH.key, process.env.DOUSIDEH_SECRET].filter(Boolean))];
+  let last = null;
+  for (const k of keys) {
+    const r = await fetch(url, { method, headers: { Authorization: 'Bearer ' + k, 'x-api-key': k, 'x-tracker-secret': k, 'Content-Type': 'application/json', Accept: 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+    const t = await r.text(); let j; try { j = JSON.parse(t); } catch (e) { j = null; }
+    if (r.status === 401 || r.status === 403) { last = 'Dousideh did not accept DOUSIDEH_API_KEY (HTTP ' + r.status + ((j && (j.error || j.message)) ? ': ' + (j.error || j.message) : '') + ')'; continue; }
+    if (!r.ok) throw new Error('Dousideh HTTP ' + r.status + ((j && (j.error || j.message)) ? ': ' + (j.error || j.message) : ''));
+    if (j == null) throw new Error('Dousideh answered with a web page, not data — check DOUSIDEH_API_URL');
+    return j;
+  }
+  throw new Error(last || 'Dousideh key missing');
 }
 const DSH_PAY = { paid: 'PAID', pending: 'PENDING', authorized: 'AUTHORIZED', partially_paid: 'PARTIALLY_PAID', refunded: 'REFUNDED', partially_refunded: 'PARTIALLY_REFUNDED', failed: 'FAILED', voided: 'VOIDED' };
 const DSH_FUL = { unfulfilled: 'UNFULFILLED', partial: 'PARTIALLY_FULFILLED', partially_fulfilled: 'PARTIALLY_FULFILLED', fulfilled: 'FULFILLED' };
