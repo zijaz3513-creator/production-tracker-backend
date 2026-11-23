@@ -167,6 +167,143 @@ if (!DOUSIDEH_ENABLED) {
   console.warn('Dousideh sync disabled — set DOUSIDEH_URL and DOUSIDEH_SECRET to send the timeline to the shop.');
 }
 const DOUSIDEH_RETRY_MS = [5000, 30000, 120000, 600000];
+
+// ------------------------------------------------------------
+// Dousideh shop API (Release 68) — the Tracker can also READ the shop's
+// orders and CHANGE them (status, notes, shipped + tracking, stock, products).
+// This needs its own key, made in Dousideh: Settings → API & webhooks →
+// Create API key, named "Production Tracker", with: Read orders, Update
+// orders, Read stock, Set and adjust stock, Read products, Create and edit
+// products. (DOUSIDEH_SECRET above only lets the Tracker SEND timeline steps.)
+// Set on Render: DOUSIDEH_API_KEY = that key (starts with dsk_).
+//                DOUSIDEH_API_URL = optional; default is the shop of
+//                DOUSIDEH_URL + /api/v1 (e.g. https://hekayeeh.com/api/v1).
+// Everything is recorded twice: Dousideh writes each change on the order's
+// timeline and in its Activity log as "API: Production Tracker", and the
+// Tracker writes who did it in order_events (kind "shop").
+// ------------------------------------------------------------
+const DOUSIDEH_API_KEY = process.env.DOUSIDEH_API_KEY;
+const DOUSIDEH_API_URL = (process.env.DOUSIDEH_API_URL || (() => {
+  try { return DOUSIDEH_URL ? new URL(DOUSIDEH_URL).origin + '/api/v1' : ''; } catch (e) { return ''; }
+})()).replace(/\/+$/, '');
+const DOUSIDEH_API_ENABLED = !!(DOUSIDEH_API_KEY && DOUSIDEH_API_URL);
+if (!DOUSIDEH_API_ENABLED) {
+  console.warn('Dousideh shop API disabled — set DOUSIDEH_API_KEY to read and change the shop\'s orders from the Tracker.');
+}
+async function dousidehApi(method, path, body) {
+  if (!DOUSIDEH_API_ENABLED) throw new Error('The shop connection is not set up: add DOUSIDEH_API_KEY on Render (a key from Dousideh → Settings → API & webhooks).');
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 20000);
+  let res;
+  try {
+    res = await fetch(DOUSIDEH_API_URL + path, {
+      method,
+      headers: { 'Authorization': 'Bearer ' + DOUSIDEH_API_KEY, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: ctl.signal
+    });
+  } catch (e) {
+    throw new Error(e.name === 'AbortError' ? 'The shop took too long to answer. Try again.' : 'Could not reach the shop: ' + e.message);
+  } finally { clearTimeout(timer); }
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* no body */ }
+  if (res.status === 401) throw new Error('The shop did not accept DOUSIDEH_API_KEY — make a new key in Dousideh and put it on Render.');
+  if (res.status === 403) throw new Error((data && data.error) || 'This key is not allowed to do that — tick the missing permission on the key in Dousideh.');
+  if (!res.ok) throw new Error((data && data.error) || ('The shop answered ' + res.status));
+  return data || {};
+}
+const shopOrderNo_ = v => (v == null ? '' : String(v)).trim().replace(/^#/, '');
+// the Tracker's own record of a change it made in the shop (not sent back to the shop: the shop already wrote it)
+function logShopChange(orderNo, sku, text, actor) {
+  sbFetch('POST', 'order_events', {
+    order_id: null, order_no: orderNo || null, sku: sku || null,
+    kind: 'shop', text: String(text || '').slice(0, 500), actor: actor || null, at: new Date().toISOString()
+  }, { Prefer: 'return=minimal' }).catch(e => console.error('order_events insert failed:', e.message));
+}
+const SHOP_STATUSES = ['confirmed', 'processing', 'shipped', 'delivered'];
+
+async function doShopPing() {
+  if (!DOUSIDEH_API_ENABLED) return { success: true, connected: false, error: 'DOUSIDEH_API_KEY is not set on Render.' };
+  try {
+    const shop = await dousidehApi('GET', '/shop');
+    return { success: true, connected: true, shop: { name: shop.name, currency: shop.currency, domain: shop.domain } };
+  } catch (e) { return { success: true, connected: false, error: e.message }; }
+}
+async function doShopGetOrder(params) {
+  const no = shopOrderNo_(params.orderNo);
+  if (!no) return { success: false, error: 'Order number is required.' };
+  return { success: true, order: await dousidehApi('GET', '/orders/' + encodeURIComponent(no)) };
+}
+async function doShopListOrders(params) {
+  const q = new URLSearchParams();
+  ['status', 'paymentStatus', 'fulfillmentStatus', 'channel', 'createdSince', 'updatedSince'].forEach(k => { if (params[k]) q.set(k, String(params[k])); });
+  q.set('page', String(Math.max(1, parseInt(params.page, 10) || 1)));
+  q.set('limit', String(Math.max(1, Math.min(100, parseInt(params.limit, 10) || 50))));
+  const r = await dousidehApi('GET', '/orders?' + q.toString());
+  return { success: true, orders: r.data || [], page: r.page || 1, hasMore: !!r.hasMore };
+}
+async function doShopSetOrderStatus(params) {
+  const no = shopOrderNo_(params.orderNo), status = (params.status || '').toString().trim().toLowerCase();
+  if (!no) return { success: false, error: 'Order number is required.' };
+  if (SHOP_STATUSES.indexOf(status) === -1) return { success: false, error: 'Status must be one of: ' + SHOP_STATUSES.join(', ') + '. Cancelling and refunds are done in the shop admin.' };
+  const order = await dousidehApi('PATCH', '/orders/' + encodeURIComponent(no), { status });
+  logShopChange(no, null, 'Shop order status set to ' + status, actorOf(params));
+  return { success: true, order };
+}
+async function doShopAddOrderNote(params) {
+  const no = shopOrderNo_(params.orderNo), note = (params.note || '').toString().trim();
+  if (!no) return { success: false, error: 'Order number is required.' };
+  if (!note) return { success: false, error: 'Write the note first.' };
+  const who = actorOf(params);
+  await dousidehApi('POST', '/orders/' + encodeURIComponent(no) + '/notes', { note: (who ? who + ' (Tracker): ' : 'Tracker: ') + note.slice(0, 1800) });
+  logShopChange(no, null, 'Note added to the shop order: ' + note.slice(0, 300), who);
+  return { success: true };
+}
+async function doShopFulfilOrder(params) {
+  const no = shopOrderNo_(params.orderNo);
+  if (!no) return { success: false, error: 'Order number is required.' };
+  const body = { notifyCustomer: params.notifyCustomer === true || params.notifyCustomer === 'true' };
+  ['carrier', 'trackingNumber', 'trackingUrl'].forEach(k => { if (params[k]) body[k] = String(params[k]).trim(); });
+  let items = params.items;
+  if (typeof items === 'string') { try { items = JSON.parse(items); } catch (e) { return { success: false, error: 'items must be a list like [{"sku":"9027-55","quantity":1}].' }; } }
+  if (Array.isArray(items) && items.length) body.items = items.map(i => ({ itemId: i.itemId || undefined, sku: i.sku || undefined, quantity: parseInt(i.quantity, 10) || 1 }));
+  const order = await dousidehApi('POST', '/orders/' + encodeURIComponent(no) + '/fulfillments', body);
+  logShopChange(no, null, 'Marked shipped in the shop' + (body.carrier ? ' with ' + body.carrier : '') + (body.trackingNumber ? ' · ' + body.trackingNumber : '') + (body.items ? ' (' + body.items.length + ' item line' + (body.items.length === 1 ? '' : 's') + ')' : ' (everything left)'), actorOf(params));
+  return { success: true, order };
+}
+async function doShopGetStock(params) {
+  const sku = (params.sku || '').toString().trim();
+  const r = await dousidehApi('GET', '/inventory?' + new URLSearchParams(sku ? { sku, limit: '100' } : { limit: String(Math.max(1, Math.min(100, parseInt(params.limit, 10) || 50))) }).toString());
+  return { success: true, stock: r.data || [] };
+}
+async function doShopSetStock(params) {
+  const sku = (params.sku || '').toString().trim(), qty = parseInt(params.quantity, 10);
+  if (!sku) return { success: false, error: 'SKU is required.' };
+  if (!Number.isFinite(qty) || qty < 0) return { success: false, error: 'Quantity must be 0 or more.' };
+  const who = actorOf(params);
+  const r = await dousidehApi('POST', '/inventory/set', { items: [{ sku, quantity: qty, ...(params.location ? { location: String(params.location) } : {}) }], reason: ('Production Tracker' + (who ? ' · ' + who : '')).slice(0, 120) });
+  const line = (r.results || r.data || [])[0];
+  if (line && line.ok === false) return { success: false, error: line.error || 'The shop did not change the stock.' };
+  logShopChange(params.orderNo ? shopOrderNo_(params.orderNo) : 'STOCK', sku, 'Shop stock of ' + sku + ' set to ' + qty, who);
+  return { success: true, result: line || r };
+}
+async function doShopGetProduct(params) {
+  const id = (params.id || '').toString().trim(), sku = (params.sku || '').toString().trim();
+  if (id) return { success: true, product: await dousidehApi('GET', '/products/' + encodeURIComponent(id)) };
+  if (!sku) return { success: false, error: 'Give the product id or a SKU.' };
+  const r = await dousidehApi('GET', '/products?' + new URLSearchParams({ sku, limit: '5' }).toString());
+  return { success: true, products: r.data || [] };
+}
+async function doShopUpdateProduct(params) {
+  const id = (params.id || '').toString().trim();
+  let changes = params.changes;
+  if (typeof changes === 'string') { try { changes = JSON.parse(changes); } catch (e) { return { success: false, error: 'changes must be an object like {"price": 35}.' }; } }
+  if (!id) return { success: false, error: 'Product id is required (see shopGetProduct).' };
+  if (!changes || typeof changes !== 'object' || Array.isArray(changes) || !Object.keys(changes).length) return { success: false, error: 'Say what to change.' };
+  const product = await dousidehApi('PATCH', '/products/' + encodeURIComponent(id), changes);
+  logShopChange('PRODUCT', product && product.sku ? product.sku : id, 'Shop product changed: ' + Object.keys(changes).join(', '), actorOf(params));
+  return { success: true, product };
+}
 function pushDousideh(ev, attempt) {
   attempt = attempt || 0;
   if (!DOUSIDEH_ENABLED || !ev || !ev.orderNo) return;
@@ -1284,6 +1421,17 @@ async function routeActionInner(action, params) {
     case 'getOrderTimeline': return doGetOrderTimeline(params);
     case 'dousidehPing': return { success: true, sendsBack: DOUSIDEH_ENABLED };
     case 'dousidehOrderEvents': return doDousidehOrderEvents(params);
+    // Release 68 — the shop's own orders, read and changed from here (admin only; every change is recorded)
+    case 'shopPing': return doShopPing();
+    case 'shopGetOrder': return doShopGetOrder(params);
+    case 'shopListOrders': return doShopListOrders(params);
+    case 'shopSetOrderStatus': return doShopSetOrderStatus(params);
+    case 'shopAddOrderNote': return doShopAddOrderNote(params);
+    case 'shopFulfilOrder': return doShopFulfilOrder(params);
+    case 'shopGetStock': return doShopGetStock(params);
+    case 'shopSetStock': return doShopSetStock(params);
+    case 'shopGetProduct': return doShopGetProduct(params);
+    case 'shopUpdateProduct': return doShopUpdateProduct(params);
     case 'addOrder': return doAddOrder(params);
     case 'updateFabric': return doUpdateFabric(params);
     case 'updateFabricDetails': return doUpdateFabricDetails(params);
