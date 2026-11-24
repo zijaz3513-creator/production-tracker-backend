@@ -2323,7 +2323,8 @@ const embKindWord = kind => (kind === 'mach' ? 'machine' : 'hand');
 // (on the way) → RCVD (Abdullah received) → WORK/PAUSE → DONE → BACK|stamp|driver (on the way back) → AREC (admin received).
 // Pieces can be handled one by one (scan the label) or in a batch (rows in the list QR).
 // ============================================================
-function driverMayView(params, rec) { return (params.role || '').toString() !== 'driver' || (rec.mach_emb_person === 'Abdullah' && (rec.driver_name || '') === (params.authenticatedName || '').toString()); }
+// A driver sees Abdullah pieces assigned to him, or not assigned to anyone yet (he claims them on pickup).
+function driverMayView(params, rec) { return (params.role || '').toString() !== 'driver' || (rec.mach_emb_person === 'Abdullah' && (!rec.driver_name || rec.driver_name === (params.authenticatedName || '').toString())); }
 function driverCallerOk(params) { return ['driver', 'admin', 'fulfillment'].indexOf((params.role || '').toString()) !== -1; }
 async function doDriverList(params) {
   if (!driverCallerOk(params)) return { success: false, error: 'Not allowed.' };
@@ -2332,7 +2333,7 @@ async function doDriverList(params) {
   const isDrv = (params.role || '').toString() === 'driver', me = (params.authenticatedName || '').toString();
   const out = { soleDriver: await soleDriver(), ready: [], toAbdullah: [], atAbdullah: [], waitingPickup: [], backToFactory: [] };
   rows.forEach(r => {
-    if (isDrv && (r.driver_name || '') !== me) return; // a driver only ever sees the pieces assigned to him
+    if (isDrv && r.driver_name && r.driver_name !== me) return; // a driver sees his own pieces + unassigned ones, never another driver's
     const p = parseEmbValue(r.machine_emb);
     const it = { assigned: r.driver_name || '', row: r.id + 2, orderNo: r.order_no, sku: r.sku, garmentType: r.garment_type || '', urgent: !!r.urgent, stamp: p.stamp, driver: p.driver || '', code: p.code };
     if (['NEED', 'RED'].indexOf(p.code) !== -1 && !r.master) out.ready.push(it);
@@ -2447,13 +2448,13 @@ async function doDriverPickup(params) {
     const p = parseEmbValue(rec.machine_emb);
     const base = { row, orderNo: rec.order_no, sku: rec.sku };
     if (rec.mach_emb_person !== 'Abdullah') { skipped.push(Object.assign(base, { error: 'This piece is not for Abdullah.' })); continue; }
-    if ((params.role || '').toString() === 'driver' && (rec.driver_name || '') !== driver) { skipped.push(Object.assign(base, { error: 'Not assigned to you.' })); continue; }
+    if (isDrvCaller && rec.driver_name && rec.driver_name !== driver) { skipped.push(Object.assign(base, { error: 'Assigned to ' + rec.driver_name + ', not you.' })); continue; }
     let value = null, dir = '';
     if (['NEED', 'RED'].indexOf(p.code) !== -1) { value = `TRANSIT|${embStampNow()}|${driver}`; dir = 'to'; }
     else if (['DONE', 'GREEN'].indexOf(p.code) !== -1) { value = `BACK|${embStampNow()}|${driver}`; dir = 'back'; }
     else if (p.code === 'TRANSIT' || p.code === 'BACK') { skipped.push(Object.assign(base, { error: 'Already on the road' + (p.driver ? ' with ' + p.driver : '') + '.' })); continue; }
     else { skipped.push(Object.assign(base, { error: ['RCVD', 'WORK', 'PAUSE'].indexOf(p.code) !== -1 ? 'Abdullah is still working on this one.' : 'Not ready for the driver.' })); continue; }
-    await sbUpdate('orders', rec.id, { machine_emb: value });
+    await sbUpdate('orders', rec.id, Object.assign({ machine_emb: value }, isDrvCaller && !rec.driver_name ? { driver_name: driver } : {}));
     logOrderEvent({ orderId: rec.id, orderNo: rec.order_no, sku: rec.sku }, 'embroidery', dir === 'to' ? `${who} took it to Abdullah (machine embroidery)` : `${who} picked it up from Abdullah`, driver);
     pushShopifyUpdate(rec.order_no, dir === 'to' ? 'Machine embroidery — on the way to Abdullah' : 'Machine embroidery — on the way back from Abdullah');
     ok.push(Object.assign(base, { dir, value }));
