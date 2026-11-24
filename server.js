@@ -2292,7 +2292,7 @@ async function loadEmbOrder(params) {
   const k = embKindFor(params);
   if (k.error) return { error: k.error };
   const col = k.kind === 'mach' ? 'machine_emb' : 'hand_emb';
-  const rows = await sbFetch('GET', `orders?id=eq.${row - 2}&select=id,order_no,master,tailor,is_done,mach_emb_person,hand_emb_person,${col}&limit=1`);
+  const rows = await sbFetch('GET', `orders?id=eq.${row - 2}&select=id,order_no,sku,master,tailor,is_done,mach_emb_person,hand_emb_person,${col}&limit=1`);
   const rec = rows && rows[0];
   if (!rec) return { error: 'Order not found.' };
   const person = k.kind === 'mach' ? rec.mach_emb_person : rec.hand_emb_person;
@@ -2485,12 +2485,14 @@ async function doEmbReceive(params) {
     if (!ctx.person) return { success: false, error: 'The admin has not chosen Abdullah or Asif for this order yet.' };
     const isAdminCaller = ['admin', 'fulfillment'].indexOf((params.role || '').toString()) !== -1;
     // Abdullah receives what the driver brought (TRANSIT). Admin may receive on his behalf (pieces already at his desk before the driver flow).
-    const okFrom = ctx.person === 'Abdullah' ? (isAdminCaller ? ['TRANSIT', 'NEED', 'RED'] : ['TRANSIT']) : ['SENT'];
+    // Abdullah may also receive pieces the driver forgot to scan (still NEED) — the timeline notes it.
+    const okFrom = ctx.person === 'Abdullah' ? ['TRANSIT', 'NEED', 'RED'] : ['SENT'];
     if (okFrom.indexOf(ctx.cur.code) === -1) {
       return { success: false, error: ctx.person === 'Asif' && ['NEED', 'RED'].indexOf(ctx.cur.code) !== -1 ? 'Waiting for the master or tailor to hand this to Asif first.' : ctx.person === 'Abdullah' && ['NEED', 'RED'].indexOf(ctx.cur.code) !== -1 ? 'The driver has not brought this to you yet — the driver scans it first.' : 'This order is not waiting to be received.' };
     }
     const mv = 'RCVD|' + embStampNow();
     await saveEmb(ctx, mv);
+    if (ctx.person === 'Abdullah' && ctx.cur.code !== 'TRANSIT' && !isAdminCaller) { try { logOrderEvent({ orderId: ctx.rec.id, orderNo: ctx.rec.order_no, sku: ctx.rec.sku }, 'embroidery', 'Abdullah received it directly — the driver did not scan the pickup', 'Abdullah'); } catch (e) {} }
     pushShopifyUpdate(ctx.rec.order_no, 'machine embroidery — received by ' + ctx.person);
     return { success: true, value: mv, person: ctx.person };
   }
