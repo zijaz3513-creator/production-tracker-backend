@@ -317,7 +317,7 @@ const ROLE_PERMISSIONS = {
   // pause / finish / return. Each role is locked to its own kind server-side.
   handemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'getSamples', 'receiveSampleEmb', 'embReceive', 'embAssignWorker', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn', 'handPartsList', 'handPartStart', 'handPartPause', 'handPartResume', 'handPartFinish', 'handSplit', 'handPartAdd', 'handPartReassign', 'handPartRemove'],
   driver: ['getOrder', 'getOrderByOrderNo', 'driverList', 'driverPickup'],
-  machemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'getSamples', 'receiveSampleEmb', 'embReceive', 'embReceiveBatch', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn'],
+  machemb: ['getOrders', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'getSamples', 'receiveSampleEmb', 'embReceive', 'embReceiveBatch', 'embBatch', 'embStart', 'embPause', 'embResume', 'embFinish', 'embReturn'],
   designer: ['getSamples', 'addSample'],
   patternmaster: ['getSamples', 'assignSampleTailor', 'startSamplePattern', 'samplePmPause', 'samplePmResume', 'samplePmFinish'],
   samplemachemb: ['getSamples', 'receiveSampleEmb'],
@@ -328,7 +328,7 @@ const ROLE_PERMISSIONS = {
     'getOrders', 'handPartsList', 'getOrder', 'getOrderByOrderNo', 'getOrderTimeline', 'addOrder', 'updateOrderDetails', 'updateFabric', 'updateFabricDetails',
     'updateMachEmb', 'updateHandEmb', 'updateMaster', 'updateTailor',
     'masterStart', 'masterPause', 'masterResume', 'masterFinish', 'masterReturn',
-    'setEmbPerson', 'driverList', 'driverPickup', 'driverAssign', 'embAdminReceive', 'shopList', 'shopOrder', 'shopFulfil', 'shopComment', 'shopNote', 'shopTags', 'embReady', 'embMasterReceive', 'embAssignWorker',
+    'setEmbPerson', 'driverList', 'driverPickup', 'driverAssign', 'embAdminReceive', 'embBatch', 'fabricStockList', 'embExtraFabric', 'shopList', 'shopOrder', 'shopFulfil', 'shopComment', 'shopNote', 'shopTags', 'embReady', 'embMasterReceive', 'embAssignWorker',
     'markDone', 'undoMarkDone', 'updateUrgent', 'atelierJobsForLine',
     'getSamples', 'addSample', 'assignSampleTailor', 'assignSampleMaster',
     'markSampleDone', 'undoSampleDone', 'sendSampleEmb', 'receiveSampleEmb',
@@ -1485,6 +1485,9 @@ async function routeActionInner(action, params) {
     case 'embAdminReceive': return doEmbAdminReceive(params);
     case 'embMasterReceive': return doEmbMasterReceive(params);
     case 'embReceiveBatch': return doEmbReceiveBatch(params);
+    case 'embBatch': return doEmbBatch(params);
+    case 'fabricStockList': return doFabricStockList(params);
+    case 'embExtraFabric': return doEmbExtraFabric(params);
     case 'driverList': return doDriverList(params);
     case 'driverPickup': return doDriverPickup(params);
     case 'driverAssign': return doDriverAssign(params);
@@ -2219,10 +2222,73 @@ async function doEmbAdminReceive(params) {
   if (cur === 'AREC') return { success: true, already: true, kind: 'mach' };
   if (['DONE', 'GREEN'].indexOf(cur) !== -1 && rec.mach_emb_person === 'Abdullah' && !params.skipDriver) return { success: false, error: 'Waiting for the driver to pick this up from Abdullah first (admin can use “Receive without driver”).', needsDriver: true };
   if (['DONE', 'GREEN', 'BACK'].indexOf(cur) === -1) return { success: false, error: 'Machine embroidery is not finished yet.' };
+  if (rec.mach_emb_person === 'Abdullah' && !params.extraFabric) return { success: false, error: 'Record the extra fabric that came back from Abdullah first (or choose “No extra fabric”).' };
   const value = 'AREC|' + embStampNow();
   await sbUpdate('orders', row - 2, { machine_emb: value });
   pushShopifyUpdate(rec.order_no, 'Machine embroidery — received by admin');
   return { success: true, kind: 'mach', person: rec.mach_emb_person, value };
+}
+
+// ---- Abdullah works several orders of one SKU at once: one Start / Pause / Resume / Finish for all ----
+const EMB_BATCH_OPS = { receive: 'embReceive', start: 'embStart', pause: 'embPause', resume: 'embResume', finish: 'embFinish' };
+async function doEmbBatch(params) {
+  const action = EMB_BATCH_OPS[(params.op || '').toString()];
+  if (!action) return { success: false, error: 'Unknown action.' };
+  const rowsIn = (Array.isArray(params.rows) ? params.rows : []).map(x => parseInt(x, 10)).filter(x => x > 1);
+  if (!rowsIn.length) return { success: false, error: 'Nothing selected.' };
+  const ok = [], failed = [];
+  for (const row of rowsIn) {
+    const p = Object.assign({}, params, { row, kind: 'mach' }); delete p.rows; delete p.op;
+    try { const r = await routeAction(action, p); if (r && r.success) ok.push({ row, value: r.value || null, already: !!r.already }); else failed.push({ row, error: (r && r.error) || 'Failed' }); }
+    catch (e) { failed.push({ row, error: e.message }); }
+  }
+  return { success: true, ok, failed };
+}
+
+// ---- Extra embroidered fabric that comes back from Abdullah → stock in the Fabric & SKU register ----
+function fabRegBase() { return (process.env.FABRIC_REGISTER_URL || 'https://hakayah.com/fab/api.php').trim(); }
+async function fabRegCall(method, query, body) {
+  const base = fabRegBase();
+  const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 20000);
+  try {
+    const r = await fetch(base + (base.includes('?') ? '&' : '?') + new URLSearchParams(query), { method, signal: ctl.signal, headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+    const j = await r.json().catch(() => null);
+    if (!r.ok || !j || j.error) throw new Error((j && j.error) || ('HTTP ' + r.status));
+    return j;
+  } finally { clearTimeout(t); }
+}
+async function doFabricStockList() {
+  try {
+    const j = await fabRegCall('GET', { resource: 'all' });
+    const items = (j.fabrics || []).map(f => ({ id: f.id, name: f.name || '', code: f.code || '', colorName: f.color_name || '', category: f.category || 'fabric', unit: f.unit || 'm', stock: Number(f.stock) || 0 }))
+      .sort((a, b) => (a.name + a.colorName).localeCompare(b.name + b.colorName));
+    return { success: true, items };
+  } catch (e) { return { success: false, error: 'Could not read the Fabric & SKU register: ' + e.message }; }
+}
+async function doEmbExtraFabric(params) {
+  const rowsIn = (Array.isArray(params.rows) ? params.rows : []).map(x => parseInt(x, 10)).filter(x => x > 1);
+  const who = (params.authenticatedName || params.role || 'Admin').toString();
+  const recs = rowsIn.length ? ((await sbFetch('GET', `orders?id=in.(${rowsIn.map(r => r - 2).join(',')})&select=id,order_no,sku`)) || []) : [];
+  const orderList = [...new Set(recs.map(r => r.order_no).filter(Boolean))].join(', ');
+  const log = text => recs.forEach(r => logOrderEvent({ orderId: r.id, orderNo: r.order_no, sku: r.sku }, 'embroidery', text, who));
+  if (params.none === true || params.none === 'true') { log('Back from Abdullah — no extra fabric'); return { success: true, none: true }; }
+  const entries = (Array.isArray(params.entries) ? params.entries : []).map(e => ({ fabricId: parseInt(e.fabricId, 10) || 0, newName: (e.newName || '').toString().trim(), newColor: (e.newColor || '').toString().trim(), metres: Math.round((parseFloat(e.metres) || 0) * 1000) / 1000 }))
+    .filter(e => e.metres > 0 && (e.fabricId || e.newName));
+  if (!entries.length) return { success: false, error: 'Enter the fabric and how many metres came back, or choose “No extra fabric”.' };
+  const note = 'Extra embroidered fabric back from Abdullah' + (orderList ? ' (orders ' + orderList + ')' : '') + ' — by ' + who;
+  const done = [];
+  for (const e of entries) {
+    try {
+      if (e.fabricId) await fabRegCall('POST', { resource: 'fabrics', action: 'adjust_stock' }, { id: e.fabricId, amount: e.metres, direction: 'add', note });
+      else { const r = await fabRegCall('POST', { resource: 'fabrics', action: 'add' }, { name: e.newName, colorName: e.newColor, stock: e.metres, unit: 'm', category: 'fabric', notes: note }); e.fabricId = r.id; }
+      done.push(e);
+    } catch (err) {
+      return { success: false, error: 'The Fabric & SKU register refused it: ' + err.message + (done.length ? ' (' + done.length + ' line(s) were already added)' : ''), added: done };
+    }
+  }
+  _fabInvCache = { at: 0, data: null };
+  log('Extra fabric back from Abdullah added to Fabric & SKU: ' + done.map(e => e.metres + 'm ' + (e.newName ? e.newName + (e.newColor ? ' ' + e.newColor : '') + ' (new)' : '#' + e.fabricId)).join(', '));
+  return { success: true, added: done };
 }
 
 // Master receives the piece back from hand embroidery; then assigns the tailor.
@@ -2471,7 +2537,7 @@ async function doEmbReceiveBatch(params) {
   if (!rowsIn.length) return { success: false, error: 'Nothing to receive.' };
   const ok = [], failed = [];
   for (const row of rowsIn) {
-    const r = await doEmbReceive(Object.assign({}, params, { row, kind: 'mach' }));
+    const r = await routeAction('embReceive', Object.assign({}, params, { row, kind: 'mach' }));
     if (r && r.success) ok.push({ row, value: r.value }); else failed.push({ row, error: (r && r.error) || 'Failed' });
   }
   return { success: true, ok, failed };
