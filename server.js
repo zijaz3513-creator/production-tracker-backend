@@ -2232,16 +2232,33 @@ async function doEmbAdminReceive(params) {
 // ---- Abdullah works several orders of one SKU at once: one Start / Pause / Resume / Finish for all ----
 const EMB_BATCH_OPS = { receive: 'embReceive', start: 'embStart', pause: 'embPause', resume: 'embResume', finish: 'embFinish' };
 async function doEmbBatch(params) {
-  const action = EMB_BATCH_OPS[(params.op || '').toString()];
-  if (!action) return { success: false, error: 'Unknown action.' };
+  const op = (params.op || '').toString();
+  if (!EMB_BATCH_OPS[op]) return { success: false, error: 'Unknown action.' };
   const rowsIn = (Array.isArray(params.rows) ? params.rows : []).map(x => parseInt(x, 10)).filter(x => x > 1);
   if (!rowsIn.length) return { success: false, error: 'Nothing selected.' };
+  const recs = (await sbFetch('GET', `orders?id=in.(${rowsIn.map(r => r - 2).join(',')})&select=id,machine_emb`)) || [];
+  const codeOf = {}; recs.forEach(r => { codeOf[r.id + 2] = parseEmbValue(r.machine_emb).code; });
+  // Which steps each piece needs so the whole SKU ends up in the same state at the same moment.
+  const plan = row => {
+    const c = codeOf[row];
+    if (op === 'start') return ['TRANSIT', 'NEED', 'RED'].indexOf(c) !== -1 ? ['embReceive', 'embStart'] : c === 'RCVD' ? ['embStart'] : c === 'PAUSE' ? ['embResume'] : [];
+    if (op === 'resume') return c === 'PAUSE' ? ['embResume'] : [];
+    if (op === 'pause') return c === 'WORK' ? ['embPause'] : [];
+    if (op === 'finish') return c === 'WORK' || c === 'PAUSE' ? ['embFinish'] : [];
+    if (op === 'receive') return ['TRANSIT', 'NEED', 'RED'].indexOf(c) !== -1 ? ['embReceive'] : [];
+    return [];
+  };
   const ok = [], failed = [];
-  for (const row of rowsIn) {
-    const p = Object.assign({}, params, { row, kind: 'mach' }); delete p.rows; delete p.op;
-    try { const r = await routeAction(action, p); if (r && r.success) ok.push({ row, value: r.value || null, already: !!r.already }); else failed.push({ row, error: (r && r.error) || 'Failed' }); }
-    catch (e) { failed.push({ row, error: e.message }); }
-  }
+  await Promise.all(rowsIn.map(async row => {
+    const steps = plan(row); if (!steps.length) return;
+    let last = null;
+    for (const action of steps) {
+      const p = Object.assign({}, params, { row, kind: 'mach' }); delete p.rows; delete p.op;
+      try { last = await routeAction(action, p); } catch (e) { last = { success: false, error: e.message }; }
+      if (!last || !last.success) { failed.push({ row, error: (last && last.error) || 'Failed' }); return; }
+    }
+    ok.push({ row, value: last.value || null });
+  }));
   return { success: true, ok, failed };
 }
 
